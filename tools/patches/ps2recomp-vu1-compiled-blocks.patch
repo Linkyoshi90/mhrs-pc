@@ -1,0 +1,3005 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index f267634..35a5be4 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -393,8 +393,6 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_runtime.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+-    src/lib/vu/ps2_vu1_upper.cpp
+-    src/lib/vu/ps2_vu1_lower.cpp
+     src/lib/games_database.cpp
+ )
+ 
+@@ -478,6 +476,18 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+     )
+ endif()
+ 
++# Generated VU1 microcode blocks (VU1Interpreter::registerCompiledBlocks) each build alone: their static
++# registration and per-pair functions must not merge with game code, and the whole file needs -frounding-math
++# so the compiler never folds VU float math in round-to-nearest (the runtime rounds toward zero).
++file(GLOB RUNNER_VU1_BLOCK_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*vu1_blocks_*.cpp")
++if(RUNNER_VU1_BLOCK_FILES)
++    set_source_files_properties(${RUNNER_VU1_BLOCK_FILES} PROPERTIES
++        SKIP_UNITY_BUILD_INCLUSION TRUE
++        SKIP_PRECOMPILE_HEADERS TRUE
++        COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-frounding-math>"
++    )
++endif()
++
+ if(PS2X_ENABLE_RUNNER_PCH)
+     set(PS2X_RUNNER_PCH_HEADERS
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 342a55b..0a1a14d 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -3,8 +3,19 @@
+ 
+ #include <array>
+ #include <bit>
++#include <cstddef>
+ #include <cstdint>
+ 
++#if defined(_MSC_VER)
++#define VU1_ALWAYS_INLINE __forceinline
++#define VU1_LAMBDA_ALWAYS_INLINE
++#define VU1_NOINLINE __declspec(noinline)
++#else
++#define VU1_ALWAYS_INLINE inline __attribute__((always_inline))
++#define VU1_LAMBDA_ALWAYS_INLINE __attribute__((always_inline))
++#define VU1_NOINLINE __attribute__((noinline))
++#endif
++
+ class GS;
+ class PS2Memory;
+ 
+@@ -63,7 +74,31 @@ public:
+     VU1State &state() { return m_state; }
+     const VU1State &state() const { return m_state; }
+ 
++    // Compiled microcode (ps2_vu1_exec.h): a block runs the pairs from pc on and returns a
++    // CompiledAccess exit code. Blocks bind to VU1 code whose words match theirs; the rest is interpreted.
++    struct CompiledAccess;
++    using CompiledBlockFn = int (*)(VU1Interpreter &vu, uint64_t budgetEnd);
++    struct CompiledBlock
++    {
++        uint32_t pc;
++        uint32_t pairCount;
++        const uint32_t *words; // pairCount lower/upper word pairs, as in VU1 code memory
++        CompiledBlockFn fn;
++    };
++    static constexpr uint32_t kCompiledCodeSize = 0x4000u;
++    // Call before any VU1 code is uploaded (static initializers of the generated sources).
++    static void registerCompiledBlocks(const CompiledBlock *blocks, size_t count);
++    // On by default; the environment variable PS2_VU1_INTERPRET turns it off.
++    static void setCompiledBlocksEnabled(bool enabled);
++
+ private:
++    enum class PairResult : uint8_t
++    {
++        Next,
++        Stopped, // budget ran out before the pair could issue
++        Ended
++    };
++
+     enum Pipeline : uint8_t
+     {
+         PipelineNone = 0,
+@@ -220,6 +255,26 @@ private:
+     };
+ 
+     static constexpr uint32_t kFmacLatency = 4u;
++
++    // Instruction fields.
++    static constexpr uint8_t DEST(uint32_t i) { return static_cast<uint8_t>((i >> 21) & 0xFu); }
++    static constexpr uint8_t VFT(uint32_t i) { return static_cast<uint8_t>((i >> 16) & 0x1Fu); }
++    static constexpr uint8_t VFS(uint32_t i) { return static_cast<uint8_t>((i >> 11) & 0x1Fu); }
++    static constexpr uint8_t VFD(uint32_t i) { return static_cast<uint8_t>((i >> 6) & 0x1Fu); }
++    static constexpr uint8_t BC(uint32_t i) { return static_cast<uint8_t>(i & 0x3u); }
++    static constexpr uint8_t LIT(uint32_t i) { return static_cast<uint8_t>((i >> 16) & 0x1Fu); }
++    static constexpr uint8_t LIS(uint32_t i) { return static_cast<uint8_t>((i >> 11) & 0x1Fu); }
++    static constexpr uint8_t LID(uint32_t i) { return static_cast<uint8_t>((i >> 6) & 0x1Fu); }
++    static constexpr uint8_t VIT(uint32_t i) { return static_cast<uint8_t>((i >> 16) & 0xFu); }
++    static constexpr uint8_t VIS(uint32_t i) { return static_cast<uint8_t>((i >> 11) & 0xFu); }
++    static constexpr uint8_t VID(uint32_t i) { return static_cast<uint8_t>((i >> 6) & 0xFu); }
++    static constexpr int16_t IMM11(uint32_t i) { return static_cast<int16_t>(static_cast<int32_t>(i << 21) >> 21); }
++    static constexpr int16_t IMM15(uint32_t i)
++    {
++        const uint32_t raw = (((i >> 21) & 0xFu) << 11) | (i & 0x7FFu);
++        return static_cast<int16_t>(static_cast<int32_t>(raw << 17) >> 17);
++    }
++    static constexpr uint8_t laneForComponent(uint32_t component) { return static_cast<uint8_t>(1u << (3u - component)); }
+     static constexpr uint32_t kMaxFlagEntries = 16u; // 8 in flight + ready ones not yet applied
+     static constexpr uint32_t kMaxPendingStores = 8u;
+     static constexpr uint32_t kMaxPendingVfWrites = 16u;
+@@ -235,6 +290,10 @@ private:
+     uint32_t m_cachedCodeSize = 0;
+     uint64_t m_cachedCodeGeneration = 0;
+     bool m_decodedCodeCacheValid = false;
++    std::array<CompiledBlockFn, kMaxDecodedPairs> m_compiledBlocks{}; // by pair index, for the cached code
++    bool m_hasCompiledBlocks = false;
++    bool m_compiledBlocksBound = false; // compiled blocks were enabled when the cache was built
++    uint64_t m_cachedCodeHash = 0;     // of the cached code, set when PS2_VU1_DUMP_DIR is
+ 
+     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+     ScalarPipelineEntry m_fdiv{};
+@@ -286,20 +345,29 @@ private:
+              uint8_t *vuData, uint32_t dataSize,
+              GS &gs, PS2Memory *memory, uint32_t maxCycles);
+ 
+-    InstructionUsage decodeUpperUsage(uint32_t upper) const;
+-    InstructionUsage decodeLowerUsage(uint32_t lower) const;
+-    static void addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
+-    static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
+-    static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
++    template <bool kCompiled>
++    PairResult stepPair(const DecodedInstructionPair &decoded, uint32_t codeSize, uint64_t budgetEnd);
++
++    static constexpr InstructionUsage decodeUpperUsage(uint32_t upper);
++    static constexpr InstructionUsage decodeLowerUsage(uint32_t lower, Unit unit);
++    static constexpr void addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
++    static constexpr void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
++    static constexpr uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
++    static constexpr DecodedInstructionPair decodePair(uint32_t lower, uint32_t upper, Unit unit);
+     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
+-    static void decodeFmac(DecodedInstructionPair &decoded);
+-    static void decodeScoreboardSlots(DecodedInstructionPair &decoded);
++    static constexpr void decodeFmac(DecodedInstructionPair &decoded);
++    static constexpr void decodeScoreboardSlots(DecodedInstructionPair &decoded);
+     bool prepareDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
+     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
++    void bindCompiledBlocks(const uint8_t *vuCode, uint32_t codeSize);
++    void dumpCodeForCompiler(const uint8_t *vuCode, uint32_t codeSize);
+ 
+     void execUpper(uint32_t instr);
++    void execUpperInline(uint32_t instr);
+     void execFmac(const DecodedInstructionPair &decoded);
++    void execFmacInline(const DecodedInstructionPair &decoded);
+     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
++    void execLowerInline(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+ 
+     void applyDest(float *dst, const float *result, uint8_t dest);
+     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
+@@ -325,7 +393,7 @@ private:
+     void startXgkick(uint32_t qwordAddress);
+ 
+     void resetScheduler();
+-    void commitReadyPipelines()
++    VU1_ALWAYS_INLINE void commitReadyPipelines()
+     {
+         if (m_cycle >= m_nextCommitCycle)
+             commitDuePipelines();
+@@ -336,7 +404,7 @@ private:
+         if (readyCycle < m_nextCommitCycle)
+             m_nextCommitCycle = readyCycle;
+     }
+-    void advanceOneCycle()
++    VU1_ALWAYS_INLINE void advanceOneCycle()
+     {
+         ++m_cycle;
+         m_state.cycles = m_cycle;
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.h b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+new file mode 100644
+index 0000000..8be7134
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+@@ -0,0 +1,1213 @@
++#ifndef PS2_VU1_EXEC_H
++#define PS2_VU1_EXEC_H
++
++// VU1Interpreter code shared by the interpreter loop and compiled microprogram blocks: instruction decode
++// (constexpr, so a compiled block decodes its pairs at build time) and the per-pair step, inlined into both.
++
++#include "runtime/ps2_vu1.h"
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/ps2_gif_arbiter.h"
++#include "runtime/ps2_memory.h"
++
++#include <algorithm>
++#include <bit>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#if defined(_MSC_VER)
++#include <intrin.h>
++#elif defined(USE_SSE2NEON)
++#include "sse2neon.h"
++#else
++#include <immintrin.h>
++#endif
++
++// Pair functions keep no buffers that could overflow; the canary is a large share of a short function.
++#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
++#define VU1_NO_STACK_PROTECTOR __attribute__((no_stack_protector))
++#else
++#define VU1_NO_STACK_PROTECTOR
++#endif
++
++// A compiled pair knows its slot counts: unrolled, the scoreboard checks use constant slots.
++#if defined(__GNUC__) && !defined(__clang__)
++#define VU1_UNROLL_SLOTS _Pragma("GCC unroll 20")
++#else
++#define VU1_UNROLL_SLOTS
++#endif
++
++namespace ps2_vu1_simd
++{
++    // normalizeOperand on four lanes: denormals -> signed zero, Inf/NaN -> signed FLT_MAX.
++    inline __m128 normalizeOperands(__m128 value)
++    {
++        const __m128i bits = _mm_castps_si128(value);
++        const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
++        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int32_t>(0x80000000u)));
++        __m128i out = _mm_blendv_epi8(bits, sign, _mm_cmpeq_epi32(exponent, _mm_setzero_si128()));
++        out = _mm_blendv_epi8(out, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)),
++                              _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000)));
++        return _mm_castsi128_ps(out);
++    }
++
++    // Lane sets below use bit c for component c (x = bit 0); MAC and dest masks use x = bit 3.
++    inline constexpr uint8_t reverseLanes[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
++                                                 0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
++
++    // Dest mask (x = bit 3) -> all-ones float lanes.
++    inline __m128 destLaneMask(uint8_t dest)
++    {
++        return _mm_castsi128_ps(_mm_set_epi32(-static_cast<int32_t>(dest & 1u), -static_cast<int32_t>((dest >> 1) & 1u),
++                                              -static_cast<int32_t>((dest >> 2) & 1u), -static_cast<int32_t>((dest >> 3) & 1u)));
++    }
++
++    // Lanes (of four doubles held as two halves) whose sign bit is set.
++    inline uint32_t laneBits(__m128d lo, __m128d hi)
++    {
++        return static_cast<uint32_t>(_mm_movemask_pd(lo) | (_mm_movemask_pd(hi) << 2));
++    }
++}
++
++VU1_ALWAYS_INLINE float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
++{
++    uint32_t bits = 0;
++    std::memcpy(&bits, &value, sizeof(bits));
++    const uint32_t sign = bits & 0x80000000u;
++    const uint32_t magnitude = bits & 0x7FFFFFFFu;
++    const uint32_t exponent = (bits >> 23) & 0xFFu;
++
++    laneFlags = sign != 0u ? 0x2u : 0u;
++    if (magnitude == 0u)
++    {
++        laneFlags |= 0x1u;
++    }
++    else if (exponent == 0u)
++    {
++        laneFlags |= 0x5u;
++        bits = sign;
++    }
++    else if (exponent == 0xFFu)
++    {
++        laneFlags |= 0x8u;
++        bits = sign | 0x7F7FFFFFu;
++    }
++
++    std::memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
++VU1_ALWAYS_INLINE uint32_t VU1Interpreter::microAddressMask() const
++{
++    return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu;
++}
++
++VU1_ALWAYS_INLINE int32_t VU1Interpreter::readBranchVi(uint8_t reg) const
++{
++    if (reg == 0u)
++        return 0;
++    if (m_viBranchBackupValid &&
++        m_viBranchBackupReg == reg)
++    {
++        return m_viBranchBackupValue;
++    }
++    return m_state.vi[reg];
++}
++
++VU1_ALWAYS_INLINE void VU1Interpreter::recordViWriteForBranch(uint8_t reg, int32_t oldValue)
++{
++    if (reg == 0u)
++        return;
++    m_viBranchBackupValue = oldValue;
++    m_viBranchBackupReg = reg;
++    m_viBranchBackupValid = true;
++}
++
++VU1_ALWAYS_INLINE void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
++{
++    if (dest & 0x8u)
++        dst[0] = result[0];
++    if (dest & 0x4u)
++        dst[1] = result[1];
++    if (dest & 0x2u)
++        dst[2] = result[2];
++    if (dest & 0x1u)
++        dst[3] = result[3];
++}
++
++constexpr void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
++{
++    if (lanes == 0u)
++        return;
++    for (uint32_t index = 0; index < usage.vfReadCount; ++index)
++    {
++        if (usage.vfRead[index].reg == reg)
++        {
++            usage.vfRead[index].lanes |= lanes;
++            return;
++        }
++    }
++    if (usage.vfReadCount < usage.vfRead.size())
++        usage.vfRead[usage.vfReadCount++] = {reg, lanes};
++}
++
++constexpr void VU1Interpreter::addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
++{
++    if (reg == 0u || lanes == 0u)
++        return;
++    if (usage.vfWrite.reg == 0u)
++        usage.vfWrite = {reg, lanes};
++    else if (usage.vfWrite.reg == reg)
++        usage.vfWrite.lanes |= lanes;
++}
++
++constexpr uint8_t VU1Interpreter::vfReadLanes(const InstructionUsage &usage, uint8_t reg)
++{
++    for (uint32_t index = 0; index < usage.vfReadCount; ++index)
++    {
++        if (usage.vfRead[index].reg == reg)
++            return usage.vfRead[index].lanes;
++    }
++    return 0u;
++}
++
++constexpr VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper)
++{
++    InstructionUsage usage;
++    usage.pipeline = PipelineFmac;
++    usage.latency = kFmacLatency;
++
++    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++    const uint8_t dest = DEST(upper);
++    const uint8_t fs = VFS(upper);
++    const uint8_t ft = VFT(upper);
++    const uint8_t fd = VFD(upper);
++
++    if (op <= 0x2Fu)
++    {
++        addVfRead(usage, fs, dest);
++        addVfWrite(usage, fd, dest);
++        if (op <= 0x1Bu)
++            addVfRead(usage, ft, laneForComponent(op & 3u));
++        else if (op >= 0x28u)
++            addVfRead(usage, ft, op == 0x2Eu ? 0xEu : dest);
++        if (op == 0x08u || op == 0x09u || op == 0x0Au || op == 0x0Bu ||
++            op == 0x0Cu || op == 0x0Du || op == 0x0Eu || op == 0x0Fu ||
++            op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
++            op == 0x29u || op == 0x2Du || op == 0x2Eu)
++        {
++            usage.accRead = dest;
++        }
++        return usage;
++    }
++
++    if (op >= 0x3Cu)
++    {
++        const uint8_t special = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
++        const bool writesAcc =
++            special <= 0x0Fu ||
++            (special >= 0x18u && special <= 0x1Cu) ||
++            special == 0x1Eu ||
++            (special >= 0x20u && special <= 0x2Au) ||
++            (special >= 0x2Cu && special <= 0x2Eu);
++        if (writesAcc)
++        {
++            addVfRead(usage, fs, dest);
++            if (special <= 0x1Bu)
++                addVfRead(usage, ft, laneForComponent(special & 3u));
++            else if ((special >= 0x28u && special <= 0x2Eu))
++                addVfRead(usage, ft, special == 0x2Eu ? 0xEu : dest);
++            usage.accWrite = dest;
++            if ((special >= 0x08u && special <= 0x0Fu) ||
++                special == 0x21u || special == 0x23u || special == 0x25u ||
++                special == 0x27u || special == 0x29u || special == 0x2Du)
++            {
++                usage.accRead = dest;
++            }
++        }
++        else if (special >= 0x10u && special <= 0x17u)
++        {
++            addVfRead(usage, fs, dest);
++            addVfWrite(usage, ft, dest);
++        }
++        else if (special == 0x1Du)
++        {
++            addVfRead(usage, fs, dest);
++            addVfWrite(usage, ft, dest);
++        }
++        else if (special == 0x1Fu)
++        {
++            addVfRead(usage, fs, 0xEu);
++            addVfRead(usage, ft, 0x1u);
++            usage.writesClip = true;
++        }
++        else if (special != 0x2Fu && special != 0x30u)
++        {
++            usage.reserved = true;
++        }
++        return usage;
++    }
++
++    usage.reserved = true;
++    return usage;
++}
++
++constexpr VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower, Unit unit)
++{
++    InstructionUsage usage;
++    if (lower == 0u || lower == 0x8000033Cu)
++        return usage;
++
++    const uint8_t opHi = static_cast<uint8_t>((lower >> 25) & 0x7Fu);
++    const uint8_t vfT = VFT(lower);
++    const uint8_t vfS = VFS(lower);
++    const uint8_t viT = VIT(lower);
++    const uint8_t viS = VIS(lower);
++    const uint8_t viD = VID(lower);
++    const uint8_t dest = DEST(lower);
++    auto readVi = [&](uint8_t reg)
++    {
++        if (reg != 0u)
++            usage.viRead |= static_cast<uint16_t>(1u << reg);
++    };
++    auto writeVi = [&](uint8_t reg)
++    {
++        if (reg != 0u)
++            usage.viWrite |= static_cast<uint16_t>(1u << reg);
++    };
++
++    switch (opHi)
++    {
++    case 0x00:
++        usage.pipeline = PipelineLsu;
++        usage.latency = 4u;
++        readVi(viS);
++        addVfWrite(usage, vfT, dest);
++        return usage;
++    case 0x01:
++        usage.pipeline = PipelineLsu;
++        usage.latency = 1u;
++        readVi(viT);
++        addVfRead(usage, vfS, dest);
++        return usage;
++    case 0x04:
++        usage.pipeline = PipelineLsu;
++        usage.latency = 4u;
++        readVi(viS);
++        writeVi(viT);
++        return usage;
++    case 0x05:
++        usage.pipeline = PipelineLsu;
++        usage.latency = 1u;
++        readVi(viS);
++        readVi(viT);
++        return usage;
++    case 0x08:
++    case 0x09:
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        usage.delaysNextBranchRead = true;
++        readVi(viS);
++        writeVi(viT);
++        return usage;
++    case 0x10:
++    case 0x12:
++    case 0x13:
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        usage.readsClip = true;
++        writeVi(1u);
++        return usage;
++    case 0x11:
++        usage.pipeline = PipelineFmac;
++        usage.latency = kFmacLatency;
++        usage.writesClip = true;
++        return usage;
++    case 0x14:
++    case 0x16:
++    case 0x17:
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        writeVi(viT);
++        return usage;
++    case 0x15:
++        usage.pipeline = PipelineFmac;
++        usage.latency = kFmacLatency;
++        return usage;
++    case 0x18:
++    case 0x1A:
++    case 0x1B:
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        readVi(viS);
++        writeVi(viT);
++        return usage;
++    case 0x1C:
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        usage.readsClip = true;
++        writeVi(viT);
++        return usage;
++    case 0x20:
++        usage.pipeline = PipelineBranch;
++        return usage;
++    case 0x21:
++        usage.pipeline = PipelineBranch;
++        usage.latency = 1u;
++        writeVi(viT);
++        return usage;
++    case 0x24:
++        usage.pipeline = PipelineBranch;
++        readVi(viS);
++        return usage;
++    case 0x25:
++        usage.pipeline = PipelineBranch;
++        usage.latency = 1u;
++        readVi(viS);
++        writeVi(viT);
++        return usage;
++    case 0x28:
++    case 0x29:
++        usage.pipeline = PipelineBranch;
++        readVi(viS);
++        readVi(viT);
++        return usage;
++    case 0x2C:
++    case 0x2D:
++    case 0x2E:
++    case 0x2F:
++        usage.pipeline = PipelineBranch;
++        readVi(viS);
++        return usage;
++    case 0x40:
++        break;
++    default:
++        usage.reserved = true;
++        return usage;
++    }
++
++    const uint8_t direct = static_cast<uint8_t>(lower & 0x3Fu);
++    if (direct == 0x30u || direct == 0x31u || direct == 0x34u || direct == 0x35u)
++    {
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        usage.delaysNextBranchRead = true;
++        readVi(viS);
++        readVi(viT);
++        writeVi(viD);
++        return usage;
++    }
++    if (direct == 0x32u)
++    {
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        usage.delaysNextBranchRead = true;
++        readVi(viS);
++        writeVi(viT);
++        return usage;
++    }
++    if (direct < 0x3Cu)
++    {
++        usage.reserved = true;
++        return usage;
++    }
++
++    const uint8_t special = static_cast<uint8_t>((lower & 3u) | ((lower >> 4) & 0x7Cu));
++    switch (special)
++    {
++    case 0x30:
++    case 0x31:
++        usage.pipeline = PipelineFmac;
++        usage.latency = 4u;
++        addVfRead(usage, vfS, special == 0x31u ? 0xFu : dest);
++        addVfWrite(usage, vfT, dest);
++        break;
++    case 0x34:
++    case 0x36:
++        usage.pipeline = PipelineLsu;
++        usage.latency = 4u;
++        usage.viLatency = 1u;
++        usage.delaysNextBranchRead = true;
++        readVi(viS);
++        writeVi(viS);
++        addVfWrite(usage, vfT, dest);
++        break;
++    case 0x35:
++    case 0x37:
++        usage.pipeline = PipelineLsu;
++        usage.latency = 1u;
++        usage.delaysNextBranchRead = true;
++        readVi(viT);
++        writeVi(viT);
++        addVfRead(usage, vfS, dest);
++        break;
++    case 0x38:
++        usage.pipeline = PipelineFdiv;
++        usage.latency = 7u;
++        addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
++        addVfRead(usage, vfT, laneForComponent((lower >> 23) & 3u));
++        break;
++    case 0x39:
++        usage.pipeline = PipelineFdiv;
++        usage.latency = 7u;
++        addVfRead(usage, vfT, laneForComponent((lower >> 23) & 3u));
++        break;
++    case 0x3A:
++        usage.pipeline = PipelineFdiv;
++        usage.latency = 13u;
++        addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
++        addVfRead(usage, vfT, laneForComponent((lower >> 23) & 3u));
++        break;
++    case 0x3B:
++        usage.pipeline = PipelineFdiv;
++        usage.waitQ = true;
++        break;
++    case 0x3C:
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        usage.delaysNextBranchRead = true;
++        addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
++        writeVi(viT);
++        break;
++    case 0x3D:
++        usage.pipeline = PipelineFmac;
++        usage.latency = 4u;
++        readVi(viS);
++        addVfWrite(usage, vfT, dest);
++        break;
++    case 0x3E:
++        usage.pipeline = PipelineLsu;
++        usage.latency = 4u;
++        readVi(viS);
++        writeVi(viT);
++        break;
++    case 0x3F:
++        usage.pipeline = PipelineLsu;
++        usage.latency = 1u;
++        readVi(viS);
++        readVi(viT);
++        break;
++    case 0x40:
++    case 0x41:
++        usage.pipeline = PipelineFmac;
++        usage.latency = 4u;
++        addVfWrite(usage, vfT, dest);
++        break;
++    case 0x42:
++    case 0x43:
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
++        break;
++    case 0x64:
++        if (unit == Unit::VU0)
++        {
++            usage.reserved = true;
++            break;
++        }
++        usage.pipeline = PipelineFmac;
++        usage.latency = 4u;
++        addVfWrite(usage, vfT, dest);
++        break;
++    case 0x68:
++    case 0x69:
++        usage.pipeline = PipelineIalu;
++        usage.latency = 1u;
++        writeVi(viT);
++        break;
++    case 0x6C:
++        if (unit == Unit::VU0)
++        {
++            usage.reserved = true;
++            break;
++        }
++        usage.pipeline = PipelineXgkick;
++        usage.latency = 2u;
++        readVi(viS);
++        break;
++    case 0x70:
++    case 0x71:
++    case 0x72:
++    case 0x73:
++    case 0x74:
++    case 0x75:
++    case 0x76:
++    case 0x77:
++    case 0x78:
++    case 0x79:
++    case 0x7A:
++    case 0x7C:
++    case 0x7D:
++        if (unit == Unit::VU0)
++        {
++            usage.reserved = true;
++            break;
++        }
++        usage.pipeline = PipelineEfu;
++        switch (special)
++        {
++        case 0x70:
++            usage.latency = 11u;
++            break;
++        case 0x71:
++        case 0x72:
++        case 0x77:
++            usage.latency = 18u;
++            break;
++        case 0x73:
++            usage.latency = 24u;
++            break;
++        case 0x74:
++        case 0x75:
++        case 0x7C:
++            usage.latency = 54u;
++            break;
++        case 0x76:
++        case 0x78:
++        case 0x7A:
++            usage.latency = 12u;
++            break;
++        case 0x79:
++            usage.latency = 29u;
++            break;
++        case 0x7D:
++            usage.latency = 44u;
++            break;
++        default:
++            break;
++        }
++        if (special >= 0x70u && special <= 0x73u)
++            addVfRead(usage, vfS, 0xEu);
++        else if (special == 0x74u)
++            addVfRead(usage, vfS, 0xCu);
++        else if (special == 0x75u)
++            addVfRead(usage, vfS, 0xAu);
++        else if (special == 0x76u)
++            addVfRead(usage, vfS, 0xFu);
++        else
++            addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
++        break;
++    case 0x7B:
++        if (unit == Unit::VU0)
++        {
++            usage.reserved = true;
++            break;
++        }
++        usage.pipeline = PipelineEfu;
++        usage.waitP = true;
++        break;
++    default:
++        usage.reserved = true;
++        break;
++    }
++    return usage;
++}
++
++constexpr void VU1Interpreter::decodeFmac(DecodedInstructionPair &decoded)
++{
++    const uint32_t upper = decoded.upper;
++    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++    const bool special = op >= 0x3Cu;
++    // The upper special group (ADDA, MADDA, ...) reuses the same selector layout.
++    const uint8_t sel = special ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
++    if (op >= 0x30u && !special)
++        return;
++
++    FmacForm form = FmacNone;
++    FmacSource source = FmacVector;
++    if (sel <= 0x0Fu)
++    {
++        form = static_cast<FmacForm>(FmacAdd + (sel >> 2)); // Add, Sub, MulAdd, MulSub
++        source = FmacBroadcast;
++    }
++    else if (sel >= 0x18u && sel <= 0x1Bu)
++    {
++        form = FmacMul;
++        source = FmacBroadcast;
++    }
++    else
++    {
++        switch (sel)
++        {
++        case 0x1Cu: form = FmacMul, source = FmacQ; break;
++        case 0x1Eu: form = FmacMul, source = FmacI; break;
++        case 0x20u: form = FmacAdd, source = FmacQ; break;
++        case 0x21u: form = FmacMulAdd, source = FmacQ; break;
++        case 0x22u: form = FmacAdd, source = FmacI; break;
++        case 0x23u: form = FmacMulAdd, source = FmacI; break;
++        case 0x24u: form = FmacSub, source = FmacQ; break;
++        case 0x25u: form = FmacMulSub, source = FmacQ; break;
++        case 0x26u: form = FmacSub, source = FmacI; break;
++        case 0x27u: form = FmacMulSub, source = FmacI; break;
++        case 0x28u: form = FmacAdd; break;
++        case 0x29u: form = FmacMulAdd; break;
++        case 0x2Au: form = FmacMul; break;
++        case 0x2Cu: form = FmacSub; break;
++        case 0x2Du: form = FmacMulSub; break;
++        case 0x2Eu: // OPMSUB (acc - cross) / OPMULA (cross)
++            form = special ? FmacMul : FmacMulSub;
++            source = FmacCross;
++            break;
++        default:
++            return;
++        }
++    }
++    decoded.fmacForm = form;
++    decoded.fmacSource = source;
++    decoded.fmacBc = static_cast<uint8_t>(sel & 3u);
++    decoded.fmacToAcc = special;
++    if (source != FmacCross)
++        return;
++
++    // Cross lanes: result x/y/z reads FS y/z/x and FT z/x/y; OPMSUB's w product (sticky flags only) reads
++    // FS w and FT w. Usage declares FS = dest and FT = xyz, so other lanes are read without a stall.
++    constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
++    constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
++    const uint8_t dest = DEST(upper);
++    uint8_t fsLanes = 0u;
++    uint8_t ftLanes = 0u;
++    for (uint32_t component = 0; component < 4u; ++component)
++    {
++        if ((dest & laneForComponent(component)) == 0u || (component == 3u && form == FmacMul))
++            continue;
++        fsLanes |= laneForComponent(crossLeft[component]);
++        ftLanes |= laneForComponent(crossRight[component]);
++    }
++    const bool sameReg = VFS(upper) == VFT(upper);
++    const uint8_t fsDeclared = sameReg ? static_cast<uint8_t>(dest | 0xEu) : dest;
++    const uint8_t ftDeclared = sameReg ? static_cast<uint8_t>(dest | 0xEu) : 0xEu;
++    decoded.fmacUndeclaredFs = static_cast<uint8_t>(fsLanes & ~fsDeclared);
++    decoded.fmacUndeclaredFt = static_cast<uint8_t>(ftLanes & ~ftDeclared);
++}
++
++constexpr void VU1Interpreter::decodeScoreboardSlots(DecodedInstructionPair &decoded)
++{
++    const auto addLanes = [](auto &slots, uint8_t &count, uint32_t base, uint8_t lanes)
++    {
++        for (uint32_t component = 0; component < 4u; ++component)
++            if ((lanes & laneForComponent(component)) != 0u)
++                slots[count++] = static_cast<uint8_t>(base + component);
++    };
++    for (const InstructionUsage *usage : {&decoded.upperUsage, &decoded.lowerUsage})
++    {
++        for (uint32_t index = 0; index < usage->vfReadCount; ++index)
++            addLanes(decoded.readSlots, decoded.readSlotCount, usage->vfRead[index].reg * 4u, usage->vfRead[index].lanes);
++        for (uint32_t bits = usage->viRead & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++            decoded.readSlots[decoded.readSlotCount++] = static_cast<uint8_t>(kViSlot + std::countr_zero(bits));
++    }
++
++    // Same order as the writes land: lower VF, upper VF, VI. ACC is left out: its latency-1 write is
++    // readable by the next pair, so it never stalls one.
++    const auto addWrites = [&decoded, &addLanes](uint32_t base, uint8_t lanes, uint32_t latency)
++    {
++        const uint8_t start = decoded.writeSlotCount;
++        addLanes(decoded.writeSlots, decoded.writeSlotCount, base, lanes);
++        for (uint8_t index = start; index < decoded.writeSlotCount; ++index)
++            decoded.writeLatency[index] = static_cast<uint8_t>(latency);
++    };
++    const InstructionUsage &lower = decoded.lowerUsage;
++    const InstructionUsage &upper = decoded.upperUsage;
++    if (lower.vfWrite.reg != 0u && decoded.suppressedLowerVf != lower.vfWrite.reg)
++        addWrites(lower.vfWrite.reg * 4u, lower.vfWrite.lanes, lower.vfLatency != 0u ? lower.vfLatency : lower.latency);
++    if (upper.vfWrite.reg != 0u)
++        addWrites(upper.vfWrite.reg * 4u, upper.vfWrite.lanes, upper.vfLatency != 0u ? upper.vfLatency : upper.latency);
++    for (uint32_t bits = lower.viWrite & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++    {
++        decoded.writeSlots[decoded.writeSlotCount] = static_cast<uint8_t>(kViSlot + std::countr_zero(bits));
++        decoded.writeLatency[decoded.writeSlotCount++] = lower.viLatency != 0u ? lower.viLatency : lower.latency;
++    }
++}
++
++constexpr VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodePair(uint32_t lower, uint32_t upper, Unit unit)
++{
++    DecodedInstructionPair decoded;
++    decoded.lower = lower;
++    decoded.upper = upper;
++    decoded.iBit = (decoded.upper & 0x80000000u) != 0u;
++    decoded.eBit = (decoded.upper & 0x40000000u) != 0u;
++    decoded.mBit = (decoded.upper & 0x20000000u) != 0u;
++    decoded.dBit = (decoded.upper & 0x10000000u) != 0u;
++    decoded.tBit = (decoded.upper & 0x08000000u) != 0u;
++    decoded.upperUsage = decodeUpperUsage(decoded.upper);
++    if (!decoded.iBit)
++        decoded.lowerUsage = decodeLowerUsage(decoded.lower, unit);
++
++    const uint8_t upperWriteReg = decoded.upperUsage.vfWrite.reg;
++    if (upperWriteReg != 0u && (vfReadLanes(decoded.lowerUsage, upperWriteReg) != 0u || decoded.lowerUsage.vfWrite.reg == upperWriteReg))
++    {
++        decoded.upperVfShadowReg = upperWriteReg;
++        if (decoded.lowerUsage.vfWrite.reg == upperWriteReg)
++            decoded.suppressedLowerVf = upperWriteReg;
++    }
++    const uint32_t lowerOp = decoded.lower >> 25;
++    decoded.lowerReadsFlags = !decoded.iBit && lowerOp >= 0x10u && lowerOp <= 0x1Cu &&
++                              lowerOp != 0x11u && lowerOp != 0x15u && lowerOp != 0x19u; // FCxx/FSxx/FMxx reads
++    decodeFmac(decoded);
++    decodeScoreboardSlots(decoded);
++    return decoded;
++}
++
++// Flag-pipeline entries all have the FMAC latency, so they land in issue order: a FIFO. They are applied
++// lazily (syncFlags) before anything can observe MAC/status/clip: a lower op reading them, the FDIV status
++// update, and the end of a run. Applying a ready entry late but in order gives the same state.
++VU1_ALWAYS_INLINE VU1Interpreter::FlagPipelineEntry *VU1Interpreter::allocFlagEntry(bool upper, uint32_t errorCode)
++{
++    if (m_flagCount == kMaxFlagEntries)
++        syncFlags();
++    if (m_flagCount == kMaxFlagEntries)
++    {
++        reportReservedInstruction(upper, errorCode);
++        return nullptr;
++    }
++    FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount++) % kMaxFlagEntries];
++    entry = {};
++    entry.valid = true;
++    entry.issueCycle = m_cycle;
++    entry.readyCycle = m_cycle + kFmacLatency;
++    return &entry;
++}
++
++// One upper FMAC op on all four lanes: result, exact Z/S/U/O flags and product-sticky flags.
++// A float product is exact in double and the sum is rounded once, so a double result that is zero, or in
++// [2^-125, 2^127), classifies like the exact one (same zero-ness and sign, no overflow or underflow) in any
++// rounding mode; only the rest needs long double. Packed float/double ops round exactly like scalar ones.
++VU1_ALWAYS_INLINE void VU1Interpreter::execFmacInline(const DecodedInstructionPair &decoded)
++{
++    const uint32_t instr = decoded.upper;
++    const uint8_t dest = DEST(instr);
++    if (dest == 0u)
++        return;
++
++    const uint8_t fs = VFS(instr);
++    const uint8_t ft = VFT(instr);
++    const FmacForm form = decoded.fmacForm;
++    const FmacSource source = decoded.fmacSource;
++    __m128 a;
++    __m128 b;
++    if (source == FmacCross)
++    {
++        // x/y/z = FS yzx * FT zxy; w only feeds OPMSUB's sticky flags (FS w * FT w).
++        static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
++        static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
++        float left[4];
++        float right[4];
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            const uint32_t l = crossLeft[component];
++            const uint32_t r = crossRight[component];
++            left[component] = (decoded.fmacUndeclaredFs & laneForComponent(l)) != 0u ? committedVfLane(fs, l) : m_state.vf[fs][l];
++            right[component] = (decoded.fmacUndeclaredFt & laneForComponent(r)) != 0u ? committedVfLane(ft, r) : m_state.vf[ft][r];
++        }
++        a = _mm_loadu_ps(left);
++        b = _mm_loadu_ps(right);
++    }
++    else
++    {
++        a = _mm_loadu_ps(m_state.vf[fs]);
++        switch (source)
++        {
++        case FmacBroadcast: b = _mm_set1_ps(m_state.vf[ft][decoded.fmacBc]); break;
++        case FmacQ: b = _mm_set1_ps(m_state.q); break;
++        case FmacI: b = _mm_set1_ps(m_state.i); break;
++        default: b = _mm_loadu_ps(m_state.vf[ft]); break;
++        }
++    }
++    a = ps2_vu1_simd::normalizeOperands(a);
++    b = ps2_vu1_simd::normalizeOperands(b);
++    const __m128 acc = ps2_vu1_simd::normalizeOperands(_mm_loadu_ps(m_state.acc));
++
++    const __m128d aLo = _mm_cvtps_pd(a), aHi = _mm_cvtps_pd(_mm_movehl_ps(a, a));
++    const __m128d bLo = _mm_cvtps_pd(b), bHi = _mm_cvtps_pd(_mm_movehl_ps(b, b));
++    const __m128d productLo = _mm_mul_pd(aLo, bLo), productHi = _mm_mul_pd(aHi, bHi); // exact
++    __m128 value;
++    __m128d exactLo, exactHi;
++    switch (form)
++    {
++    case FmacAdd:
++        value = _mm_add_ps(a, b);
++        exactLo = _mm_add_pd(aLo, bLo), exactHi = _mm_add_pd(aHi, bHi);
++        break;
++    case FmacSub:
++        value = _mm_sub_ps(a, b);
++        exactLo = _mm_sub_pd(aLo, bLo), exactHi = _mm_sub_pd(aHi, bHi);
++        break;
++    case FmacMulAdd:
++        value = _mm_add_ps(acc, _mm_mul_ps(a, b));
++        exactLo = _mm_add_pd(_mm_cvtps_pd(acc), productLo);
++        exactHi = _mm_add_pd(_mm_cvtps_pd(_mm_movehl_ps(acc, acc)), productHi);
++        break;
++    case FmacMulSub:
++        value = _mm_sub_ps(acc, _mm_mul_ps(a, b));
++        exactLo = _mm_sub_pd(_mm_cvtps_pd(acc), productLo);
++        exactHi = _mm_sub_pd(_mm_cvtps_pd(_mm_movehl_ps(acc, acc)), productHi);
++        break;
++    default:
++        value = _mm_mul_ps(a, b);
++        exactLo = productLo, exactHi = productHi;
++        break;
++    }
++
++    const uint32_t destLanes = ps2_vu1_simd::reverseLanes[dest];
++    const __m128d absMask = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
++    const __m128d zero = _mm_setzero_pd();
++    uint32_t extraSticky = 0u;
++    if (form == FmacMulAdd || form == FmacMulSub)
++    {
++        // Every product condition of a written lane accumulates into the sticky flags.
++        const __m128d magLo = _mm_and_pd(productLo, absMask), magHi = _mm_and_pd(productHi, absMask);
++        const __m128d maxFloat = _mm_set1_pd(std::numeric_limits<float>::max());
++        const __m128d minFloat = _mm_set1_pd(std::numeric_limits<float>::min());
++        const uint32_t isZero = ps2_vu1_simd::laneBits(_mm_cmpeq_pd(magLo, zero), _mm_cmpeq_pd(magHi, zero)) & destLanes;
++        const uint32_t isNegative = ps2_vu1_simd::laneBits(productLo, productHi) & destLanes;
++        const uint32_t isOver = ps2_vu1_simd::laneBits(_mm_cmpgt_pd(magLo, maxFloat), _mm_cmpgt_pd(magHi, maxFloat)) & destLanes;
++        const uint32_t isUnder = ps2_vu1_simd::laneBits(_mm_cmplt_pd(magLo, minFloat), _mm_cmplt_pd(magHi, minFloat)) & destLanes & ~isZero;
++        extraSticky = ((isZero | isUnder) != 0u ? 0x1u : 0u) | (isNegative != 0u ? 0x2u : 0u) |
++                      (isUnder != 0u ? 0x4u : 0u) | (isOver != 0u ? 0x8u : 0u);
++    }
++
++    const __m128d magLo = _mm_and_pd(exactLo, absMask), magHi = _mm_and_pd(exactHi, absMask);
++    const __m128d lowest = _mm_set1_pd(0x1p-125), highest = _mm_set1_pd(0x1p127);
++    uint32_t isZero = ps2_vu1_simd::laneBits(_mm_cmpeq_pd(magLo, zero), _mm_cmpeq_pd(magHi, zero));
++    uint32_t isNegative = ps2_vu1_simd::laneBits(exactLo, exactHi);
++    uint32_t inRange = ps2_vu1_simd::laneBits(_mm_and_pd(_mm_cmpge_pd(magLo, lowest), _mm_cmplt_pd(magLo, highest)),
++                                _mm_and_pd(_mm_cmpge_pd(magHi, lowest), _mm_cmplt_pd(magHi, highest)));
++    if (source == FmacCross) // w is +0
++    {
++        isZero |= 0x8u;
++        isNegative &= 0x7u;
++        inRange &= 0x7u;
++    }
++
++    alignas(16) float result[4];
++    _mm_store_ps(result, value);
++    uint32_t macZero = isZero & destLanes;
++    uint32_t macSign = isNegative & destLanes;
++    uint32_t macUnder = 0u;
++    uint32_t macOver = 0u;
++    for (uint32_t bits = macZero; bits != 0u; bits &= bits - 1u)
++    {
++        const uint32_t component = static_cast<uint32_t>(std::countr_zero(bits));
++        result[component] = ((isNegative >> component) & 1u) != 0u ? -0.0f : 0.0f;
++    }
++    if (const uint32_t slow = destLanes & ~(inRange | isZero); slow != 0u)
++    {
++        alignas(16) float left[4], right[4], accum[4];
++        _mm_store_ps(left, a);
++        _mm_store_ps(right, b);
++        _mm_store_ps(accum, acc);
++        for (uint32_t bits = slow; bits != 0u; bits &= bits - 1u)
++        {
++            const uint32_t component = static_cast<uint32_t>(std::countr_zero(bits));
++            const long double la = left[component], lb = right[component], lacc = accum[component];
++            long double exact;
++            switch (form)
++            {
++            case FmacAdd: exact = la + lb; break;
++            case FmacSub: exact = la - lb; break;
++            case FmacMulAdd: exact = lacc + la * lb; break;
++            case FmacMulSub: exact = lacc - la * lb; break;
++            default: exact = la * lb; break;
++            }
++            const uint32_t flags = normalizeFmacExactResult(result[component], exact);
++            const uint32_t lane = 1u << component;
++            macZero |= (flags & 0x1u) != 0u ? lane : 0u;
++            macSign = (macSign & ~lane) | ((flags & 0x2u) != 0u ? lane : 0u);
++            macUnder |= (flags & 0x4u) != 0u ? lane : 0u;
++            macOver |= (flags & 0x8u) != 0u ? lane : 0u;
++        }
++    }
++
++    if (FlagPipelineEntry *entry = allocFlagEntry(true, 0xFFFFFFFFu))
++    {
++        entry->mac = static_cast<uint32_t>(ps2_vu1_simd::reverseLanes[macZero]) | (static_cast<uint32_t>(ps2_vu1_simd::reverseLanes[macSign]) << 4) |
++                     (static_cast<uint32_t>(ps2_vu1_simd::reverseLanes[macUnder]) << 8) | (static_cast<uint32_t>(ps2_vu1_simd::reverseLanes[macOver]) << 12);
++        entry->status = (macZero != 0u ? 0x1u : 0u) | (macSign != 0u ? 0x2u : 0u) |
++                        (macUnder != 0u ? 0x4u : 0u) | (macOver != 0u ? 0x8u : 0u);
++        entry->extraSticky = extraSticky;
++        entry->writesMac = true;
++        entry->writesStatus = true;
++    }
++    applyDest(decoded.fmacToAcc ? m_state.acc : m_state.vf[VFD(instr)], result, dest);
++}
++
++// Called before markPairWrites, so m_ready still holds the previous write's due cycle: if that write is
++// already due, this write starts a new chain and the lane shows oldValue until this one lands.
++VU1_ALWAYS_INLINE void VU1Interpreter::noteVfWrite(uint8_t reg, uint8_t laneMask, const float oldValue[4], uint32_t latency)
++{
++    const __m128i cycle = _mm_set1_epi64x(static_cast<long long>(m_cycle));
++    const __m128i pendingXY = _mm_cmpgt_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i *>(&m_ready[reg * 4u])), cycle);
++    const __m128i pendingZW = _mm_cmpgt_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i *>(&m_ready[reg * 4u + 2u])), cycle);
++    const __m128 pending = _mm_shuffle_ps(_mm_castsi128_ps(pendingXY), _mm_castsi128_ps(pendingZW), _MM_SHUFFLE(2, 0, 2, 0));
++    const __m128 start = _mm_andnot_ps(pending, ps2_vu1_simd::destLaneMask(laneMask));
++    float *chain = m_vfChainStart[reg].data();
++    _mm_storeu_ps(chain, _mm_blendv_ps(_mm_loadu_ps(chain), _mm_loadu_ps(oldValue), start));
++    m_vfWrittenLanes[reg] |= laneMask;
++    m_inflightReady = std::max(m_inflightReady, m_cycle + latency);
++    if (m_vfWriteMask != 0u) // supersede a deferred write still queued for these lanes
++    {
++        ++m_nextWriteSequence;
++        for (uint32_t component = 0; component < 4u; ++component)
++            if ((laneMask & laneForComponent(component)) != 0u)
++                m_vfLatestWrite[reg][component] = m_nextWriteSequence;
++    }
++}
++
++VU1_ALWAYS_INLINE void VU1Interpreter::noteViWrite(uint8_t reg, int32_t oldValue, uint32_t latency)
++{
++    if (m_ready[kViSlot + reg] <= m_cycle)
++        m_viChainStart[reg] = oldValue;
++    m_viWritten |= static_cast<uint16_t>(1u << reg);
++    m_inflightReady = std::max(m_inflightReady, m_cycle + latency);
++    if (m_viWriteMask != 0u)
++        m_viLatestWrite[reg] = ++m_nextWriteSequence;
++}
++
++VU1_ALWAYS_INLINE uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
++{
++    uint64_t ready = m_cycle;
++    VU1_UNROLL_SLOTS
++    for (uint32_t index = 0; index < decoded.readSlotCount; ++index)
++        ready = std::max(ready, m_ready[decoded.readSlots[index]]);
++
++    if (decoded.lowerUsage.pipeline == PipelineFdiv && m_fdiv.valid)
++        ready = std::max(ready, m_fdiv.readyCycle);
++    if (decoded.lowerUsage.pipeline == PipelineEfu)
++        ready = std::max(ready, m_efuResourceReady);
++    if (decoded.lowerUsage.waitQ && m_fdiv.valid)
++        ready = std::max(ready, m_fdiv.readyCycle);
++    if (decoded.lowerUsage.waitP)
++    {
++        for (const ScalarPipelineEntry &entry : m_efu)
++            if (entry.valid)
++                ready = std::max(ready, entry.readyCycle);
++    }
++    if (decoded.lowerUsage.pipeline == PipelineXgkick && m_xgkick.active)
++        ready = std::max(ready, m_cycle + 1u);
++    return ready;
++}
++
++VU1_ALWAYS_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
++{
++    VU1_UNROLL_SLOTS
++    for (uint32_t index = 0; index < decoded.writeSlotCount; ++index)
++        m_ready[decoded.writeSlots[index]] = m_cycle + decoded.writeLatency[index];
++}
++
++#include "runtime/ps2_vu1_upper.inl"
++#include "runtime/ps2_vu1_lower.inl"
++
++// One instruction pair: wait for its operands (stalling cycle by cycle), issue it, and step one cycle.
++// The interpreter loop and compiled blocks (with a constexpr pair, so it folds to that pair) share it.
++template <bool kCompiled>
++VU1_ALWAYS_INLINE VU1Interpreter::PairResult VU1Interpreter::stepPair(const DecodedInstructionPair &decoded,
++                                                                     uint32_t codeSize, uint64_t budgetEnd)
++{
++    bool programEnded = false;
++    uint64_t readyCycle = calculatePairReadyCycle(decoded);
++    while (readyCycle > m_cycle)
++    {
++        if (readyCycle >= budgetEnd)
++        {
++            advanceTo(budgetEnd);
++            break;
++        }
++        advanceTo(readyCycle);
++        readyCycle = calculatePairReadyCycle(decoded);
++    }
++    if (m_cycle >= budgetEnd)
++        return PairResult::Stopped;
++
++    uint8_t writtenVi = 0u;
++    int32_t oldVi = 0;
++    if (const uint32_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
++    {
++        writtenVi = static_cast<uint8_t>(std::countr_zero(viWrites));
++        // The value the pipeline shows: a branch in the next pair reads it (recordViWriteForBranch).
++        oldVi = m_ready[kViSlot + writtenVi] > m_cycle ? m_viChainStart[writtenVi] : m_state.vi[writtenVi];
++    }
++
++    const VfAccess upperWrite = decoded.upperUsage.vfWrite;
++    const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
++    const bool hasUpperWrite = upperWrite.reg != 0u;
++    const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
++    const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
++    if (decoded.lowerReadsFlags)
++        syncFlags();
++    float oldUpperVf[4];
++    float oldLowerVf[4];
++    if (hasUpperWrite)
++        std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
++    if (hasDistinctLowerWrite)
++        std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++
++    const auto execUpperOf = [this](const DecodedInstructionPair &pair) VU1_LAMBDA_ALWAYS_INLINE
++    {
++        if constexpr (kCompiled)
++        {
++            if (pair.fmacForm == FmacNone)
++                execUpperInline(pair.upper);
++            else
++                execFmacInline(pair);
++        }
++        else if (pair.fmacForm == FmacNone)
++            execUpper(pair.upper);
++        else
++            execFmac(pair);
++    };
++    const auto execLowerOf = [this](const DecodedInstructionPair &pair) VU1_LAMBDA_ALWAYS_INLINE
++    {
++        if constexpr (kCompiled)
++            execLowerInline(pair.lower, m_activeVuData, m_activeVuDataSize, *m_activeGs, m_activeMemory, pair.upper);
++        else
++            execLower(pair.lower, m_activeVuData, m_activeVuDataSize, *m_activeGs, m_activeMemory, pair.upper);
++    };
++    if (decoded.iBit)
++    {
++        execUpperOf(decoded);
++        float immediate = 0.0f;
++        std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++        m_state.i = normalizeOperand(immediate);
++    }
++    else if (decoded.upperVfShadowReg != 0u)
++    {
++        float oldVf[4]{};
++        float upperVf[4]{};
++        std::memcpy(oldVf,
++                    m_state.vf[decoded.upperVfShadowReg],
++                    sizeof(oldVf));
++        execUpperOf(decoded);
++        std::memcpy(upperVf,
++                    m_state.vf[decoded.upperVfShadowReg],
++                    sizeof(upperVf));
++        std::memcpy(m_state.vf[decoded.upperVfShadowReg],
++                    oldVf,
++                    sizeof(oldVf));
++        execLowerOf(decoded);
++        std::memcpy(m_state.vf[decoded.upperVfShadowReg],
++                    upperVf,
++                    sizeof(upperVf));
++    }
++    else
++    {
++        execUpperOf(decoded);
++        if (decoded.lowerUsage.pipeline != PipelineNone) // not a lower NOP
++            execLowerOf(decoded);
++    }
++
++    m_viBranchBackupValid = false;
++
++    // Writes land in m_state now; the scoreboard (markPairWrites) keeps readers from seeing them early.
++    // ACC (latency 1) is readable by the next pair, so it needs neither.
++    if (hasUpperWrite)
++        noteVfWrite(upperWrite.reg, upperWrite.lanes, oldUpperVf,
++                    decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency : decoded.upperUsage.latency);
++    if (hasDistinctLowerWrite)
++        noteVfWrite(lowerWrite.reg, lowerWrite.lanes, oldLowerVf,
++                    decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency : decoded.lowerUsage.latency);
++    if (writtenVi != 0u)
++    {
++        m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
++        noteViWrite(writtenVi, oldVi,
++                    decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
++    }
++
++    markPairWrites(decoded);
++    if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
++        recordViWriteForBranch(writtenVi, oldVi);
++
++    m_state.vf[0][0] = 0.0f;
++    m_state.vf[0][1] = 0.0f;
++    m_state.vf[0][2] = 0.0f;
++    m_state.vf[0][3] = 1.0f;
++    m_state.vi[0] = 0;
++
++    uint32_t nextPc = m_state.pc + 8u;
++    if (nextPc >= codeSize)
++        nextPc = 0u;
++    m_state.pc = nextPc;
++
++    if (m_state.branchPending)
++    {
++        if (m_state.branchDelay == 0u)
++        {
++            m_state.pc = m_state.branchTarget & microAddressMask();
++            m_state.branchPending = false;
++        }
++        else
++        {
++            --m_state.branchDelay;
++        }
++    }
++
++    const bool dHalt = decoded.dBit && m_state.dBitEnabled;
++    const bool tHalt = decoded.tBit && m_state.tBitEnabled;
++    const bool haltBit = dHalt || tHalt;
++    const bool haltBranch = haltBit && decoded.lowerUsage.pipeline == PipelineBranch;
++
++    if (m_state.haltAfterDelaySlot)
++    {
++        m_state.stoppedByD = m_pendingHaltD;
++        m_state.stoppedByT = m_pendingHaltT;
++        programEnded = true;
++    }
++    else if (m_state.ebit)
++        programEnded = true;
++    else if (haltBit && !haltBranch)
++    {
++        m_state.stoppedByD = dHalt;
++        m_state.stoppedByT = tHalt;
++        programEnded = true;
++    }
++    else if (decoded.eBit)
++        m_state.ebit = true;
++    else if (haltBranch)
++    {
++        m_state.haltAfterDelaySlot = true;
++        m_pendingHaltD = dHalt;
++        m_pendingHaltT = tHalt;
++    }
++
++    advanceOneCycle();
++    return programEnded ? PairResult::Ended : PairResult::Next;
++}
++
++struct VU1Interpreter::CompiledAccess
++{
++    // Block exit codes; kNext only between the pairs of a block.
++    enum : int
++    {
++        kNext = 0,
++        kLeave = 1,     // continue the run loop at the current pc
++        kStop = 2,      // the cycle budget ran out
++        kEnded = 3,     // the program ended
++        kInterpret = 4  // interpret the pair at the current pc
++    };
++
++    // One pair, specialized: a function of its own, so a block stays a short list of calls (and identical pairs
++    // share the code); kNext once it issued and nothing ended the run.
++    template <uint32_t Lower, uint32_t Upper>
++    static VU1_NOINLINE VU1_NO_STACK_PROTECTOR int pair(VU1Interpreter &vu, uint64_t budgetEnd)
++    {
++        static constexpr DecodedInstructionPair kPair = decodePair(Lower, Upper, Unit::VU1);
++        if constexpr (kPair.upperUsage.reserved || kPair.lowerUsage.reserved)
++            return kInterpret;
++        else
++        {
++            if (vu.m_cycle >= budgetEnd || vu.m_stopRequested)
++                return kLeave;
++            const PairResult result = vu.stepPair<true>(kPair, kCompiledCodeSize, budgetEnd);
++            return result == PairResult::Next ? kNext : result == PairResult::Ended ? kEnded : kStop;
++        }
++    }
++
++    // The pair at the current pc, then kNext if execution falls through to nextPc.
++    template <uint32_t Lower, uint32_t Upper>
++    static VU1_ALWAYS_INLINE int step(VU1Interpreter &vu, uint64_t budgetEnd, uint32_t nextPc)
++    {
++        const int exit = pair<Lower, Upper>(vu, budgetEnd);
++        if (exit != kNext)
++            return exit;
++        return vu.m_state.pc == nextPc ? kNext : kLeave;
++    }
++};
++
++#endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/include/runtime/ps2_vu1_lower.inl
+similarity index 97%
+rename from ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+rename to ps2xRuntime/include/runtime/ps2_vu1_lower.inl
+index 94be789..7da0f6a 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/include/runtime/ps2_vu1_lower.inl
+@@ -1,16 +1,10 @@
+-#include "runtime/ps2_vu1.h"
+-#include "runtime/gs/ps2_gif_arbiter.h"
+-#include "runtime/gs/gs_frontend.h"
+-#include "runtime/ps2_memory.h"
+-#include "ps2_vu1_detail.h"
++// Included by ps2_vu1_exec.h.
++#ifndef PS2_VU1_LOWER_INL
++#define PS2_VU1_LOWER_INL
+ 
+-#include <cmath>
+-#include <cstring>
+-#include <limits>
+-
+-namespace
++namespace ps2_vu1_lower_ops
+ {
+-    float vuEatan(float value)
++    inline float vuEatan(float value)
+     {
+         constexpr float coefficients[] = {
+             0.999999344348907f,
+@@ -30,7 +24,7 @@ namespace
+         return quarterPi + value * polynomial;
+     }
+ 
+-    float vuEsin(float value)
++    inline float vuEsin(float value)
+     {
+         constexpr float coefficients[] = {
+             1.0f,
+@@ -46,7 +40,7 @@ namespace
+         return value * polynomial;
+     }
+ 
+-    float vuEexp(float value)
++    inline float vuEexp(float value)
+     {
+         constexpr float coefficients[] = {
+             0.249998688697815f,
+@@ -69,8 +63,9 @@ namespace
+ // ============================================================================
+ // Lower instructions
+ // ============================================================================
+-void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
++VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
+ {
++    using namespace ps2_vu1_lower_ops;
+     (void)upperInstr;
+     if (instr == 0x00000000 || instr == 0x8000033C) // NOP
+         return;
+@@ -83,7 +78,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     {
+     case 0x00: // LQ (Load Quadword from VU data memory)
+     {
+-        uint8_t it = FT(instr);  // VF destination
++        uint8_t it = VFT(instr);  // VF destination
+         uint8_t is = VIS(instr); // VI base
+         uint8_t dest = (instr >> 21) & 0xF;
+         int16_t imm = IMM11(instr);
+@@ -99,7 +94,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     }
+     case 0x01: // SQ (Store Quadword to VU data memory)
+     {
+-        uint8_t is = FS(instr);  // VF source
++        uint8_t is = VFS(instr);  // VF source
+         uint8_t it = VIT(instr); // VI base
+         uint8_t dest = (instr >> 21) & 0xF;
+         int16_t imm = IMM11(instr);
+@@ -386,8 +381,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     case 0x40: // Lower1 / lower special. Bit31 set; low 6 bits select integer or special op.
+     {
+         const uint8_t funct = instr & 0x3Fu;
+-        const uint8_t vfT = FT(instr);
+-        const uint8_t vfS = FS(instr);
++        const uint8_t vfT = VFT(instr);
++        const uint8_t vfS = VFS(instr);
+         const uint8_t viT = VIT(instr);
+         const uint8_t viS = VIS(instr);
+         const uint8_t viD = VID(instr);
+@@ -787,3 +782,5 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+         break;
+     }
+ }
++
++#endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/include/runtime/ps2_vu1_upper.inl
+similarity index 95%
+rename from ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+rename to ps2xRuntime/include/runtime/ps2_vu1_upper.inl
+index c7019e0..1238dc5 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/include/runtime/ps2_vu1_upper.inl
+@@ -1,13 +1,10 @@
+-#include "runtime/ps2_vu1.h"
+-#include "ps2_vu1_detail.h"
++// Included by ps2_vu1_exec.h.
++#ifndef PS2_VU1_UPPER_INL
++#define PS2_VU1_UPPER_INL
+ 
+-#include <cmath>
+-#include <cstring>
+-#include <limits>
+-
+-namespace
++namespace ps2_vu1_upper_ops
+ {
+-    int32_t vuFloatToInt(float value, float scale)
++    inline int32_t vuFloatToInt(float value, float scale)
+     {
+         const double scaled = static_cast<double>(value) * static_cast<double>(scale);
+         if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
+@@ -21,12 +18,13 @@ namespace
+ // ============================================================================
+ // Upper instructions (FMAC pipeline)
+ // ============================================================================
+-void VU1Interpreter::execUpper(uint32_t instr)
++VU1_ALWAYS_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
+ {
++    using namespace ps2_vu1_upper_ops;
+     uint8_t dest = DEST(instr);
+-    uint8_t ft = FT(instr);
+-    uint8_t fs = FS(instr);
+-    uint8_t fd = FD(instr);
++    uint8_t ft = VFT(instr);
++    uint8_t fs = VFS(instr);
++    uint8_t fd = VFD(instr);
+     uint8_t op = instr & 0x3F;
+     if (op >= 0x3Cu)
+     {
+@@ -231,3 +229,5 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         return;
+     }
+ }
++
++#endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 647e50d..ba20416 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,8 +1,7 @@
+-#include "runtime/ps2_vu1.h"
++#include "runtime/ps2_vu1_exec.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_memory.h"
+-#include "ps2_vu1_detail.h"
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -13,22 +12,13 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <limits>
++#include <mutex>
++#include <set>
++#include <vector>
+ #include <ps2_log.h>
+-#if defined(_MSC_VER)
+-#include <intrin.h>
+-#elif defined(USE_SSE2NEON)
+-#include "sse2neon.h"
+-#else
+-#include <immintrin.h>
+-#endif
+ 
+ namespace
+ {
+-    constexpr uint8_t laneForComponent(uint32_t component)
+-    {
+-        return static_cast<uint8_t>(1u << (3u - component));
+-    }
+-
+     // Lowest free slot of a pipeline whose valid entries are the set bits of mask; capacity if full.
+     template <uint32_t Capacity>
+     uint32_t freeSlot(uint32_t mask)
+@@ -36,85 +26,6 @@ namespace
+         const uint32_t slot = static_cast<uint32_t>(std::countr_zero(~mask));
+         return slot < Capacity ? slot : Capacity;
+     }
+-
+-    // Same flags as normalizeFmacExactResult for a value that is exact in double.
+-    uint8_t fmacExactFlags(double exact)
+-    {
+-        uint8_t flags = std::signbit(exact) ? 0x2u : 0u;
+-        const double magnitude = std::fabs(exact);
+-        if (magnitude == 0.0)
+-            flags |= 0x1u;
+-        else if (magnitude > static_cast<double>(std::numeric_limits<float>::max()))
+-            flags |= 0x8u;
+-        else if (magnitude < static_cast<double>(std::numeric_limits<float>::min()))
+-            flags |= 0x5u;
+-        return flags;
+-    }
+-
+-    // normalizeOperand on four lanes: denormals -> signed zero, Inf/NaN -> signed FLT_MAX.
+-    __m128 normalizeOperands(__m128 value)
+-    {
+-        const __m128i bits = _mm_castps_si128(value);
+-        const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+-        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int32_t>(0x80000000u)));
+-        __m128i out = _mm_blendv_epi8(bits, sign, _mm_cmpeq_epi32(exponent, _mm_setzero_si128()));
+-        out = _mm_blendv_epi8(out, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)),
+-                              _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000)));
+-        return _mm_castsi128_ps(out);
+-    }
+-
+-    // Lane sets below use bit c for component c (x = bit 0); MAC and dest masks use x = bit 3.
+-    constexpr uint8_t reverseLanes[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+-                                          0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+-
+-    // Dest mask (x = bit 3) -> all-ones float lanes.
+-    __m128 destLaneMask(uint8_t dest)
+-    {
+-        return _mm_castsi128_ps(_mm_set_epi32(-static_cast<int32_t>(dest & 1u), -static_cast<int32_t>((dest >> 1) & 1u),
+-                                              -static_cast<int32_t>((dest >> 2) & 1u), -static_cast<int32_t>((dest >> 3) & 1u)));
+-    }
+-
+-    // Lanes (of four doubles held as two halves) whose sign bit is set.
+-    uint32_t laneBits(__m128d lo, __m128d hi)
+-    {
+-        return static_cast<uint32_t>(_mm_movemask_pd(lo) | (_mm_movemask_pd(hi) << 2));
+-    }
+-}
+-
+-void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+-{
+-    if (lanes == 0u)
+-        return;
+-    for (uint32_t index = 0; index < usage.vfReadCount; ++index)
+-    {
+-        if (usage.vfRead[index].reg == reg)
+-        {
+-            usage.vfRead[index].lanes |= lanes;
+-            return;
+-        }
+-    }
+-    if (usage.vfReadCount < usage.vfRead.size())
+-        usage.vfRead[usage.vfReadCount++] = {reg, lanes};
+-}
+-
+-void VU1Interpreter::addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+-{
+-    if (reg == 0u || lanes == 0u)
+-        return;
+-    if (usage.vfWrite.reg == 0u)
+-        usage.vfWrite = {reg, lanes};
+-    else if (usage.vfWrite.reg == reg)
+-        usage.vfWrite.lanes |= lanes;
+-}
+-
+-uint8_t VU1Interpreter::vfReadLanes(const InstructionUsage &usage, uint8_t reg)
+-{
+-    for (uint32_t index = 0; index < usage.vfReadCount; ++index)
+-    {
+-        if (usage.vfRead[index].reg == reg)
+-            return usage.vfRead[index].lanes;
+-    }
+-    return 0u;
+ }
+ 
+ VU1Interpreter::VU1Interpreter(Unit unit)
+@@ -169,72 +80,6 @@ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+     return normalizeOperand(vf[bc & 3u]);
+ }
+ 
+-float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+-{
+-    uint32_t bits = 0;
+-    std::memcpy(&bits, &value, sizeof(bits));
+-    const uint32_t sign = bits & 0x80000000u;
+-    const uint32_t magnitude = bits & 0x7FFFFFFFu;
+-    const uint32_t exponent = (bits >> 23) & 0xFFu;
+-
+-    laneFlags = sign != 0u ? 0x2u : 0u;
+-    if (magnitude == 0u)
+-    {
+-        laneFlags |= 0x1u;
+-    }
+-    else if (exponent == 0u)
+-    {
+-        laneFlags |= 0x5u;
+-        bits = sign;
+-    }
+-    else if (exponent == 0xFFu)
+-    {
+-        laneFlags |= 0x8u;
+-        bits = sign | 0x7F7FFFFFu;
+-    }
+-
+-    std::memcpy(&value, &bits, sizeof(value));
+-    return value;
+-}
+-
+-uint32_t VU1Interpreter::microAddressMask() const
+-{
+-    return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu;
+-}
+-
+-int32_t VU1Interpreter::readBranchVi(uint8_t reg) const
+-{
+-    if (reg == 0u)
+-        return 0;
+-    if (m_viBranchBackupValid &&
+-        m_viBranchBackupReg == reg)
+-    {
+-        return m_viBranchBackupValue;
+-    }
+-    return m_state.vi[reg];
+-}
+-
+-void VU1Interpreter::recordViWriteForBranch(uint8_t reg, int32_t oldValue)
+-{
+-    if (reg == 0u)
+-        return;
+-    m_viBranchBackupValue = oldValue;
+-    m_viBranchBackupReg = reg;
+-    m_viBranchBackupValid = true;
+-}
+-
+-void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
+-{
+-    if (dest & 0x8u)
+-        dst[0] = result[0];
+-    if (dest & 0x4u)
+-        dst[1] = result[1];
+-    if (dest & 0x2u)
+-        dst[2] = result[2];
+-    if (dest & 0x1u)
+-        dst[3] = result[3];
+-}
+-
+ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
+                                                   long double exactResult) const
+ {
+@@ -265,26 +110,6 @@ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
+     return flags;
+ }
+ 
+-// Flag-pipeline entries all have the FMAC latency, so they land in issue order: a FIFO. They are applied
+-// lazily (syncFlags) before anything can observe MAC/status/clip: a lower op reading them, the FDIV status
+-// update, and the end of a run. Applying a ready entry late but in order gives the same state.
+-VU1Interpreter::FlagPipelineEntry *VU1Interpreter::allocFlagEntry(bool upper, uint32_t errorCode)
+-{
+-    if (m_flagCount == kMaxFlagEntries)
+-        syncFlags();
+-    if (m_flagCount == kMaxFlagEntries)
+-    {
+-        reportReservedInstruction(upper, errorCode);
+-        return nullptr;
+-    }
+-    FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount++) % kMaxFlagEntries];
+-    entry = {};
+-    entry.valid = true;
+-    entry.issueCycle = m_cycle;
+-    entry.readyCycle = m_cycle + kFmacLatency;
+-    return &entry;
+-}
+-
+ void VU1Interpreter::syncFlags()
+ {
+     for (; m_flagCount != 0u; m_flagHead = (m_flagHead + 1u) % kMaxFlagEntries, --m_flagCount)
+@@ -320,169 +145,6 @@ void VU1Interpreter::forFlagEntriesIssuedNow(F &&f)
+     }
+ }
+ 
+-// One upper FMAC op on all four lanes: result, exact Z/S/U/O flags and product-sticky flags.
+-// A float product is exact in double and the sum is rounded once, so a double result that is zero, or in
+-// [2^-125, 2^127), classifies like the exact one (same zero-ness and sign, no overflow or underflow) in any
+-// rounding mode; only the rest needs long double. Packed float/double ops round exactly like scalar ones.
+-void VU1Interpreter::execFmac(const DecodedInstructionPair &decoded)
+-{
+-    const uint32_t instr = decoded.upper;
+-    const uint8_t dest = DEST(instr);
+-    if (dest == 0u)
+-        return;
+-
+-    const uint8_t fs = FS(instr);
+-    const uint8_t ft = FT(instr);
+-    const FmacForm form = decoded.fmacForm;
+-    const FmacSource source = decoded.fmacSource;
+-    __m128 a;
+-    __m128 b;
+-    if (source == FmacCross)
+-    {
+-        // x/y/z = FS yzx * FT zxy; w only feeds OPMSUB's sticky flags (FS w * FT w).
+-        static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
+-        static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
+-        float left[4];
+-        float right[4];
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            const uint32_t l = crossLeft[component];
+-            const uint32_t r = crossRight[component];
+-            left[component] = (decoded.fmacUndeclaredFs & laneForComponent(l)) != 0u ? committedVfLane(fs, l) : m_state.vf[fs][l];
+-            right[component] = (decoded.fmacUndeclaredFt & laneForComponent(r)) != 0u ? committedVfLane(ft, r) : m_state.vf[ft][r];
+-        }
+-        a = _mm_loadu_ps(left);
+-        b = _mm_loadu_ps(right);
+-    }
+-    else
+-    {
+-        a = _mm_loadu_ps(m_state.vf[fs]);
+-        switch (source)
+-        {
+-        case FmacBroadcast: b = _mm_set1_ps(m_state.vf[ft][decoded.fmacBc]); break;
+-        case FmacQ: b = _mm_set1_ps(m_state.q); break;
+-        case FmacI: b = _mm_set1_ps(m_state.i); break;
+-        default: b = _mm_loadu_ps(m_state.vf[ft]); break;
+-        }
+-    }
+-    a = normalizeOperands(a);
+-    b = normalizeOperands(b);
+-    const __m128 acc = normalizeOperands(_mm_loadu_ps(m_state.acc));
+-
+-    const __m128d aLo = _mm_cvtps_pd(a), aHi = _mm_cvtps_pd(_mm_movehl_ps(a, a));
+-    const __m128d bLo = _mm_cvtps_pd(b), bHi = _mm_cvtps_pd(_mm_movehl_ps(b, b));
+-    const __m128d productLo = _mm_mul_pd(aLo, bLo), productHi = _mm_mul_pd(aHi, bHi); // exact
+-    __m128 value;
+-    __m128d exactLo, exactHi;
+-    switch (form)
+-    {
+-    case FmacAdd:
+-        value = _mm_add_ps(a, b);
+-        exactLo = _mm_add_pd(aLo, bLo), exactHi = _mm_add_pd(aHi, bHi);
+-        break;
+-    case FmacSub:
+-        value = _mm_sub_ps(a, b);
+-        exactLo = _mm_sub_pd(aLo, bLo), exactHi = _mm_sub_pd(aHi, bHi);
+-        break;
+-    case FmacMulAdd:
+-        value = _mm_add_ps(acc, _mm_mul_ps(a, b));
+-        exactLo = _mm_add_pd(_mm_cvtps_pd(acc), productLo);
+-        exactHi = _mm_add_pd(_mm_cvtps_pd(_mm_movehl_ps(acc, acc)), productHi);
+-        break;
+-    case FmacMulSub:
+-        value = _mm_sub_ps(acc, _mm_mul_ps(a, b));
+-        exactLo = _mm_sub_pd(_mm_cvtps_pd(acc), productLo);
+-        exactHi = _mm_sub_pd(_mm_cvtps_pd(_mm_movehl_ps(acc, acc)), productHi);
+-        break;
+-    default:
+-        value = _mm_mul_ps(a, b);
+-        exactLo = productLo, exactHi = productHi;
+-        break;
+-    }
+-
+-    const uint32_t destLanes = reverseLanes[dest];
+-    const __m128d absMask = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
+-    const __m128d zero = _mm_setzero_pd();
+-    uint32_t extraSticky = 0u;
+-    if (form == FmacMulAdd || form == FmacMulSub)
+-    {
+-        // Every product condition of a written lane accumulates into the sticky flags.
+-        const __m128d magLo = _mm_and_pd(productLo, absMask), magHi = _mm_and_pd(productHi, absMask);
+-        const __m128d maxFloat = _mm_set1_pd(std::numeric_limits<float>::max());
+-        const __m128d minFloat = _mm_set1_pd(std::numeric_limits<float>::min());
+-        const uint32_t isZero = laneBits(_mm_cmpeq_pd(magLo, zero), _mm_cmpeq_pd(magHi, zero)) & destLanes;
+-        const uint32_t isNegative = laneBits(productLo, productHi) & destLanes;
+-        const uint32_t isOver = laneBits(_mm_cmpgt_pd(magLo, maxFloat), _mm_cmpgt_pd(magHi, maxFloat)) & destLanes;
+-        const uint32_t isUnder = laneBits(_mm_cmplt_pd(magLo, minFloat), _mm_cmplt_pd(magHi, minFloat)) & destLanes & ~isZero;
+-        extraSticky = ((isZero | isUnder) != 0u ? 0x1u : 0u) | (isNegative != 0u ? 0x2u : 0u) |
+-                      (isUnder != 0u ? 0x4u : 0u) | (isOver != 0u ? 0x8u : 0u);
+-    }
+-
+-    const __m128d magLo = _mm_and_pd(exactLo, absMask), magHi = _mm_and_pd(exactHi, absMask);
+-    const __m128d lowest = _mm_set1_pd(0x1p-125), highest = _mm_set1_pd(0x1p127);
+-    uint32_t isZero = laneBits(_mm_cmpeq_pd(magLo, zero), _mm_cmpeq_pd(magHi, zero));
+-    uint32_t isNegative = laneBits(exactLo, exactHi);
+-    uint32_t inRange = laneBits(_mm_and_pd(_mm_cmpge_pd(magLo, lowest), _mm_cmplt_pd(magLo, highest)),
+-                                _mm_and_pd(_mm_cmpge_pd(magHi, lowest), _mm_cmplt_pd(magHi, highest)));
+-    if (source == FmacCross) // w is +0
+-    {
+-        isZero |= 0x8u;
+-        isNegative &= 0x7u;
+-        inRange &= 0x7u;
+-    }
+-
+-    alignas(16) float result[4];
+-    _mm_store_ps(result, value);
+-    uint32_t macZero = isZero & destLanes;
+-    uint32_t macSign = isNegative & destLanes;
+-    uint32_t macUnder = 0u;
+-    uint32_t macOver = 0u;
+-    for (uint32_t bits = macZero; bits != 0u; bits &= bits - 1u)
+-    {
+-        const uint32_t component = static_cast<uint32_t>(std::countr_zero(bits));
+-        result[component] = ((isNegative >> component) & 1u) != 0u ? -0.0f : 0.0f;
+-    }
+-    if (const uint32_t slow = destLanes & ~(inRange | isZero); slow != 0u)
+-    {
+-        alignas(16) float left[4], right[4], accum[4];
+-        _mm_store_ps(left, a);
+-        _mm_store_ps(right, b);
+-        _mm_store_ps(accum, acc);
+-        for (uint32_t bits = slow; bits != 0u; bits &= bits - 1u)
+-        {
+-            const uint32_t component = static_cast<uint32_t>(std::countr_zero(bits));
+-            const long double la = left[component], lb = right[component], lacc = accum[component];
+-            long double exact;
+-            switch (form)
+-            {
+-            case FmacAdd: exact = la + lb; break;
+-            case FmacSub: exact = la - lb; break;
+-            case FmacMulAdd: exact = lacc + la * lb; break;
+-            case FmacMulSub: exact = lacc - la * lb; break;
+-            default: exact = la * lb; break;
+-            }
+-            const uint32_t flags = normalizeFmacExactResult(result[component], exact);
+-            const uint32_t lane = 1u << component;
+-            macZero |= (flags & 0x1u) != 0u ? lane : 0u;
+-            macSign = (macSign & ~lane) | ((flags & 0x2u) != 0u ? lane : 0u);
+-            macUnder |= (flags & 0x4u) != 0u ? lane : 0u;
+-            macOver |= (flags & 0x8u) != 0u ? lane : 0u;
+-        }
+-    }
+-
+-    if (FlagPipelineEntry *entry = allocFlagEntry(true, 0xFFFFFFFFu))
+-    {
+-        entry->mac = static_cast<uint32_t>(reverseLanes[macZero]) | (static_cast<uint32_t>(reverseLanes[macSign]) << 4) |
+-                     (static_cast<uint32_t>(reverseLanes[macUnder]) << 8) | (static_cast<uint32_t>(reverseLanes[macOver]) << 12);
+-        entry->status = (macZero != 0u ? 0x1u : 0u) | (macSign != 0u ? 0x2u : 0u) |
+-                        (macUnder != 0u ? 0x4u : 0u) | (macOver != 0u ? 0x8u : 0u);
+-        entry->extraSticky = extraSticky;
+-        entry->writesMac = true;
+-        entry->writesStatus = true;
+-    }
+-    applyDest(decoded.fmacToAcc ? m_state.acc : m_state.vf[FD(instr)], result, dest);
+-}
+-
+ void VU1Interpreter::queueFsset(uint16_t immediate)
+ {
+     forFlagEntriesIssuedNow([](FlagPipelineEntry &entry) { entry.writesStatus = false; });
+@@ -614,38 +276,6 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint64_t readyCycl
+     m_viLatestWrite[reg] = write.sequence;
+ }
+ 
+-// Called before markPairWrites, so m_ready still holds the previous write's due cycle: if that write is
+-// already due, this write starts a new chain and the lane shows oldValue until this one lands.
+-inline void VU1Interpreter::noteVfWrite(uint8_t reg, uint8_t laneMask, const float oldValue[4], uint32_t latency)
+-{
+-    const __m128i cycle = _mm_set1_epi64x(static_cast<long long>(m_cycle));
+-    const __m128i pendingXY = _mm_cmpgt_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i *>(&m_ready[reg * 4u])), cycle);
+-    const __m128i pendingZW = _mm_cmpgt_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i *>(&m_ready[reg * 4u + 2u])), cycle);
+-    const __m128 pending = _mm_shuffle_ps(_mm_castsi128_ps(pendingXY), _mm_castsi128_ps(pendingZW), _MM_SHUFFLE(2, 0, 2, 0));
+-    const __m128 start = _mm_andnot_ps(pending, destLaneMask(laneMask));
+-    float *chain = m_vfChainStart[reg].data();
+-    _mm_storeu_ps(chain, _mm_blendv_ps(_mm_loadu_ps(chain), _mm_loadu_ps(oldValue), start));
+-    m_vfWrittenLanes[reg] |= laneMask;
+-    m_inflightReady = std::max(m_inflightReady, m_cycle + latency);
+-    if (m_vfWriteMask != 0u) // supersede a deferred write still queued for these lanes
+-    {
+-        ++m_nextWriteSequence;
+-        for (uint32_t component = 0; component < 4u; ++component)
+-            if ((laneMask & laneForComponent(component)) != 0u)
+-                m_vfLatestWrite[reg][component] = m_nextWriteSequence;
+-    }
+-}
+-
+-inline void VU1Interpreter::noteViWrite(uint8_t reg, int32_t oldValue, uint32_t latency)
+-{
+-    if (m_ready[kViSlot + reg] <= m_cycle)
+-        m_viChainStart[reg] = oldValue;
+-    m_viWritten |= static_cast<uint16_t>(1u << reg);
+-    m_inflightReady = std::max(m_inflightReady, m_cycle + latency);
+-    if (m_viWriteMask != 0u)
+-        m_viLatestWrite[reg] = ++m_nextWriteSequence;
+-}
+-
+ // The run stops with writes in flight: show what the pipeline shows and queue each lane's newest write (the
+ // only one that will still land) like the pipeline holds it, so flush and a later resume see it land.
+ void VU1Interpreter::deferInflightWrites()
+@@ -905,623 +535,126 @@ void VU1Interpreter::flushPipelines()
+         advanceOneCycle();
+ }
+ 
+-inline uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
++namespace
+ {
+-    uint64_t ready = m_cycle;
+-    for (uint32_t index = 0; index < decoded.readSlotCount; ++index)
+-        ready = std::max(ready, m_ready[decoded.readSlots[index]]);
+-
+-    if (decoded.lowerUsage.pipeline == PipelineFdiv && m_fdiv.valid)
+-        ready = std::max(ready, m_fdiv.readyCycle);
+-    if (decoded.lowerUsage.pipeline == PipelineEfu)
+-        ready = std::max(ready, m_efuResourceReady);
+-    if (decoded.lowerUsage.waitQ && m_fdiv.valid)
+-        ready = std::max(ready, m_fdiv.readyCycle);
+-    if (decoded.lowerUsage.waitP)
++    std::vector<const VU1Interpreter::CompiledBlock *> &compiledBlockRegistry()
+     {
+-        for (const ScalarPipelineEntry &entry : m_efu)
+-            if (entry.valid)
+-                ready = std::max(ready, entry.readyCycle);
++        static std::vector<const VU1Interpreter::CompiledBlock *> blocks;
++        return blocks;
+     }
+-    if (decoded.lowerUsage.pipeline == PipelineXgkick && m_xgkick.active)
+-        ready = std::max(ready, m_cycle + 1u);
+-    return ready;
+-}
+-
+-inline void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+-{
+-    for (uint32_t index = 0; index < decoded.writeSlotCount; ++index)
+-        m_ready[decoded.writeSlots[index]] = m_cycle + decoded.writeLatency[index];
+-}
+-
+-VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper) const
+-{
+-    InstructionUsage usage;
+-    usage.pipeline = PipelineFmac;
+-    usage.latency = kFmacLatency;
+-
+-    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+-    const uint8_t dest = DEST(upper);
+-    const uint8_t fs = FS(upper);
+-    const uint8_t ft = FT(upper);
+-    const uint8_t fd = FD(upper);
+ 
+-    if (op <= 0x2Fu)
++    const char *vu1DumpDir()
+     {
+-        addVfRead(usage, fs, dest);
+-        addVfWrite(usage, fd, dest);
+-        if (op <= 0x1Bu)
+-            addVfRead(usage, ft, laneForComponent(op & 3u));
+-        else if (op >= 0x28u)
+-            addVfRead(usage, ft, op == 0x2Eu ? 0xEu : dest);
+-        if (op == 0x08u || op == 0x09u || op == 0x0Au || op == 0x0Bu ||
+-            op == 0x0Cu || op == 0x0Du || op == 0x0Eu || op == 0x0Fu ||
+-            op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
+-            op == 0x29u || op == 0x2Du || op == 0x2Eu)
+-        {
+-            usage.accRead = dest;
+-        }
+-        return usage;
++        static const char *dir = std::getenv("PS2_VU1_DUMP_DIR");
++        return dir;
+     }
+ 
+-    if (op >= 0x3Cu)
++    bool &compiledBlocksEnabled()
+     {
+-        const uint8_t special = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
+-        const bool writesAcc =
+-            special <= 0x0Fu ||
+-            (special >= 0x18u && special <= 0x1Cu) ||
+-            special == 0x1Eu ||
+-            (special >= 0x20u && special <= 0x2Au) ||
+-            (special >= 0x2Cu && special <= 0x2Eu);
+-        if (writesAcc)
+-        {
+-            addVfRead(usage, fs, dest);
+-            if (special <= 0x1Bu)
+-                addVfRead(usage, ft, laneForComponent(special & 3u));
+-            else if ((special >= 0x28u && special <= 0x2Eu))
+-                addVfRead(usage, ft, special == 0x2Eu ? 0xEu : dest);
+-            usage.accWrite = dest;
+-            if ((special >= 0x08u && special <= 0x0Fu) ||
+-                special == 0x21u || special == 0x23u || special == 0x25u ||
+-                special == 0x27u || special == 0x29u || special == 0x2Du)
+-            {
+-                usage.accRead = dest;
+-            }
+-        }
+-        else if (special >= 0x10u && special <= 0x17u)
+-        {
+-            addVfRead(usage, fs, dest);
+-            addVfWrite(usage, ft, dest);
+-        }
+-        else if (special == 0x1Du)
+-        {
+-            addVfRead(usage, fs, dest);
+-            addVfWrite(usage, ft, dest);
+-        }
+-        else if (special == 0x1Fu)
+-        {
+-            addVfRead(usage, fs, 0xEu);
+-            addVfRead(usage, ft, 0x1u);
+-            usage.writesClip = true;
+-        }
+-        else if (special != 0x2Fu && special != 0x30u)
+-        {
+-            usage.reserved = true;
+-        }
+-        return usage;
++        static bool enabled = std::getenv("PS2_VU1_INTERPRET") == nullptr;
++        return enabled;
+     }
+-
+-    usage.reserved = true;
+-    return usage;
+ }
+ 
+-VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower) const
++void VU1Interpreter::registerCompiledBlocks(const CompiledBlock *blocks, size_t count)
+ {
+-    InstructionUsage usage;
+-    if (lower == 0u || lower == 0x8000033Cu)
+-        return usage;
+-
+-    const uint8_t opHi = static_cast<uint8_t>((lower >> 25) & 0x7Fu);
+-    const uint8_t vfT = FT(lower);
+-    const uint8_t vfS = FS(lower);
+-    const uint8_t viT = VIT(lower);
+-    const uint8_t viS = VIS(lower);
+-    const uint8_t viD = VID(lower);
+-    const uint8_t dest = DEST(lower);
+-    auto readVi = [&](uint8_t reg)
+-    {
+-        if (reg != 0u)
+-            usage.viRead |= static_cast<uint16_t>(1u << reg);
+-    };
+-    auto writeVi = [&](uint8_t reg)
+-    {
+-        if (reg != 0u)
+-            usage.viWrite |= static_cast<uint16_t>(1u << reg);
+-    };
++    for (size_t i = 0; i < count; ++i)
++        compiledBlockRegistry().push_back(&blocks[i]);
++}
+ 
+-    switch (opHi)
++void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
++                                             const PS2Memory *memory, uint64_t generation)
++{
++    const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
++    for (uint32_t i = 0; i < pairCount; ++i)
++        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
++    bindCompiledBlocks(vuCode, codeSize);
++    if (vu1DumpDir() != nullptr)
+     {
+-    case 0x00:
+-        usage.pipeline = PipelineLsu;
+-        usage.latency = 4u;
+-        readVi(viS);
+-        addVfWrite(usage, vfT, dest);
+-        return usage;
+-    case 0x01:
+-        usage.pipeline = PipelineLsu;
+-        usage.latency = 1u;
+-        readVi(viT);
+-        addVfRead(usage, vfS, dest);
+-        return usage;
+-    case 0x04:
+-        usage.pipeline = PipelineLsu;
+-        usage.latency = 4u;
+-        readVi(viS);
+-        writeVi(viT);
+-        return usage;
+-    case 0x05:
+-        usage.pipeline = PipelineLsu;
+-        usage.latency = 1u;
+-        readVi(viS);
+-        readVi(viT);
+-        return usage;
+-    case 0x08:
+-    case 0x09:
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        usage.delaysNextBranchRead = true;
+-        readVi(viS);
+-        writeVi(viT);
+-        return usage;
+-    case 0x10:
+-    case 0x12:
+-    case 0x13:
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        usage.readsClip = true;
+-        writeVi(1u);
+-        return usage;
+-    case 0x11:
+-        usage.pipeline = PipelineFmac;
+-        usage.latency = kFmacLatency;
+-        usage.writesClip = true;
+-        return usage;
+-    case 0x14:
+-    case 0x16:
+-    case 0x17:
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        writeVi(viT);
+-        return usage;
+-    case 0x15:
+-        usage.pipeline = PipelineFmac;
+-        usage.latency = kFmacLatency;
+-        return usage;
+-    case 0x18:
+-    case 0x1A:
+-    case 0x1B:
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        readVi(viS);
+-        writeVi(viT);
+-        return usage;
+-    case 0x1C:
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        usage.readsClip = true;
+-        writeVi(viT);
+-        return usage;
+-    case 0x20:
+-        usage.pipeline = PipelineBranch;
+-        return usage;
+-    case 0x21:
+-        usage.pipeline = PipelineBranch;
+-        usage.latency = 1u;
+-        writeVi(viT);
+-        return usage;
+-    case 0x24:
+-        usage.pipeline = PipelineBranch;
+-        readVi(viS);
+-        return usage;
+-    case 0x25:
+-        usage.pipeline = PipelineBranch;
+-        usage.latency = 1u;
+-        readVi(viS);
+-        writeVi(viT);
+-        return usage;
+-    case 0x28:
+-    case 0x29:
+-        usage.pipeline = PipelineBranch;
+-        readVi(viS);
+-        readVi(viT);
+-        return usage;
+-    case 0x2C:
+-    case 0x2D:
+-    case 0x2E:
+-    case 0x2F:
+-        usage.pipeline = PipelineBranch;
+-        readVi(viS);
+-        return usage;
+-    case 0x40:
+-        break;
+-    default:
+-        usage.reserved = true;
+-        return usage;
++        uint64_t hash = 1469598103934665603ull;
++        for (uint32_t i = 0; i < codeSize; ++i)
++            hash = (hash ^ vuCode[i]) * 1099511628211ull;
++        m_cachedCodeHash = hash;
+     }
+ 
+-    const uint8_t direct = static_cast<uint8_t>(lower & 0x3Fu);
+-    if (direct == 0x30u || direct == 0x31u || direct == 0x34u || direct == 0x35u)
+-    {
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        usage.delaysNextBranchRead = true;
+-        readVi(viS);
+-        readVi(viT);
+-        writeVi(viD);
+-        return usage;
+-    }
+-    if (direct == 0x32u)
+-    {
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        usage.delaysNextBranchRead = true;
+-        readVi(viS);
+-        writeVi(viT);
+-        return usage;
+-    }
+-    if (direct < 0x3Cu)
+-    {
+-        usage.reserved = true;
+-        return usage;
+-    }
++    m_cachedVuCode = vuCode;
++    m_cachedMemory = memory;
++    m_cachedCodeSize = codeSize;
++    m_cachedCodeGeneration = generation;
++    m_decodedCodeCacheValid = true;
++}
+ 
+-    const uint8_t special = static_cast<uint8_t>((lower & 3u) | ((lower >> 4) & 0x7Cu));
+-    switch (special)
+-    {
+-    case 0x30:
+-    case 0x31:
+-        usage.pipeline = PipelineFmac;
+-        usage.latency = 4u;
+-        addVfRead(usage, vfS, special == 0x31u ? 0xFu : dest);
+-        addVfWrite(usage, vfT, dest);
+-        break;
+-    case 0x34:
+-    case 0x36:
+-        usage.pipeline = PipelineLsu;
+-        usage.latency = 4u;
+-        usage.viLatency = 1u;
+-        usage.delaysNextBranchRead = true;
+-        readVi(viS);
+-        writeVi(viS);
+-        addVfWrite(usage, vfT, dest);
+-        break;
+-    case 0x35:
+-    case 0x37:
+-        usage.pipeline = PipelineLsu;
+-        usage.latency = 1u;
+-        usage.delaysNextBranchRead = true;
+-        readVi(viT);
+-        writeVi(viT);
+-        addVfRead(usage, vfS, dest);
+-        break;
+-    case 0x38:
+-        usage.pipeline = PipelineFdiv;
+-        usage.latency = 7u;
+-        addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
+-        addVfRead(usage, vfT, laneForComponent((lower >> 23) & 3u));
+-        break;
+-    case 0x39:
+-        usage.pipeline = PipelineFdiv;
+-        usage.latency = 7u;
+-        addVfRead(usage, vfT, laneForComponent((lower >> 23) & 3u));
+-        break;
+-    case 0x3A:
+-        usage.pipeline = PipelineFdiv;
+-        usage.latency = 13u;
+-        addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
+-        addVfRead(usage, vfT, laneForComponent((lower >> 23) & 3u));
+-        break;
+-    case 0x3B:
+-        usage.pipeline = PipelineFdiv;
+-        usage.waitQ = true;
+-        break;
+-    case 0x3C:
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        usage.delaysNextBranchRead = true;
+-        addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
+-        writeVi(viT);
+-        break;
+-    case 0x3D:
+-        usage.pipeline = PipelineFmac;
+-        usage.latency = 4u;
+-        readVi(viS);
+-        addVfWrite(usage, vfT, dest);
+-        break;
+-    case 0x3E:
+-        usage.pipeline = PipelineLsu;
+-        usage.latency = 4u;
+-        readVi(viS);
+-        writeVi(viT);
+-        break;
+-    case 0x3F:
+-        usage.pipeline = PipelineLsu;
+-        usage.latency = 1u;
+-        readVi(viS);
+-        readVi(viT);
+-        break;
+-    case 0x40:
+-    case 0x41:
+-        usage.pipeline = PipelineFmac;
+-        usage.latency = 4u;
+-        addVfWrite(usage, vfT, dest);
+-        break;
+-    case 0x42:
+-    case 0x43:
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
+-        break;
+-    case 0x64:
+-        if (m_unit == Unit::VU0)
+-        {
+-            usage.reserved = true;
+-            break;
+-        }
+-        usage.pipeline = PipelineFmac;
+-        usage.latency = 4u;
+-        addVfWrite(usage, vfT, dest);
+-        break;
+-    case 0x68:
+-    case 0x69:
+-        usage.pipeline = PipelineIalu;
+-        usage.latency = 1u;
+-        writeVi(viT);
+-        break;
+-    case 0x6C:
+-        if (m_unit == Unit::VU0)
+-        {
+-            usage.reserved = true;
+-            break;
+-        }
+-        usage.pipeline = PipelineXgkick;
+-        usage.latency = 2u;
+-        readVi(viS);
+-        break;
+-    case 0x70:
+-    case 0x71:
+-    case 0x72:
+-    case 0x73:
+-    case 0x74:
+-    case 0x75:
+-    case 0x76:
+-    case 0x77:
+-    case 0x78:
+-    case 0x79:
+-    case 0x7A:
+-    case 0x7C:
+-    case 0x7D:
+-        if (m_unit == Unit::VU0)
+-        {
+-            usage.reserved = true;
+-            break;
+-        }
+-        usage.pipeline = PipelineEfu;
+-        switch (special)
+-        {
+-        case 0x70:
+-            usage.latency = 11u;
+-            break;
+-        case 0x71:
+-        case 0x72:
+-        case 0x77:
+-            usage.latency = 18u;
+-            break;
+-        case 0x73:
+-            usage.latency = 24u;
+-            break;
+-        case 0x74:
+-        case 0x75:
+-        case 0x7C:
+-            usage.latency = 54u;
+-            break;
+-        case 0x76:
+-        case 0x78:
+-        case 0x7A:
+-            usage.latency = 12u;
+-            break;
+-        case 0x79:
+-            usage.latency = 29u;
+-            break;
+-        case 0x7D:
+-            usage.latency = 44u;
+-            break;
+-        default:
+-            break;
+-        }
+-        if (special >= 0x70u && special <= 0x73u)
+-            addVfRead(usage, vfS, 0xEu);
+-        else if (special == 0x74u)
+-            addVfRead(usage, vfS, 0xCu);
+-        else if (special == 0x75u)
+-            addVfRead(usage, vfS, 0xAu);
+-        else if (special == 0x76u)
+-            addVfRead(usage, vfS, 0xFu);
+-        else
+-            addVfRead(usage, vfS, laneForComponent((lower >> 21) & 3u));
+-        break;
+-    case 0x7B:
+-        if (m_unit == Unit::VU0)
+-        {
+-            usage.reserved = true;
+-            break;
+-        }
+-        usage.pipeline = PipelineEfu;
+-        usage.waitP = true;
+-        break;
+-    default:
+-        usage.reserved = true;
+-        break;
+-    }
+-    return usage;
++void VU1Interpreter::setCompiledBlocksEnabled(bool enabled)
++{
++    compiledBlocksEnabled() = enabled;
+ }
+ 
+-VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const
++// A block is only valid for code whose words match the ones it was compiled from.
++void VU1Interpreter::bindCompiledBlocks(const uint8_t *vuCode, uint32_t codeSize)
+ {
+-    DecodedInstructionPair decoded;
+-    std::memcpy(&decoded.lower, vuCode + pc, sizeof(decoded.lower));
+-    std::memcpy(&decoded.upper, vuCode + pc + sizeof(decoded.lower), sizeof(decoded.upper));
+-    decoded.iBit = (decoded.upper & 0x80000000u) != 0u;
+-    decoded.eBit = (decoded.upper & 0x40000000u) != 0u;
+-    decoded.mBit = (decoded.upper & 0x20000000u) != 0u;
+-    decoded.dBit = (decoded.upper & 0x10000000u) != 0u;
+-    decoded.tBit = (decoded.upper & 0x08000000u) != 0u;
+-    decoded.upperUsage = decodeUpperUsage(decoded.upper);
+-    if (!decoded.iBit)
+-        decoded.lowerUsage = decodeLowerUsage(decoded.lower);
+-
+-    const uint8_t upperWriteReg = decoded.upperUsage.vfWrite.reg;
+-    if (upperWriteReg != 0u && (vfReadLanes(decoded.lowerUsage, upperWriteReg) != 0u || decoded.lowerUsage.vfWrite.reg == upperWriteReg))
++    m_compiledBlocks.fill(nullptr);
++    m_hasCompiledBlocks = false;
++    m_compiledBlocksBound = compiledBlocksEnabled();
++    if (!m_compiledBlocksBound || m_unit != Unit::VU1 || codeSize != kCompiledCodeSize)
++        return;
++    for (const CompiledBlock *block : compiledBlockRegistry())
+     {
+-        decoded.upperVfShadowReg = upperWriteReg;
+-        if (decoded.lowerUsage.vfWrite.reg == upperWriteReg)
+-            decoded.suppressedLowerVf = upperWriteReg;
++        const uint32_t pairIndex = block->pc / 8u;
++        if ((block->pc & 7u) != 0u || block->pc + block->pairCount * 8u > codeSize || m_compiledBlocks[pairIndex] ||
++            std::memcmp(vuCode + block->pc, block->words, block->pairCount * 8u) != 0)
++            continue;
++        m_compiledBlocks[pairIndex] = block->fn;
++        m_hasCompiledBlocks = true;
+     }
+-    const uint32_t lowerOp = decoded.lower >> 25;
+-    decoded.lowerReadsFlags = !decoded.iBit && lowerOp >= 0x10u && lowerOp <= 0x1Cu &&
+-                              lowerOp != 0x11u && lowerOp != 0x15u && lowerOp != 0x19u; // FCxx/FSxx/FMxx reads
+-    decodeFmac(decoded);
+-    decodeScoreboardSlots(decoded);
+-    return decoded;
+ }
+ 
+-void VU1Interpreter::decodeFmac(DecodedInstructionPair &decoded)
++// PS2_VU1_DUMP_DIR=<dir>: writes each VU1 code image runs start in as vu1-<hash>.bin and appends the pcs they
++// start at to vu1-<hash>.entries: the input for compiling the microcode into blocks.
++void VU1Interpreter::dumpCodeForCompiler(const uint8_t *vuCode, uint32_t codeSize)
+ {
+-    const uint32_t upper = decoded.upper;
+-    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+-    const bool special = op >= 0x3Cu;
+-    // The upper special group (ADDA, MADDA, ...) reuses the same selector layout.
+-    const uint8_t sel = special ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
+-    if (op >= 0x30u && !special)
++    static std::mutex mutex;
++    static std::set<std::pair<uint64_t, uint32_t>> seen;
++    std::lock_guard<std::mutex> lock(mutex);
++    if (!seen.insert({m_cachedCodeHash, m_state.pc}).second)
+         return;
+-
+-    FmacForm form = FmacNone;
+-    FmacSource source = FmacVector;
+-    if (sel <= 0x0Fu)
++    char name[64];
++    std::snprintf(name, sizeof(name), "vu1-%016llx", static_cast<unsigned long long>(m_cachedCodeHash));
++    const std::string base = (std::filesystem::path(vu1DumpDir()) / name).string();
++    if (!std::filesystem::exists(base + ".bin"))
+     {
+-        form = static_cast<FmacForm>(FmacAdd + (sel >> 2)); // Add, Sub, MulAdd, MulSub
+-        source = FmacBroadcast;
+-    }
+-    else if (sel >= 0x18u && sel <= 0x1Bu)
+-    {
+-        form = FmacMul;
+-        source = FmacBroadcast;
+-    }
+-    else
+-    {
+-        switch (sel)
++        if (FILE *f = std::fopen((base + ".bin").c_str(), "wb"))
+         {
+-        case 0x1Cu: form = FmacMul, source = FmacQ; break;
+-        case 0x1Eu: form = FmacMul, source = FmacI; break;
+-        case 0x20u: form = FmacAdd, source = FmacQ; break;
+-        case 0x21u: form = FmacMulAdd, source = FmacQ; break;
+-        case 0x22u: form = FmacAdd, source = FmacI; break;
+-        case 0x23u: form = FmacMulAdd, source = FmacI; break;
+-        case 0x24u: form = FmacSub, source = FmacQ; break;
+-        case 0x25u: form = FmacMulSub, source = FmacQ; break;
+-        case 0x26u: form = FmacSub, source = FmacI; break;
+-        case 0x27u: form = FmacMulSub, source = FmacI; break;
+-        case 0x28u: form = FmacAdd; break;
+-        case 0x29u: form = FmacMulAdd; break;
+-        case 0x2Au: form = FmacMul; break;
+-        case 0x2Cu: form = FmacSub; break;
+-        case 0x2Du: form = FmacMulSub; break;
+-        case 0x2Eu: // OPMSUB (acc - cross) / OPMULA (cross)
+-            form = special ? FmacMul : FmacMulSub;
+-            source = FmacCross;
+-            break;
+-        default:
+-            return;
++            std::fwrite(vuCode, 1, codeSize, f);
++            std::fclose(f);
+         }
+     }
+-    decoded.fmacForm = form;
+-    decoded.fmacSource = source;
+-    decoded.fmacBc = static_cast<uint8_t>(sel & 3u);
+-    decoded.fmacToAcc = special;
+-    if (source != FmacCross)
+-        return;
+-
+-    // Cross lanes: result x/y/z reads FS y/z/x and FT z/x/y; OPMSUB's w product (sticky flags only) reads
+-    // FS w and FT w. Usage declares FS = dest and FT = xyz, so other lanes are read without a stall.
+-    static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
+-    static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
+-    const uint8_t dest = DEST(upper);
+-    uint8_t fsLanes = 0u;
+-    uint8_t ftLanes = 0u;
+-    for (uint32_t component = 0; component < 4u; ++component)
++    if (FILE *f = std::fopen((base + ".entries").c_str(), "a"))
+     {
+-        if ((dest & laneForComponent(component)) == 0u || (component == 3u && form == FmacMul))
+-            continue;
+-        fsLanes |= laneForComponent(crossLeft[component]);
+-        ftLanes |= laneForComponent(crossRight[component]);
++        std::fprintf(f, "%04x\n", m_state.pc);
++        std::fclose(f);
+     }
+-    const bool sameReg = FS(upper) == FT(upper);
+-    const uint8_t fsDeclared = sameReg ? static_cast<uint8_t>(dest | 0xEu) : dest;
+-    const uint8_t ftDeclared = sameReg ? static_cast<uint8_t>(dest | 0xEu) : 0xEu;
+-    decoded.fmacUndeclaredFs = static_cast<uint8_t>(fsLanes & ~fsDeclared);
+-    decoded.fmacUndeclaredFt = static_cast<uint8_t>(ftLanes & ~ftDeclared);
+ }
+ 
+-void VU1Interpreter::decodeScoreboardSlots(DecodedInstructionPair &decoded)
++VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const
+ {
+-    const auto addLanes = [](auto &slots, uint8_t &count, uint32_t base, uint8_t lanes)
+-    {
+-        for (uint32_t component = 0; component < 4u; ++component)
+-            if ((lanes & laneForComponent(component)) != 0u)
+-                slots[count++] = static_cast<uint8_t>(base + component);
+-    };
+-    for (const InstructionUsage *usage : {&decoded.upperUsage, &decoded.lowerUsage})
+-    {
+-        for (uint32_t index = 0; index < usage->vfReadCount; ++index)
+-            addLanes(decoded.readSlots, decoded.readSlotCount, usage->vfRead[index].reg * 4u, usage->vfRead[index].lanes);
+-        for (uint32_t bits = usage->viRead & 0xFFFEu; bits != 0u; bits &= bits - 1u)
+-            decoded.readSlots[decoded.readSlotCount++] = static_cast<uint8_t>(kViSlot + std::countr_zero(bits));
+-    }
++    uint32_t words[2];
++    std::memcpy(words, vuCode + pc, sizeof(words));
++    return decodePair(words[0], words[1], m_unit);
++}
+ 
+-    // Same order as the writes land: lower VF, upper VF, VI. ACC is left out: its latency-1 write is
+-    // readable by the next pair, so it never stalls one.
+-    const auto addWrites = [&decoded, &addLanes](uint32_t base, uint8_t lanes, uint32_t latency)
+-    {
+-        const uint8_t start = decoded.writeSlotCount;
+-        addLanes(decoded.writeSlots, decoded.writeSlotCount, base, lanes);
+-        for (uint8_t index = start; index < decoded.writeSlotCount; ++index)
+-            decoded.writeLatency[index] = static_cast<uint8_t>(latency);
+-    };
+-    const InstructionUsage &lower = decoded.lowerUsage;
+-    const InstructionUsage &upper = decoded.upperUsage;
+-    if (lower.vfWrite.reg != 0u && decoded.suppressedLowerVf != lower.vfWrite.reg)
+-        addWrites(lower.vfWrite.reg * 4u, lower.vfWrite.lanes, lower.vfLatency != 0u ? lower.vfLatency : lower.latency);
+-    if (upper.vfWrite.reg != 0u)
+-        addWrites(upper.vfWrite.reg * 4u, upper.vfWrite.lanes, upper.vfLatency != 0u ? upper.vfLatency : upper.latency);
+-    for (uint32_t bits = lower.viWrite & 0xFFFEu; bits != 0u; bits &= bits - 1u)
+-    {
+-        decoded.writeSlots[decoded.writeSlotCount] = static_cast<uint8_t>(kViSlot + std::countr_zero(bits));
+-        decoded.writeLatency[decoded.writeSlotCount++] = lower.viLatency != 0u ? lower.viLatency : lower.latency;
+-    }
++void VU1Interpreter::execFmac(const DecodedInstructionPair &decoded)
++{
++    execFmacInline(decoded);
+ }
+ 
+-void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+-                                             const PS2Memory *memory, uint64_t generation)
++void VU1Interpreter::execUpper(uint32_t instr)
+ {
+-    const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
+-    for (uint32_t i = 0; i < pairCount; ++i)
+-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
++    execUpperInline(instr);
++}
+ 
+-    m_cachedVuCode = vuCode;
+-    m_cachedMemory = memory;
+-    m_cachedCodeSize = codeSize;
+-    m_cachedCodeGeneration = generation;
+-    m_decodedCodeCacheValid = true;
++void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
++{
++    execLowerInline(instr, vuData, dataSize, gs, memory, upperInstr);
+ }
+ 
+ // VU code cannot change while a microprogram runs, so the decoded cache is validated once per run.
+@@ -1538,7 +671,8 @@ bool VU1Interpreter::prepareDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+         m_cachedVuCode != vuCode ||
+         m_cachedMemory != memory ||
+         m_cachedCodeSize != codeSize ||
+-        m_cachedCodeGeneration != generation)
++        m_cachedCodeGeneration != generation ||
++        m_compiledBlocksBound != compiledBlocksEnabled())
+     {
+         rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
+     }
+@@ -1606,6 +740,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     const bool codeCached = prepareDecodedCodeCache(vuCode, codeSize, memory);
++    if (codeCached && m_unit == Unit::VU1 && vu1DumpDir() != nullptr)
++        dumpCodeForCompiler(vuCode, codeSize);
+     bool programEnded = false;
+     // Afterwards every cycle step commits what lands on it (advanceOneCycle), and nothing a pair queues
+     // lands in the cycle it issues in.
+@@ -1615,6 +751,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
++        if (m_hasCompiledBlocks && codeCached && (m_state.pc & 7u) == 0u)
++        {
++            if (const CompiledBlockFn block = m_compiledBlocks[m_state.pc / 8u])
++            {
++                const int exit = block(*this, budgetEnd);
++                if (exit == CompiledAccess::kLeave)
++                    continue;
++                if (exit == CompiledAccess::kStop)
++                    break;
++                if (exit == CompiledAccess::kEnded)
++                {
++                    programEnded = true;
++                    break;
++                }
++                // kInterpret: the interpreter takes this pair.
++            }
++        }
++
+         const uint32_t pairIndex = m_state.pc / 8u;
+         const DecodedInstructionPair &decoded =
+             codeCached && (m_state.pc & 7u) == 0u && pairIndex < kMaxDecodedPairs
+@@ -1626,159 +780,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             break;
+         }
+ 
+-        uint64_t readyCycle = calculatePairReadyCycle(decoded);
+-        while (readyCycle > m_cycle)
+-        {
+-            if (readyCycle >= budgetEnd)
+-            {
+-                advanceTo(budgetEnd);
+-                break;
+-            }
+-            advanceTo(readyCycle);
+-            readyCycle = calculatePairReadyCycle(decoded);
+-        }
+-        if (m_cycle >= budgetEnd)
++        const PairResult result = stepPair<false>(decoded, codeSize, budgetEnd);
++        if (result == PairResult::Stopped)
+             break;
+-
+-        uint8_t writtenVi = 0u;
+-        int32_t oldVi = 0;
+-        if (const uint32_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
+-        {
+-            writtenVi = static_cast<uint8_t>(std::countr_zero(viWrites));
+-            // The value the pipeline shows: a branch in the next pair reads it (recordViWriteForBranch).
+-            oldVi = m_ready[kViSlot + writtenVi] > m_cycle ? m_viChainStart[writtenVi] : m_state.vi[writtenVi];
+-        }
+-
+-        const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+-        const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+-        const bool hasUpperWrite = upperWrite.reg != 0u;
+-        const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+-        const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
+-        if (decoded.lowerReadsFlags)
+-            syncFlags();
+-        float oldUpperVf[4];
+-        float oldLowerVf[4];
+-        if (hasUpperWrite)
+-            std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+-        if (hasDistinctLowerWrite)
+-            std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+-
+-        const auto execUpperOf = [this](const DecodedInstructionPair &pair)
+-        {
+-            if (pair.fmacForm != FmacNone)
+-                execFmac(pair);
+-            else
+-                execUpper(pair.upper);
+-        };
+-        if (decoded.iBit)
+-        {
+-            execUpperOf(decoded);
+-            float immediate = 0.0f;
+-            std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+-            m_state.i = normalizeOperand(immediate);
+-        }
+-        else if (decoded.upperVfShadowReg != 0u)
+-        {
+-            float oldVf[4]{};
+-            float upperVf[4]{};
+-            std::memcpy(oldVf,
+-                        m_state.vf[decoded.upperVfShadowReg],
+-                        sizeof(oldVf));
+-            execUpperOf(decoded);
+-            std::memcpy(upperVf,
+-                        m_state.vf[decoded.upperVfShadowReg],
+-                        sizeof(upperVf));
+-            std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+-                        oldVf,
+-                        sizeof(oldVf));
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+-            std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+-                        upperVf,
+-                        sizeof(upperVf));
+-        }
+-        else
+-        {
+-            execUpperOf(decoded);
+-            if (decoded.lowerUsage.pipeline != PipelineNone) // not a lower NOP
+-                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+-        }
+-
+-        m_viBranchBackupValid = false;
+-
+-        // Writes land in m_state now; the scoreboard (markPairWrites) keeps readers from seeing them early.
+-        // ACC (latency 1) is readable by the next pair, so it needs neither.
+-        if (hasUpperWrite)
+-            noteVfWrite(upperWrite.reg, upperWrite.lanes, oldUpperVf,
+-                        decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency : decoded.upperUsage.latency);
+-        if (hasDistinctLowerWrite)
+-            noteVfWrite(lowerWrite.reg, lowerWrite.lanes, oldLowerVf,
+-                        decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency : decoded.lowerUsage.latency);
+-        if (writtenVi != 0u)
+-        {
+-            m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
+-            noteViWrite(writtenVi, oldVi,
+-                        decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+-        }
+-
+-        markPairWrites(decoded);
+-        if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+-            recordViWriteForBranch(writtenVi, oldVi);
+-
+-        m_state.vf[0][0] = 0.0f;
+-        m_state.vf[0][1] = 0.0f;
+-        m_state.vf[0][2] = 0.0f;
+-        m_state.vf[0][3] = 1.0f;
+-        m_state.vi[0] = 0;
+-
+-        uint32_t nextPc = m_state.pc + 8u;
+-        if (nextPc >= codeSize)
+-            nextPc = 0u;
+-        m_state.pc = nextPc;
+-
+-        if (m_state.branchPending)
+-        {
+-            if (m_state.branchDelay == 0u)
+-            {
+-                m_state.pc = m_state.branchTarget & microAddressMask();
+-                m_state.branchPending = false;
+-            }
+-            else
+-            {
+-                --m_state.branchDelay;
+-            }
+-        }
+-
+-        const bool dHalt = decoded.dBit && m_state.dBitEnabled;
+-        const bool tHalt = decoded.tBit && m_state.tBitEnabled;
+-        const bool haltBit = dHalt || tHalt;
+-        const bool haltBranch = haltBit && decoded.lowerUsage.pipeline == PipelineBranch;
+-
+-        if (m_state.haltAfterDelaySlot)
++        if (result == PairResult::Ended)
+         {
+-            m_state.stoppedByD = m_pendingHaltD;
+-            m_state.stoppedByT = m_pendingHaltT;
+-            programEnded = true;
+-        }
+-        else if (m_state.ebit)
+             programEnded = true;
+-        else if (haltBit && !haltBranch)
+-        {
+-            m_state.stoppedByD = dHalt;
+-            m_state.stoppedByT = tHalt;
+-            programEnded = true;
+-        }
+-        else if (decoded.eBit)
+-            m_state.ebit = true;
+-        else if (haltBranch)
+-        {
+-            m_state.haltAfterDelaySlot = true;
+-            m_pendingHaltD = dHalt;
+-            m_pendingHaltT = tHalt;
+-        }
+-
+-        advanceOneCycle();
+-        if (programEnded)
+             break;
++        }
+     }
+ 
+     if (!programEnded)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+deleted file mode 100644
+index ed0ee71..0000000
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ /dev/null
+@@ -1,29 +0,0 @@
+-#ifndef PS2_VU1_DETAIL_H
+-#define PS2_VU1_DETAIL_H
+-
+-#include <cstdint>
+-
+-// Instruction field extraction helpers
+-static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+-static inline uint8_t FT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+-static inline uint8_t FS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
+-static inline uint8_t FD(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
+-static inline uint8_t BC(uint32_t i) { return (uint8_t)(i & 0x3); }
+-
+-// Lower instruction field helpers
+-static inline uint8_t LIT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+-static inline uint8_t LIS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
+-static inline uint8_t LID(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
+-static inline uint8_t VIT(uint32_t i) { return (uint8_t)((i >> 16) & 0xF); }
+-static inline uint8_t VIS(uint32_t i) { return (uint8_t)((i >> 11) & 0xF); }
+-static inline uint8_t VID(uint32_t i) { return (uint8_t)((i >> 6) & 0xF); }
+-static inline int16_t IMM11(uint32_t i) { return (int16_t)(int32_t)((int32_t)(i << 21) >> 21); }
+-static inline int16_t IMM15(uint32_t i)
+-{
+-    uint32_t lo11 = i & 0x7FF;
+-    uint32_t hi4 = (i >> 21) & 0xF;
+-    uint32_t raw = (hi4 << 11) | lo11;
+-    return (int16_t)(int32_t)((int32_t)(raw << 17) >> 17);
+-}
+-
+-#endif
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index c473f94..ef71fd2 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_vu1.h"
++#include "runtime/ps2_vu1_exec.h"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -171,6 +172,24 @@ namespace
+         return makeVuLowerSpecial(0x39u, 0u, ft, 0u, static_cast<uint8_t>((ftf & 0x3u) << 2));
+     }
+ 
++    // ADD.x vf3, vf1, vf2 | IADDIU vi1, vi0, 7 + ADD.x vf3, vf1, vf1 with the E bit | NOP, compiled like
++    // tools/vu1_compile.py emits it; counts its runs.
++    constexpr uint32_t kCompiledTestWords[] = {0x8000033Cu, 0x010208E8u, 0x10010007u, 0x410108E8u, 0x8000033Cu, kVuUpperNop};
++    int g_compiledTestBlockRuns = 0;
++    int compiledTestBlock(VU1Interpreter &vu, uint64_t end)
++    {
++        using A = VU1Interpreter::CompiledAccess;
++        ++g_compiledTestBlockRuns;
++        if (const int r = A::step<0x8000033Cu, 0x010208E8u>(vu, end, 0x08u))
++            return r;
++        if (const int r = A::step<0x10010007u, 0x410108E8u>(vu, end, 0x10u))
++            return r;
++        if (const int r = A::step<0x8000033Cu, kVuUpperNop>(vu, end, 0x18u))
++            return r;
++        return A::kLeave;
++    }
++    const VU1Interpreter::CompiledBlock kCompiledTestBlock{0u, 3u, kCompiledTestWords, compiledTestBlock};
++
+     void writeVuInstructionPair(uint8_t *code, uint32_t pc, uint32_t lower, uint32_t upper)
+     {
+         std::memcpy(code + pc, &lower, sizeof(lower));
+@@ -1752,6 +1771,42 @@ void register_ps2_vu1_tests()
+             t.Equals(vu1.state().vf[3][0], 2.0f, "the second ADD lands at cycle 5");
+         });
+ 
++        tc.Run("a compiled block gives the interpreter's results, also when the budget stops it", [](TestCase &t)
++        {
++            VU1Interpreter::registerCompiledBlocks(&kCompiledTestBlock, 1u);
++            for (uint32_t budget : {1u, 2u, 3u, 4u, 5u, 100u})
++            {
++                VU1State results[2];
++                for (int compiled = 0; compiled < 2; ++compiled)
++                {
++                    VU1Interpreter::setCompiledBlocksEnabled(compiled != 0);
++                    Vu1Fixture fx;
++                    t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++                    for (uint32_t pair = 0; pair < 3u; ++pair)
++                        writeVuInstructionPair(fx.code, pair * 8u, kCompiledTestWords[pair * 2u], kCompiledTestWords[pair * 2u + 1u]);
++
++                    VU1Interpreter vu1;
++                    vu1.state().vf[1][0] = 1.0f;
++                    vu1.state().vf[2][0] = 10.0f;
++                    vu1.state().vf[3][0] = -1.0f;
++                    g_compiledTestBlockRuns = 0;
++                    vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, budget);
++                    results[compiled] = vu1.state();
++                    if (budget < 100u) // finish the program
++                        vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 100u);
++                    t.Equals(vu1.state().vf[3][0], 2.0f, "the second ADD lands");
++                    t.Equals(vu1.state().vi[1], 7, "IADDIU lands");
++                    t.Equals(g_compiledTestBlockRuns > 0, compiled != 0, "the block runs only when compiled blocks are on");
++                }
++                VU1Interpreter::setCompiledBlocksEnabled(true);
++                const VU1State &a = results[0], &b = results[1];
++                t.IsTrue(std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0 && std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0 &&
++                             std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0 && a.pc == b.pc && a.cycles == b.cycles &&
++                             a.mac == b.mac && a.status == b.status && a.ebit == b.ebit,
++                         "compiled and interpreted runs should stop in the same state");
++            }
++        });
++
+         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
+         {
+             Vu1Fixture fx;

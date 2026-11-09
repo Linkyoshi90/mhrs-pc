@@ -1,0 +1,49 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..832344a 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -493,6 +493,7 @@ private:
+     GS m_gs;
+     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
+     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
++    uint64_t m_iopEeCycleDebt = 0u; // EE cycles not yet run on the IOP, see advanceIopEeCycles
+     PS2AudioBackend m_audioBackend;
+     PSPadBackend m_padBackend;
+     PS2RomDevice m_romDevice;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..eab4cd9 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -607,7 +607,17 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
+-    m_iopSubsystem->runEeCycles(eeCycles);
++    // The EE accounts a few cycles per guest dispatch. Running the IOP scheduler for ~8 IOP cycles at a
++    // time spends far more host time on scheduling than on execution, so batch the debt
++    // (16384 EE cycles = 2048 IOP cycles, ~55 us of guest time).
++    constexpr uint64_t kIopBatchEeCycles = 16384u;
++    m_iopEeCycleDebt += eeCycles;
++    if (m_iopEeCycleDebt < kIopBatchEeCycles)
++    {
++        return;
++    }
++    m_iopSubsystem->runEeCycles(m_iopEeCycleDebt);
++    m_iopEeCycleDebt = 0u;
+ }
+ 
+ void PS2Runtime::resetIop()
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index 7242e65..6440823 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -193,7 +193,8 @@ void register_ps2_sif_rpc_tests()
+         {
+             TestEnv env;
+ 
+-            env.runtime.eeScheduler().accountCycles(80u);
++            // The runtime runs the IOP in batches (see PS2Runtime::advanceIopEeCycles), so cross one.
++            env.runtime.eeScheduler().accountCycles(2u * 16384u);
+             const uint64_t cyclesBeforeInit = env.runtime.iopDebugSnapshot().emulatorCycles;
+             t.IsTrue(cyclesBeforeInit != 0u, "IOP cycle counter should advance before RPC initialization");
+ 

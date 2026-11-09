@@ -1,0 +1,25 @@
+# Apply in this order to PS2Recomp e563698 (git apply tools/patches/<name>)
+ps2recomp-linux-sse4.patch
+ps2recomp-setupthread-stack-top.patch
+ps2recomp-cdvd-dualinfo-callback.patch
+ps2recomp-runner-cd-image-arg.patch
+ps2recomp-function-trace-option.patch
+ps2recomp-iop-batching.patch
+ps2recomp-iop-native-functions.patch
+ps2recomp-iop-module-names.patch
+ps2recomp-dma-empty-chain-completion.patch
+ps2recomp-vif1-ibit-interrupt.patch
+ps2recomp-mc-getdir-continue.patch
+ps2recomp-iop-rpc-handler-budget.patch
+ps2recomp-sifcmd-ee-to-iop.patch
+ps2recomp-mpeg-nodata-callback.patch
+ps2recomp-mpeg-sys-isend.patch
+ps2recomp-callback-stacks-kernel-area.patch
+ps2recomp-gs-parallel-raster.patch
+ps2recomp-vu1-fast-paths.patch
+ps2recomp-gs-async-backend.patch
+ps2recomp-vu0-macro-memory.patch
+ps2recomp-vif1-stall-nocopy.patch
+ps2recomp-vu1-immediate-writes.patch
+ps2recomp-gs-band-raster.patch
+ps2recomp-vu1-compiled-blocks.patch

@@ -1,0 +1,644 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_backend.h b/ps2xRuntime/include/runtime/gs/gs_backend.h
+index 3f00d01..23a0fb6 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_backend.h
+@@ -2,9 +2,18 @@
+ 
+ #include "runtime/gs/gs_types.h"
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <vector>
+ 
++// One step of a draw run: a primitive, or a CLUT load when draw is null.
++struct GSDrawStep
++{
++    const GSPrimitiveBatch *draw = nullptr;
++    GSTex0Reg tex0{};
++    GSTexClutReg texclut{};
++};
++
+ class GSRasterBackend
+ {
+ public:
+@@ -15,6 +24,17 @@ public:
+ 
+     virtual void Submit(const GSPrimitiveBatch &batch) = 0;
+     virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
++    // Runs the steps in order, as Submit / LoadClut would; a backend may overlap independent primitives.
++    virtual void SubmitMany(const GSDrawStep *steps, size_t count)
++    {
++        for (size_t i = 0; i < count; ++i)
++        {
++            if (steps[i].draw)
++                Submit(*steps[i].draw);
++            else
++                LoadClut(steps[i].tex0, steps[i].texclut);
++        }
++    }
+ 
+     virtual void BeginTransfer(const GSTransferCommand &command) = 0;
+     virtual void UploadImage(const uint8_t *data, uint32_t sizeBytes) = 0;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 95ffbda..cd9bfae 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -18,6 +18,7 @@ public:
+ 
+     void Submit(const GSPrimitiveBatch &batch) override;
+     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    void SubmitMany(const GSDrawStep *steps, size_t count) override;
+     void BeginTransfer(const GSTransferCommand &command) override;
+     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
+ 
+@@ -36,12 +37,15 @@ public:
+ 
+ private:
+     void ResetUnlocked();
+-    void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
++    bool ApplyClutLoad(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
++    bool LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+     uint32_t ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
++    size_t BandRunEnd(const GSDrawStep *steps, size_t begin, size_t count) const;
++    void DrawInBands(const GSDrawStep *steps, size_t count);
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
+@@ -54,6 +58,7 @@ private:
+         uint32_t decodedWidth = 0;
+         int lastU = -1; // last decoded texel read, to rebuild the shared cache
+         int lastV = -1;
++        bool read = false; // a texel was read through cache
+     };
+     using RowRasterFn = std::function<void(int y0, int y1, TexelSource &texels)>;
+     void RasterRows(const GSDrawState &state, int minX, int minY, int maxX, int maxY, const RowRasterFn &rows);
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index 869dca4..051e5bc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -63,6 +63,7 @@ void GSAsyncBackend::Run(Command &command)
+ void GSAsyncBackend::WorkerLoop()
+ {
+     std::vector<Command> batch;
++    std::vector<GSDrawStep> run; // consecutive draws and CLUT loads, handed over together
+     for (;;)
+     {
+         {
+@@ -75,7 +76,25 @@ void GSAsyncBackend::WorkerLoop()
+         m_cv.notify_all(); // the queue has room again
+ 
+         for (Command &command : batch)
++        {
++            if (const auto *draw = std::get_if<GSPrimitiveBatch>(&command))
++            {
++                run.push_back(GSDrawStep{draw, {}, {}});
++                continue;
++            }
++            if (const auto *clut = std::get_if<ClutLoad>(&command))
++            {
++                run.push_back(GSDrawStep{nullptr, clut->tex0, clut->texclut});
++                continue;
++            }
++            if (!run.empty())
++                m_inner->SubmitMany(run.data(), run.size());
++            run.clear();
+             Run(command);
++        }
++        if (!run.empty())
++            m_inner->SubmitMany(run.data(), run.size());
++        run.clear();
+ 
+         {
+             std::lock_guard<std::mutex> lock(m_mutex);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 5b1ef9f..03a429a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -425,6 +425,43 @@ namespace
+         bool m_stop = false;
+     };
+ 
++    // The rows this thread draws while DrawInBands splits a run of primitives by rows.
++    struct BandRows
++    {
++        int y0 = 0;
++        int y1 = -1;
++        GSMem::TexturePageCache cache;
++        const uint16_t *clut = nullptr; // palette at the current primitive
++        bool read = false;
++    };
++    thread_local BandRows *t_bandRows = nullptr;
++
++    // Pixels a sprite or triangle can touch along one axis (y unless alongX), with slack around the
++    // rasteriser's own rounding, clipped to the scissor.
++    void primitiveSpan(const GSPrimitiveBatch &batch, bool alongX, int &first, int &last)
++    {
++        const auto &ctx = batch.state.context;
++        const int lo0 = alongX ? ctx.scissor.x0 : ctx.scissor.y0;
++        const int hi0 = alongX ? ctx.scissor.x1 : ctx.scissor.y1;
++        const int count = batch.state.prim.type == GS_PRIM_SPRITE ? 2 : 3;
++        float lo = INFINITY, hi = -INFINITY;
++        for (int i = 0; i < count; ++i)
++        {
++            const float v = alongX ? batch.vertices[i].x : batch.vertices[i].y;
++            lo = std::min(lo, v);
++            hi = std::max(hi, v);
++        }
++        if (!std::isfinite(lo) || !std::isfinite(hi))
++        {
++            first = lo0, last = hi0;
++            return;
++        }
++        auto clip = [&](double v) { return static_cast<int>(std::max<double>(lo0, std::min<double>(hi0, v))); };
++        const double offset = static_cast<double>((alongX ? ctx.xyoffset.ofx : ctx.xyoffset.ofy) >> 4);
++        first = clip(std::floor(lo - offset) - 1.0);
++        last = clip(std::ceil(hi - offset) + 1.0);
++    }
++
+     struct PageSpan
+     {
+         uint32_t first = 0;
+@@ -734,18 +771,252 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     DrawPrimitive(batch);
+ }
+ 
++void GSCpuBackend::SubmitMany(const GSDrawStep *steps, size_t count)
++{
++    // Below this many pixels (by bounding box), waking the workers costs more than it saves.
++    constexpr int64_t kMinBandArea = 4096;
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (!m_vram)
++        return;
++    size_t i = 0;
++    while (i < count)
++    {
++        const size_t end = BandRunEnd(steps, i, count);
++        int64_t area = 0;
++        for (size_t k = i; k < end && area < kMinBandArea; ++k)
++        {
++            if (!steps[k].draw || steps[k].draw->vertexCount == 0u)
++                continue;
++            int x0, x1, y0, y1;
++            primitiveSpan(*steps[k].draw, true, x0, x1);
++            primitiveSpan(*steps[k].draw, false, y0, y1);
++            area += static_cast<int64_t>(x1 - x0 + 1) * (y1 - y0 + 1);
++        }
++        if (area >= kMinBandArea)
++        {
++            DrawInBands(steps + i, end - i);
++            i = end;
++            continue;
++        }
++        for (const size_t stop = std::max(end, i + 1); i < stop; ++i)
++        {
++            if (!steps[i].draw)
++                ApplyClutLoad(steps[i].tex0, steps[i].texclut);
++            else if (steps[i].draw->vertexCount != 0u)
++                DrawPrimitive(*steps[i].draw);
++        }
++    }
++}
++
++// End of the longest run from begin that may be drawn band by band: sprites and triangles into one frame and
++// depth buffer that no step of the run reads as a texture or palette, with no stale cached page among those.
++size_t GSCpuBackend::BandRunEnd(const GSDrawStep *steps, size_t begin, size_t count) const
++{
++    if (RowWorkerPool::instance().workers() == 0)
++        return begin;
++    const GSContext *first = nullptr;
++    int x0 = INT32_MAX, y0 = INT32_MAX, x1 = -1, y1 = -1;
++    bool depthAccess = false, cacheChecked = false;
++    PageSpan reads{UINT32_MAX, 0}; // texture and palette pages, empty while first > last
++    size_t i = begin;
++    for (; i < count; ++i)
++    {
++        PageSpan nReads = reads;
++        auto addRead = [&](const PageSpan &span)
++        {
++            nReads.first = std::min(nReads.first, span.first);
++            nReads.last = std::max(nReads.last, span.last);
++        };
++        int nx0 = x0, ny0 = y0, nx1 = x1, ny1 = y1;
++        bool nDepth = depthAccess;
++        const GSContext *nFirst = first;
++        if (!steps[i].draw)
++        {
++            const GSTex0Reg &tex0 = steps[i].tex0;
++            const bool indexed = isFourBitIndexedPsm(tex0.psm) || isEightBitIndexedPsm(tex0.psm);
++            if (indexed && tex0.cld >= 1u && tex0.cld <= 5u)
++            {
++                const GSTexClutReg &clut = steps[i].texclut;
++                const uint32_t entries = isFourBitIndexedPsm(tex0.psm) ? 16u : 256u;
++                PageSpan span;
++                // CSM1 reads a 16x16 CT32/CT16 block of blocks cbp..cbp+3.
++                const bool ok = tex0.csm == 0u
++                                    ? (span = PageSpan{tex0.cbp / 32u, (tex0.cbp + 3u) / 32u}).last < 512u
++                                    : pageSpan(tex0.cpsm, tex0.cbp, clut.cbw != 0u ? clut.cbw : 1u, clut.cou * 16u, clut.cov,
++                                               clut.cou * 16u + entries - 1u, clut.cov, span);
++                if (!ok)
++                    break;
++                addRead(span);
++            }
++        }
++        else
++        {
++            const GSPrimitiveBatch &batch = *steps[i].draw;
++            if (batch.vertexCount == 0u)
++                continue;
++            const auto type = batch.state.prim.type;
++            if (type != GS_PRIM_SPRITE && type != GS_PRIM_TRIANGLE && type != GS_PRIM_TRISTRIP && type != GS_PRIM_TRIFAN)
++                break;
++            // Large primitives keep the row-parallel raster, which decodes their texture up front.
++            int px0, px1, py0, py1;
++            primitiveSpan(batch, true, px0, px1);
++            primitiveSpan(batch, false, py0, py1);
++            if (static_cast<int64_t>(px1 - px0 + 1) * (py1 - py0 + 1) >= 16384)
++                break;
++            const auto &ctx = batch.state.context;
++            if (!nFirst)
++                nFirst = &ctx;
++            else if (ctx.frame.fbp != nFirst->frame.fbp || ctx.frame.fbw != nFirst->frame.fbw ||
++                     ctx.frame.psm != nFirst->frame.psm || ctx.zbuf.zbp != nFirst->zbuf.zbp || ctx.zbuf.psm != nFirst->zbuf.psm)
++                break;
++            // Every pixel lies in the scissor rectangle.
++            nx0 = std::min<int>(nx0, std::min(ctx.scissor.x0, ctx.scissor.x1));
++            ny0 = std::min<int>(ny0, std::min(ctx.scissor.y0, ctx.scissor.y1));
++            nx1 = std::max<int>(nx1, std::max(ctx.scissor.x0, ctx.scissor.x1));
++            ny1 = std::max<int>(ny1, std::max(ctx.scissor.y0, ctx.scissor.y1));
++            if (static_cast<uint32_t>(nx1) >= std::max<uint32_t>(ctx.frame.fbw, 1u) * 64u)
++                break; // wider rows alias other rows of the buffer
++            nDepth = nDepth || ((ctx.test >> 17) & 3u) >= 2u || !ctx.zbuf.zmask;
++            if (batch.state.prim.tme)
++            {
++                const auto &tex = ctx.tex0;
++                const uint32_t maxU = (ctx.clamp & 0x2u) != 0u ? 1023u : std::max<uint32_t>(batch.state.textureWidth, 1u) - 1u;
++                const uint32_t maxV = ((ctx.clamp >> 2) & 0x2u) != 0u ? 1023u : std::max<uint32_t>(batch.state.textureHeight, 1u) - 1u;
++                PageSpan span;
++                if (!pageSpan(tex.psm, tex.tbp0, tex.tbw, 0u, 0u, maxU, maxV, span))
++                    break;
++                addRead(span);
++            }
++        }
++        if (nFirst)
++        {
++            const uint32_t fbw = std::max<uint32_t>(nFirst->frame.fbw, 1u);
++            PageSpan frame, depth;
++            if (!pageSpan(nFirst->frame.psm, framePageBaseToBlock(nFirst->frame.fbp), fbw, nx0, ny0, nx1, ny1, frame))
++                break;
++            if (nDepth && (!pageSpan(nFirst->zbuf.psm, framePageBaseToBlock(nFirst->zbuf.zbp), fbw, nx0, ny0, nx1, ny1, depth) ||
++                           depth.overlaps(frame)))
++                break;
++            if (nReads.first <= nReads.last && (nReads.overlaps(frame) || (nDepth && nReads.overlaps(depth))))
++                break;
++        }
++        // Bands and the CLUT pre-pass read fresh VRAM; the serial raster would see a stale cached page.
++        const uint32_t cachedPage = m_texturePageCache.PageBase() / GSMem::TexturePageCache::kPageSize;
++        if (!cacheChecked && cachedPage >= nReads.first && cachedPage <= nReads.last)
++        {
++            if (!m_texturePageCache.MatchesVram(m_vram))
++                break;
++            cacheChecked = true;
++        }
++        first = nFirst;
++        x0 = nx0, y0 = ny0, x1 = nx1, y1 = ny1;
++        depthAccess = nDepth;
++        reads = nReads;
++    }
++    return i;
++}
++
++void GSCpuBackend::DrawInBands(const GSDrawStep *steps, size_t count)
++{
++    // CLUT loads run here first, in order; each primitive gets the palette current at its step.
++    thread_local std::vector<std::array<uint16_t, 512>> clutsTl;
++    thread_local std::vector<std::pair<int, int>> rowsTl;
++    thread_local std::vector<uint32_t> clutOfTl;
++    std::vector<std::array<uint16_t, 512>> &cluts = clutsTl; // lambdas do not capture thread_locals
++    std::vector<std::pair<int, int>> &rows = rowsTl;
++    std::vector<uint32_t> &clutOf = clutOfTl;
++    cluts.assign(1, m_clut);
++    rows.resize(count);
++    clutOf.resize(count);
++    size_t lastClutRead = SIZE_MAX;
++    int top = INT32_MAX, bottom = INT32_MIN;
++    for (size_t i = 0; i < count; ++i)
++    {
++        rows[i] = {INT32_MAX, INT32_MIN}; // no rows: CLUT loads and empty batches
++        if (!steps[i].draw)
++        {
++            if (ApplyClutLoad(steps[i].tex0, steps[i].texclut))
++            {
++                lastClutRead = i;
++                cluts.push_back(m_clut);
++            }
++            continue;
++        }
++        clutOf[i] = static_cast<uint32_t>(cluts.size() - 1u);
++        if (steps[i].draw->vertexCount == 0u)
++            continue;
++        primitiveSpan(*steps[i].draw, false, rows[i].first, rows[i].second);
++        top = std::min(top, rows[i].first);
++        bottom = std::max(bottom, rows[i].second);
++    }
++    if (top > bottom)
++        return;
++
++    RowWorkerPool &pool = RowWorkerPool::instance();
++    const int bandCount = std::min(bottom - top + 1, static_cast<int>(2u * (pool.workers() + 1u)));
++    const int rowsPerBand = (bottom - top + bandCount) / bandCount;
++    struct BandEnd
++    {
++        size_t lastRead; // last step that read a texel in this band
++        uint32_t page;
++    };
++    thread_local std::vector<BandEnd> endsTl;
++    std::vector<BandEnd> &ends = endsTl;
++    ends.assign(static_cast<size_t>(bandCount), BandEnd{SIZE_MAX, UINT32_MAX});
++    pool.run(bandCount, [&](int b)
++    {
++        thread_local BandRows band;
++        band.y0 = top + b * rowsPerBand;
++        band.y1 = std::min(bottom, band.y0 + rowsPerBand - 1);
++        band.cache.Invalidate();
++        size_t lastRead = SIZE_MAX;
++        t_bandRows = &band;
++        for (size_t i = 0; i < count; ++i)
++        {
++            if (rows[i].second < band.y0 || rows[i].first > band.y1)
++                continue;
++            band.read = false;
++            band.clut = cluts[clutOf[i]].data();
++            DrawPrimitive(*steps[i].draw);
++            if (band.read)
++                lastRead = i;
++        }
++        t_bandRows = nullptr;
++        ends[static_cast<size_t>(b)] = BandEnd{lastRead, band.cache.PageBase()};
++    });
++
++    // The serial raster leaves the page of its last read cached. If a primitive read after the last CLUT load
++    // did, that is the last such primitive in its bottom band that read (rows run top to bottom); the pre-pass
++    // already left the CLUT's page. Nothing the run read was written, so VRAM still holds that page.
++    const BandEnd *last = nullptr;
++    for (const BandEnd &end : ends)
++        if (end.lastRead != SIZE_MAX && (!last || end.lastRead >= last->lastRead))
++            last = &end;
++    if (last && (lastClutRead == SIZE_MAX || last->lastRead > lastClutRead))
++    {
++        m_texturePageCache.Invalidate();
++        m_texturePageCache.Resolve(m_vram, last->page);
++    }
++}
++
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    ApplyClutLoad(tex0, texclut);
++}
++
++// True when the load read VRAM (through the texture page cache).
++bool GSCpuBackend::ApplyClutLoad(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
+     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+-        return;
++        return false;
+ 
+     switch (tex0.cld)
+     {
+     case 0u:
+     case 6u:
+     case 7u:
+-        return;
++        return false;
+     case 1u:
+         break;
+     case 2u:
+@@ -756,28 +1027,28 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+         break;
+     case 4u:
+         if (m_clutCbp[0] == tex0.cbp)
+-            return;
++            return false;
+         m_clutCbp[0] = tex0.cbp;
+         break;
+     case 5u:
+         if (m_clutCbp[1] == tex0.cbp)
+-            return;
++            return false;
+         m_clutCbp[1] = tex0.cbp;
+         break;
+     default:
+-        return;
++        return false;
+     }
+ 
+-    LoadClutUnlocked(tex0, texclut);
++    return LoadClutUnlocked(tex0, texclut);
+ }
+ 
+-void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++bool GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     const bool fourBit = isFourBitIndexedPsm(tex0.psm);
+     const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
+     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
+     if (!sixteenBit && !thirtyTwoBit)
+-        return;
++        return false;
+ 
+     const uint32_t entryCount = fourBit ? 16u : 256u;
+     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
+@@ -817,6 +1088,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+             m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
+         }
+     }
++    return true; // the loop always reads: firstEntry < entryCount
+ }
+ 
+ void GSCpuBackend::Flush()
+@@ -1202,6 +1474,7 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+                                   uint8_t csa,
+                                   uint8_t sourcePsm)
+ {
++    const uint16_t *clut = t_bandRows ? t_bandRows->clut : m_clut.data();
+     const bool sixteenBit = cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S;
+     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
+     const uint32_t clutBase = (static_cast<uint32_t>(csa) & csaMask) << 4u;
+@@ -1220,17 +1493,17 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+     {
+     case GS_PSM_CT32:
+     {
+-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
++        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
+         return applyTexa(state.texa, cpsm, raw);
+     }
+     case GS_PSM_CT24:
+     {
+-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
++        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
+         return applyTexa(state.texa, cpsm, raw & 0x00FFFFFFu);
+     }
+     case GS_PSM_CT16:
+     case GS_PSM_CT16S:
+-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(m_clut[clutIndex]));
++        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(clut[clutIndex]));
+     default:
+         break;
+     }
+@@ -1303,6 +1576,7 @@ uint32_t GSCpuBackend::SampleTexture(TexelSource &texels, const GSDrawState &sta
+             texels.lastV = sampleV;
+             return texels.decoded[static_cast<uint32_t>(sampleV) * texels.decodedWidth + static_cast<uint32_t>(sampleU)];
+         }
++        texels.read = true;
+         return FetchTexel(*texels.cache, state, sampleU, sampleV);
+     };
+ 
+@@ -1639,6 +1913,18 @@ bool GSCpuBackend::CanRasterRowsInParallel(const GSDrawState &state, int minX, i
+ 
+ void GSCpuBackend::RasterRows(const GSDrawState &state, int minX, int minY, int maxX, int maxY, const RowRasterFn &rows)
+ {
++    if (BandRows *band = t_bandRows)
++    {
++        minY = std::max(minY, band->y0);
++        maxY = std::min(maxY, band->y1);
++        if (minY > maxY)
++            return;
++        TexelSource texels;
++        texels.cache = &band->cache;
++        rows(minY, maxY, texels);
++        band->read |= texels.read;
++        return;
++    }
+     if (!CanRasterRowsInParallel(state, minX, minY, maxX, maxY))
+     {
+         TexelSource texels;
+diff --git a/ps2xTest/gs_cache/CMakeLists.txt b/ps2xTest/gs_cache/CMakeLists.txt
+index af36821..633f2be 100644
+--- a/ps2xTest/gs_cache/CMakeLists.txt
++++ b/ps2xTest/gs_cache/CMakeLists.txt
+@@ -45,7 +45,7 @@ endfunction()
+ add_gs_cache_suite(ps2_gs_texture_cache_tests gs_texture_cache_tests.cpp texture
+     unaligned_texture unaligned_wrap stale_mirror page_alternation
+     flush_visibility upload_visibility local_copy_visibility raster_visibility
+-    reset_and_rebind parallel_raster invalid_vram_size reserved_psm)
++    reset_and_rebind parallel_raster band_raster invalid_vram_size reserved_psm)
+ 
+ add_gs_cache_suite(ps2_gs_clut_cache_tests gs_clut_cache_tests.cpp clut
+     unaligned_csm1_ct32 unaligned_csm1_ct16 unaligned_csm1_ct16s wrapped_clut unaligned_csm2
+diff --git a/ps2xTest/gs_cache/gs_texture_cache_tests.cpp b/ps2xTest/gs_cache/gs_texture_cache_tests.cpp
+index 0d45347..4de655b 100644
+--- a/ps2xTest/gs_cache/gs_texture_cache_tests.cpp
++++ b/ps2xTest/gs_cache/gs_texture_cache_tests.cpp
+@@ -165,6 +165,100 @@ namespace
+         expectEqual(f.sample(tex, 63, 63), kGreen, "TEXFLUSH after a parallel draw");
+     }
+ 
++    // Returns the texel the serial backend reads at (5, sampleV) after the run, once both rewrote the texture.
++    uint32_t bandCase(uint32_t sampleV)
++    {
++        // A run of overlapping, blended, depth-tested triangles and sprites, some with a palette that CLUT loads
++        // in the run change, drawn in bands matches drawing them one by one.
++        BackendFixture serial, banded;
++        auto tex = texture();
++        auto indexed = texture(GS_PSM_T8, 256u); // 64x64 T8 in page 8; palettes in pages 4 and 5
++        indexed.tbw = 2;
++        for (BackendFixture *f : {&serial, &banded})
++        {
++            for (uint32_t v = 0; v < 64; ++v)
++                for (uint32_t u = 0; u < 64; ++u)
++                {
++                    f->backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, u, v, 0x80000000u | (v << 10) | (u * 3u));
++                    f->backend.WriteVram(GS_PSM_T8, indexed.tbp0, indexed.tbw, u, v, (u * 7u + v) & 0xFFu);
++                }
++            for (uint32_t x = 0; x < 16; ++x)
++                for (uint32_t y = 0; y < 16; ++y)
++                {
++                    f->backend.WriteVram(GS_PSM_CT32, 128u, 1u, x, y, 0x40000000u | (x << 16) | (y << 4));
++                    f->backend.WriteVram(GS_PSM_CT32, 160u, 1u, x, y, 0x20000000u | (y << 16) | x);
++                }
++        }
++        uint32_t seed = 12345u;
++        auto next = [&](uint32_t range) { seed = seed * 1664525u + 1013904223u; return (seed >> 8) % range; };
++        std::vector<GSPrimitiveBatch> draws;
++        draws.reserve(400);
++        std::vector<GSDrawStep> steps;
++        for (int i = 0; i < 400; ++i)
++        {
++            if (i % 50 == 0)
++            {
++                GSDrawStep load{};
++                load.tex0 = indexed;
++                load.tex0.cbp = (i / 50) % 2 != 0 ? 160u : 128u;
++                steps.push_back(load);
++            }
++            const bool palette = i % 3 == 1; // the last draw (399) samples the direct-colour texture
++            auto batch = sprite(palette ? indexed : tex, 0, 0, (i & 1) != 0);
++            auto &ctx = batch.state.context;
++            batch.state.textureWidth = batch.state.textureHeight = 64;
++            batch.state.prim.tme = i % 5 != 0;
++            batch.state.prim.abe = true;
++            ctx.alpha = 0x44; // (Cs - Cd) * As + Cd
++            ctx.frame.fbw = 4;
++            ctx.scissor = {0, 255, 0, 255};
++            ctx.zbuf = {300u, GS_PSM_Z32, false};
++            ctx.test = 2ull << 17; // depth GEQUAL
++            if (i % 7 != 0)
++            {
++                batch.state.prim.type = GS_PRIM_TRIANGLE;
++                batch.vertexCount = 3;
++            }
++            for (auto &vertex : batch.vertices)
++            {
++                vertex.x = static_cast<float>(next(300)) - 20.0f;
++                vertex.y = static_cast<float>(next(300)) - 20.0f;
++                vertex.z = static_cast<double>(next(1000));
++                vertex.u = static_cast<uint16_t>(next(64 * 16));
++                vertex.v = static_cast<uint16_t>(next(64 * 16));
++                vertex.r = static_cast<uint8_t>(next(256));
++                vertex.a = static_cast<uint8_t>(next(129));
++            }
++            draws.push_back(batch);
++            steps.push_back(GSDrawStep{&draws.back(), {}, {}});
++        }
++        for (const GSDrawStep &step : steps)
++        {
++            if (step.draw)
++                serial.backend.Submit(*step.draw);
++            else
++                serial.backend.LoadClut(step.tex0, step.texclut);
++        }
++        banded.backend.SubmitMany(steps.data(), steps.size());
++        require(serial.vram == banded.vram, "banded run matches one-by-one drawing");
++
++        // Both must leave the same page cached: a rewrite without TEXFLUSH stays invisible there.
++        for (BackendFixture *f : {&serial, &banded})
++            for (uint32_t v = 0; v < 64; ++v)
++                for (uint32_t u = 0; u < 64; ++u)
++                    f->backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, u, v, kGreen);
++        const uint32_t texel = serial.sample(tex, 5, sampleV);
++        expectEqual(banded.sample(tex, 5, sampleV), texel, "same cached page after the run");
++        return texel;
++    }
++
++    void bandRaster()
++    {
++        // The texture spans two pages (rows 0-31 and 32-63); one of them stays cached after the run.
++        const uint32_t low = bandCase(5), high = bandCase(40);
++        require(low != kGreen || high != kGreen, "the run leaves a texture page cached");
++    }
++
+     void invalidVramSize()
+     {
+         BackendFixture f;
+@@ -199,6 +293,7 @@ int main(int argc, char** argv)
+         {"flush_visibility", flushVisibility}, {"upload_visibility", uploadVisibility},
+         {"local_copy_visibility", localCopyVisibility}, {"raster_visibility", rasterVisibility},
+         {"reset_and_rebind", resetAndRebind}, {"parallel_raster", parallelRaster},
++        {"band_raster", bandRaster},
+         {"invalid_vram_size", invalidVramSize},
+         {"reserved_psm", reservedPsm}
+     });

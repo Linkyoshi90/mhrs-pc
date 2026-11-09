@@ -1,0 +1,128 @@
+diff --git a/ps2xRuntime/include/ps2_call_list.h b/ps2xRuntime/include/ps2_call_list.h
+index 94a6fa1..0070180 100644
+--- a/ps2xRuntime/include/ps2_call_list.h
++++ b/ps2xRuntime/include/ps2_call_list.h
+@@ -305,6 +305,7 @@
+     X(sceCdRead)                              \
+     X(sceCdReadChain)                         \
+     X(sceCdReadClock)                         \
++    X(sceCdReadDvdDualInfo)                   \
+     X(sceCdReadIOPm)                          \
+     X(sceCdSearchFile)                        \
+     X(sceCdSeek)                              \
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..b018741 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -29,6 +29,29 @@ namespace ps2_stubs
+         };
+ 
+         uint32_t g_cdStReadTraceCount = 0u;
++
++        // sceCdCallback target. libcdvd calls it from its CD interrupt handler when an async
++        // command finishes; games use it to iSignalSema their CD thread.
++        uint32_t g_cdCallback = 0u;
++        uint32_t g_cdCallbackGp = 0u;
++        constexpr uint32_t kCdFuncRead = 1u; // SCECdFuncRead
++
++        void queueCdCallback(PS2Runtime *runtime, uint32_t command)
++        {
++            if (!runtime || g_cdCallback == 0u || !runtime->hasFunction(g_cdCallback))
++            {
++                return;
++            }
++
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::Interrupt;
++            invocation.context.pc = g_cdCallback;
++            SET_GPR_U32(&invocation.context, 4, command);
++            SET_GPR_U32(&invocation.context, 28, g_cdCallbackGp);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++        }
+         CdStreamTimingState g_cdStreamTiming;
+ 
+         uint64_t currentCdStreamTick(PS2Runtime *runtime)
+@@ -317,6 +340,7 @@ namespace ps2_stubs
+         {
+             g_cdStreamingLbn = selected.lbn + selected.sectors;
+             setReturnS32(ctx, 1); // command accepted/success
++            queueCdCallback(runtime, kCdFuncRead);
+             return;
+         }
+ 
+@@ -355,7 +379,10 @@ namespace ps2_stubs
+ 
+     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        setReturnS32(ctx, 0);
++        const uint32_t previous = g_cdCallback;
++        g_cdCallback = getRegU32(ctx, 4);
++        g_cdCallbackGp = getRegU32(ctx, 28);
++        setReturnU32(ctx, previous);
+     }
+ 
+     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -507,6 +534,20 @@ namespace ps2_stubs
+         setReturnS32(ctx, ok ? 1 : 0);
+     }
+ 
++    // int sceCdReadDvdDualInfo(int *on_dual, u32 *layer1_start). The guest version binds the CDVDFSV
++    // S-command RPC server, which the IOP HLE does not provide, and spins forever. Report a single-layer disc.
++    void sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        for (int reg = 4; reg <= 5; ++reg)
++        {
++            if (uint8_t *out = getMemPtr(rdram, getRegU32(ctx, reg)))
++            {
++                std::memset(out, 0, sizeof(uint32_t));
++            }
++        }
++        setReturnS32(ctx, 1);
++    }
++
+     void sceCdReadClock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t clockAddr = getRegU32(ctx, 4);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.h b/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+index dd5bae9..b35fc80 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+@@ -63,6 +63,7 @@ namespace ps2_stubs
+     void sceCdPosToInt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdReadChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdReadClock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++    void sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdReadIOPm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xTest/src/ps2_runtime_io_tests.cpp b/ps2xTest/src/ps2_runtime_io_tests.cpp
+index 4f979be..b5194af 100644
+--- a/ps2xTest/src/ps2_runtime_io_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_io_tests.cpp
+@@ -707,6 +707,24 @@ void register_ps2_runtime_io_tests()
+                      "sceCdSearchFile should assign a pseudo LSN for the resolved host file");
+         });
+ 
++        tc.Run("sceCdCallback returns the previously registered callback", [](TestCase &t)
++        {
++            TestContext test;
++            constexpr uint32_t kFirst = 0x00200000u;
++            constexpr uint32_t kSecond = 0x00200100u;
++
++            clearContext(test.ctx);
++            setRegU32(test.ctx, 4, kFirst);
++            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, nullptr);
++            setRegU32(test.ctx, 4, kSecond);
++            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, nullptr);
++            t.Equals(getRegU32(&test.ctx, 2), kFirst, "second registration should return the first callback");
++
++            setRegU32(test.ctx, 4, 0u);
++            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, nullptr);
++            t.Equals(getRegU32(&test.ctx, 2), kSecond, "clearing should return the second callback");
++        });
++
+         tc.Run("sceCdRead reads from explicit cdImage path", [](TestCase &t)
+         {
+             TestContext test;

@@ -1,0 +1,173 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..a79973a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include "Common.h"
+ #include "MPEG.h"
+ #include "runtime/ee_scheduler.h"
+@@ -1620,6 +1621,56 @@ namespace ps2_stubs
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
+         }
+ 
++        // libmpeg calls the sceMpegCbNodata callback from inside sceMpegGetPicture, on the calling thread,
++        // whenever the decoder runs dry; games that feed sceMpegAddBs only from it would otherwise wait forever.
++        // Runs it as a nested call on the current thread (GetThreadId-based locks in it must see the caller),
++        // then re-enters GetPicture. Returns only when no such callback is registered.
++        void invokeNodataCallback(uint8_t *rdram, R5900Context *callerCtx, PS2Runtime *runtime, uint32_t mpegAddr)
++        {
++            constexpr uint32_t kMpegCbNodata = 1u;
++            MpegRegisteredCallback nodata{};
++            {
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                const auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
++                if (it == g_mpeg_stub_state.callbacksByMpeg.end())
++                    return;
++                for (const MpegRegisteredCallback &callback : it->second)
++                    if (!callback.stream && callback.type == kMpegCbNodata)
++                        nodata = callback;
++            }
++            if (!rdram || !callerCtx || !runtime || nodata.func == 0u || !runtime->hasFunction(nodata.func))
++                return;
++
++            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++            MpegStreamCallbackEvent event{};
++            event.streamType = kMpegCbNodata; // sceMpegCbData.type
++            if (cbDataAddr == 0u || !writeMpegCallbackData(rdram, cbDataAddr, event))
++            {
++                if (cbDataAddr != 0u)
++                    runtime->guestFree(cbDataAddr);
++                return;
++            }
++
++            R5900Context callbackCtx = *callerCtx;
++            SET_GPR_U32(&callbackCtx, 4, mpegAddr);
++            SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
++            SET_GPR_U32(&callbackCtx, 6, nodata.data);
++            SET_GPR_U32(&callbackCtx, 7, 0u);
++            SET_GPR_U32(&callbackCtx, 29, 0u);
++            SET_GPR_U32(&callbackCtx, 31, 0u);
++            callbackCtx.pc = nodata.func;
++
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::HleCall;
++            invocation.context = callbackCtx;
++            invocation.onComplete = [rdram, runtime, cbDataAddr](const R5900Context &, R5900Context &parent)
++            {
++                runtime->guestFree(cbDataAddr);
++                sceMpegGetPicture(rdram, &parent, runtime);
++            };
++            runtime->eeScheduler().invokeCurrent(std::move(invocation));
++        }
++
+         void dispatchStreamCallbacks(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      PS2Runtime *runtime,
+@@ -1896,6 +1947,13 @@ namespace ps2_stubs
+                     break;
+                 }
+                 feedElementaryStream(playback, src, chunk);
++                // ponytail: a sequence end code split across two AddBs calls is missed.
++                static constexpr uint8_t kSequenceEndCode[] = {0x00u, 0x00u, 0x01u, kMpegSequenceEnd};
++                if (std::search(src, src + chunk, std::begin(kSequenceEndCode), std::end(kSequenceEndCode)) != src + chunk)
++                {
++                    playback.streamEnded = true;
++                    flushDecoderIfEnded(playback);
++                }
+                 copied += chunk;
+             }
+             wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+@@ -2308,6 +2366,7 @@ namespace ps2_stubs
+                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                 }
+                 lock.unlock();
++                invokeNodataCallback(rdram, ctx, runtime, mpegAddr);
+                 runtime->eeScheduler().waitExternal(
+                     EeWaitReason::Mpeg,
+                     kMpegPictureWaitType,
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 4772f3f..212c5c2 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -239,6 +239,50 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    constexpr uint32_t kMpegNodataMainPc = 0x00125200u;
++    constexpr uint32_t kMpegNodataResumePc = 0x00125210u;
++    constexpr uint32_t kMpegNodataCallbackPc = 0x00125220u;
++    constexpr uint32_t kMpegNodataHandle = 0x00127000u;
++    constexpr uint32_t kMpegNodataImage = 0x00132000u;
++    constexpr uint32_t kMpegNodataEndCode = 0x00133000u;
++    std::atomic<uint32_t> gMpegNodataCalls{0u};
++    std::atomic<int32_t> gMpegNodataResult{-999};
++
++    // Like MOH: Rising Sun when its movie queue is empty: feed a sequence end code from the callback.
++    void testMpegNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gMpegNodataCalls.fetch_add(1u, std::memory_order_acq_rel);
++        const uint8_t endCode[] = {0x00u, 0x00u, 0x01u, 0xB7u};
++        std::memcpy(rdram + kMpegNodataEndCode, endCode, sizeof(endCode));
++        R5900Context addBs = *ctx;
++        setRegU32(addBs, 4, ::getRegU32(ctx, 4));
++        setRegU32(addBs, 5, kMpegNodataEndCode);
++        setRegU32(addBs, 6, sizeof(endCode));
++        ps2_stubs::sceMpegAddBs(rdram, &addBs, runtime);
++        ctx->pc = ::getRegU32(ctx, 31);
++    }
++
++    void testMpegNodataMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        R5900Context addCtx{};
++        setRegU32(addCtx, 4, kMpegNodataHandle);
++        setRegU32(addCtx, 5, 1u); // sceMpegCbNodata
++        setRegU32(addCtx, 6, kMpegNodataCallbackPc);
++        setRegU32(addCtx, 7, 0u);
++        ps2_stubs::sceMpegAddCallback(rdram, &addCtx, runtime);
++        setRegU32(*ctx, 4, kMpegNodataHandle);
++        setRegU32(*ctx, 5, kMpegNodataImage);
++        ctx->pc = kMpegNodataResumePc;
++        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
++    }
++
++    void testMpegNodataResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gMpegNodataResult.store(static_cast<int32_t>(::getRegU32(ctx, 2)), std::memory_order_release);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
+     void testStopAfterMpegCallback(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         ctx->pc = 0u;
+@@ -779,6 +823,29 @@ void register_ps2_runtime_expansion_tests()
+                      "resumed GetPicture should publish the configured height");
+         });
+ 
++        tc.Run("sceMpegGetPicture calls the no-data callback that feeds sceMpegAddBs", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++            ps2_stubs::resetMpegStubState();
++            ps2_stubs::notifyMpegCdStreamStart();
++            runtime.registerFunction(kMpegNodataMainPc, testMpegNodataMain);
++            runtime.registerFunction(kMpegNodataResumePc, testMpegNodataResume);
++            runtime.registerFunction(kMpegNodataCallbackPc, testMpegNodataCallback);
++            gMpegNodataCalls.store(0u, std::memory_order_release);
++            gMpegNodataResult.store(-999, std::memory_order_release);
++
++            R5900Context mainContext{};
++            mainContext.pc = kMpegNodataMainPc;
++            runtime.eeScheduler().reset(rdram.data(), mainContext);
++            runtime.eeScheduler().run();
++
++            t.Equals(gMpegNodataCalls.load(std::memory_order_acquire), 1u,
++                     "GetPicture should call the sceMpegCbNodata callback once when no picture is decoded");
++            t.Equals(gMpegNodataResult.load(std::memory_order_acquire), 0,
++                     "the sequence end code fed by the callback should end the stream and resume GetPicture");
++        });
++
+         tc.Run("sceMpegGetPicture waits for new decoder output instead of duplicating the last frame", [](TestCase &t)
+         {
+             PS2Runtime runtime;

@@ -1,0 +1,247 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..a0309c0 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -345,6 +345,8 @@ public:
+     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+     void processPendingTransfers();
+     std::vector<uint32_t> consumeCompletedDmacCauses();
++    // INTC causes raised by devices (e.g. 5 = VIF1 I-bit interrupt), dispatched like DMAC completions.
++    std::vector<uint32_t> consumePendingIntcCauses();
+ 
+     int pollDmaRegisters();
+ 
+@@ -423,6 +425,11 @@ public:
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
+     std::mutex m_completedDmacMutex;
+     std::vector<uint32_t> m_completedDmacCauses;
++    std::vector<uint32_t> m_pendingIntcCauses; // guarded by m_completedDmacMutex
++    // VIF1 stalls after a VIFcode with the I bit until FBRST.STC; data arriving meanwhile waits here.
++    bool m_vif1IrqPending = false;
++    bool m_vif1Stalled = false;
++    std::vector<uint8_t> m_vif1StallBuffer;
+ 
+     struct CodeRegion
+     {
+@@ -452,6 +459,7 @@ public:
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
++    void queueIntcCause(uint32_t cause);
+ };
+ 
+ #endif // PS2_MEMORY_H
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index ce28119..073b809 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -325,6 +325,7 @@ bool PS2Memory::initialize(size_t ramSize)
+     {
+         std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+         m_completedDmacCauses.clear();
++        m_pendingIntcCauses.clear();
+     }
+     m_codeRegions.clear();
+     m_path3Masked = false;
+@@ -1229,6 +1230,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             {
+                 const bool wasPath3Masked = m_path3Masked;
+                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
++                m_vif1IrqPending = false;
++                m_vif1Stalled = false;
++                m_vif1StallBuffer.clear();
+                 m_vif1PendingPath2ImageQwc = 0u;
+                 m_vif1PendingPath2DirectHl = false;
+                 m_path3Masked = false;
+@@ -1238,8 +1242,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             if (value & 0x8u) // STC
+             {
+                 vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
++                if (m_vif1Stalled) // resume what arrived during the I-bit stall
++                {
++                    m_vif1Stalled = false;
++                    std::vector<uint8_t> resume;
++                    resume.swap(m_vif1StallBuffer);
++                    if (!resume.empty())
++                        processVIF1Data(resume.data(), static_cast<uint32_t>(resume.size()));
++                }
+             }
+             break;
++        case 0x10003C20u: // VIF1_ERR: MII, ME0, ME1
++            vif1_regs.err = value & 0x7u;
++            break;
+         case 0x10003C30u:
+             vif1_regs.mark = value & 0xFFFFu;
+             vif1_regs.stat &= ~(1u << 6); // clear MRK flag on CPU write
+@@ -1918,6 +1933,20 @@ void PS2Memory::processPendingTransfers()
+     }
+ }
+ 
++void PS2Memory::queueIntcCause(uint32_t cause)
++{
++    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
++    m_pendingIntcCauses.push_back(cause);
++}
++
++std::vector<uint32_t> PS2Memory::consumePendingIntcCauses()
++{
++    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
++    std::vector<uint32_t> causes;
++    causes.swap(m_pendingIntcCauses);
++    return causes;
++}
++
+ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+ {
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+@@ -2368,6 +2397,27 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         return stat;
+     }
+ 
++    if (address >= 0x10003C00u && address < 0x10003D00u) // VIF1 registers mirror the interpreter state
++    {
++        switch (address)
++        {
++        case 0x10003C00u: return vif1_regs.stat;
++        case 0x10003C20u: return vif1_regs.err;
++        case 0x10003C30u: return vif1_regs.mark;
++        case 0x10003C40u: return vif1_regs.cycle;
++        case 0x10003C50u: return vif1_regs.mode;
++        case 0x10003C60u: return vif1_regs.num;
++        case 0x10003C70u: return vif1_regs.mask;
++        case 0x10003C80u: return vif1_regs.code;
++        case 0x10003C90u: return vif1_regs.itops;
++        case 0x10003CA0u: return vif1_regs.base;
++        case 0x10003CB0u: return vif1_regs.ofst;
++        case 0x10003CC0u: return vif1_regs.tops;
++        case 0x10003CD0u: return vif1_regs.itop;
++        case 0x10003CE0u: return vif1_regs.top;
++        default: break;
++        }
++    }
+     if (address >= 0x10000000 && address < 0x10010000)
+     {
+         if (address >= 0x10008000 && address < 0x1000F000)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 0491d8e..ee34a80 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1494,6 +1494,10 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+     {
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+     }
++    for (uint32_t cause : m_memory.consumePendingIntcCauses())
++    {
++        m_eeScheduler->dispatchIrq(false, cause);
++    }
+ }
+ 
+ void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index f872edd..1d7c412 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -300,7 +300,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+     if (sizeBytes == 0u)
+         return;
+ 
++    // Stalled by an I-bit VIFcode: hold the data until FBRST.STC (the DMA would wait on hardware).
++    if (m_vif1Stalled)
++    {
++        m_vif1StallBuffer.insert(m_vif1StallBuffer.end(), data, data + sizeBytes);
++        return;
++    }
++
+     uint32_t pos = 0;
++    // The I-bit command has finished: raise INTC 5 (VIF1) and stall before the next VIFcode.
++    auto enterIrqStall = [&]()
++    {
++        m_vif1IrqPending = false;
++        m_vif1Stalled = true;
++        vif1_regs.stat |= (1u << 10) | (1u << 11); // VIS, INT
++        m_vif1StallBuffer.assign(data + pos, data + sizeBytes);
++        queueIntcCause(5u);
++    };
+ 
+     while (pos + 4 <= sizeBytes)
+     {
+@@ -331,6 +347,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             continue;
+         }
+ 
++        if (m_vif1IrqPending)
++        {
++            enterIrqStall();
++            return;
++        }
++
+         uint32_t cmd;
+         memcpy(&cmd, data + pos, 4);
+         pos += 4;
+@@ -344,7 +366,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         vif1_regs.code = cmd;
+         vif1_regs.num = num;
+         if (irq)
++        {
+             vif1_regs.stat |= (1u << 11); // INT
++            if ((vif1_regs.err & 0x1u) == 0u) // ERR.MII masks the I-bit interrupt and stall
++                m_vif1IrqPending = true;
++        }
+ 
+         if (opcode == VIF_NOP)
+         {
+@@ -780,4 +806,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             continue;
+         }
+     }
++    if (m_vif1IrqPending && m_vif1PendingPath2ImageQwc == 0u)
++    {
++        pos = sizeBytes;
++        enterIrqStall();
++    }
+ }
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 7bbc369..f90c546 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -1912,6 +1912,40 @@ void register_ps2_memory_tests()
+             }
+         });
+ 
++        tc.Run("VIF1 I-bit VIFcode raises INTC 5 and stalls until FBRST.STC", [](TestCase &t)
++        {
++            for (const bool masked : {false, true})
++            {
++                PS2Memory mem;
++                t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++                if (masked)
++                    t.IsTrue(mem.writeIORegister(0x10003C20u, 0x1u), "set VIF1_ERR.MII");
++                (void)mem.consumePendingIntcCauses();
++
++                const uint32_t stream[] = {
++                    0x80000000u, // NOP with the I bit
++                    0x07001234u, // MARK 0x1234
++                };
++                mem.processVIF1Data(reinterpret_cast<const uint8_t *>(stream), sizeof(stream));
++                const std::vector<uint32_t> causes = mem.consumePendingIntcCauses();
++                if (masked)
++                {
++                    t.Equals(causes.size(), static_cast<size_t>(0u), "ERR.MII must suppress the VIF1 interrupt");
++                    t.Equals(mem.readIORegister(0x10003C30u) & 0xFFFFu, 0x1234u, "a masked I bit must not stall");
++                    continue;
++                }
++                t.Equals(causes.size(), static_cast<size_t>(1u), "I bit should raise one INTC cause");
++                if (!causes.empty())
++                    t.Equals(causes[0], 5u, "VIF1 interrupt is INTC cause 5");
++                t.IsTrue(mem.readIORegister(0x10003C30u) != 0x1234u, "VIF1 must stall before the next VIFcode");
++                t.Equals(mem.readIORegister(0x10003C80u), 0x80000000u, "VIF1_CODE should hold the I-bit VIFcode");
++
++                t.IsTrue(mem.writeIORegister(0x10003C10u, 0x8u), "FBRST.STC should succeed");
++                t.Equals(mem.readIORegister(0x10003C30u) & 0xFFFFu, 0x1234u, "STC should resume the stalled stream");
++                t.IsTrue((mem.readIORegister(0x10003C00u) & (1u << 11)) == 0u, "STC should clear STAT.INT");
++            }
++        });
++
+         tc.Run("GIF chain with only an END tag still completes the channel", [](TestCase &t)
+         {
+             PS2Memory mem;

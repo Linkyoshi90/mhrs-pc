@@ -1,0 +1,100 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index a0309c0..13044bb 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -430,6 +430,9 @@ public:
+     bool m_vif1IrqPending = false;
+     bool m_vif1Stalled = false;
+     std::vector<uint8_t> m_vif1StallBuffer;
++    size_t m_vif1StallOffset = 0; // the held stream starts here in m_vif1StallBuffer
++    // The stream being resumed after STC; a new I bit inside it hands the buffer back instead of copying it.
++    std::vector<uint8_t> m_vif1ResumeBuffer;
+ 
+     struct CodeRegion
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 073b809..6ff6438 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1233,6 +1233,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 m_vif1IrqPending = false;
+                 m_vif1Stalled = false;
+                 m_vif1StallBuffer.clear();
++                m_vif1StallOffset = 0;
+                 m_vif1PendingPath2ImageQwc = 0u;
+                 m_vif1PendingPath2DirectHl = false;
+                 m_path3Masked = false;
+@@ -1245,10 +1246,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 if (m_vif1Stalled) // resume what arrived during the I-bit stall
+                 {
+                     m_vif1Stalled = false;
+-                    std::vector<uint8_t> resume;
+-                    resume.swap(m_vif1StallBuffer);
+-                    if (!resume.empty())
+-                        processVIF1Data(resume.data(), static_cast<uint32_t>(resume.size()));
++                    m_vif1ResumeBuffer.swap(m_vif1StallBuffer);
++                    m_vif1StallBuffer.clear();
++                    const size_t offset = m_vif1StallOffset;
++                    m_vif1StallOffset = 0;
++                    if (offset < m_vif1ResumeBuffer.size())
++                        processVIF1Data(m_vif1ResumeBuffer.data() + offset, static_cast<uint32_t>(m_vif1ResumeBuffer.size() - offset));
+                 }
+             }
+             break;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 1d7c412..90fb2a5 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -314,7 +314,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         m_vif1IrqPending = false;
+         m_vif1Stalled = true;
+         vif1_regs.stat |= (1u << 10) | (1u << 11); // VIS, INT
+-        m_vif1StallBuffer.assign(data + pos, data + sizeBytes);
++        const uint8_t *resumeBegin = m_vif1ResumeBuffer.data();
++        if (!m_vif1ResumeBuffer.empty() && data >= resumeBegin && data < resumeBegin + m_vif1ResumeBuffer.size())
++        {
++            // Stalled again inside a resumed stream: keep its buffer (swap leaves `data` valid) and remember where.
++            m_vif1StallBuffer.swap(m_vif1ResumeBuffer);
++            m_vif1StallOffset = static_cast<size_t>((data + pos) - m_vif1StallBuffer.data());
++        }
++        else
++        {
++            m_vif1StallBuffer.assign(data + pos, data + sizeBytes);
++            m_vif1StallOffset = 0;
++        }
+         queueIntcCause(5u);
+     };
+ 
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index f90c546..b83ca86 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -1946,6 +1946,28 @@ void register_ps2_memory_tests()
+             }
+         });
+ 
++        tc.Run("VIF1 stream with several I bits resumes each stall where it stopped", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            (void)mem.consumePendingIntcCauses();
++            const uint32_t stream[] = {
++                0x80000000u, 0x07000001u, // I-bit NOP, MARK 1
++                0x80000000u, 0x07000002u, // I-bit NOP, MARK 2
++                0x80000000u, 0x07000003u, // I-bit NOP, MARK 3
++            };
++            mem.processVIF1Data(reinterpret_cast<const uint8_t *>(stream), sizeof(stream));
++            const uint32_t extra[] = {0x07000004u}; // arrives while stalled
++            mem.processVIF1Data(reinterpret_cast<const uint8_t *>(extra), sizeof(extra));
++            for (uint32_t mark = 1u; mark <= 3u; ++mark)
++            {
++                t.Equals(mem.consumePendingIntcCauses().size(), static_cast<size_t>(1u), "each I bit raises INTC 5 once");
++                t.IsTrue(mem.writeIORegister(0x10003C10u, 0x8u), "FBRST.STC");
++                t.Equals(mem.readIORegister(0x10003C30u) & 0xFFFFu, mark == 3u ? 4u : mark, "STC resumes after the stalled VIFcode");
++            }
++            t.Equals(mem.consumePendingIntcCauses().size(), static_cast<size_t>(0u), "no stall left after the last I bit");
++        });
++
+         tc.Run("GIF chain with only an END tag still completes the channel", [](TestCase &t)
+         {
+             PS2Memory mem;

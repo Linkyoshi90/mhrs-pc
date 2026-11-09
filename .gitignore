@@ -1,0 +1,19 @@
+# Copyrighted game data: never commit
+iso/
+extracted/
+*.iso
+*.elf
+SLUS_*
+*.rom
+
+# Tooling
+.venv/
+
+# Generated from game code: never commit
+asm/
+build/
+
+# Runner output when launched from repo root
+imgui.ini
+ps2_log.txt
+__pycache__/

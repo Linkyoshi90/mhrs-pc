@@ -1,0 +1,17 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..88244fb 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -501,6 +501,12 @@ if(MSVC)
+     target_compile_options(ps2EntryRunner PRIVATE /FS)
+ endif()
+ 
++# GCC/Clang only allow the SSE4.1 intrinsics used by the runtime headers when the ISA is enabled (MSVC allows them by default).
++# PUBLIC so generated game code that includes those headers gets it too.
++if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
++    target_compile_options(ps2_runtime PUBLIC -msse4.2)
++endif()
++
+ target_include_directories(ps2_runtime PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/include
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel

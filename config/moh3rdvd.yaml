@@ -1,0 +1,75 @@
+name: Medal of Honor - Rising Sun (NTSC-U, SLUS-20753) MOH3RDVD.ELF
+sha1: 1943b34e7c2098dadd2d5bf25a9ee3055653f2c7
+options:
+  basename: moh3rdvd
+  target_path: extracted/MOH3RDVD.rom
+  elf_path: build/moh3rdvd.elf
+  base_path: ..
+  platform: ps2
+  compiler: EEGCC
+  # gas -mabi=eabi uses n32 register names ($t4-$t7 are invalid there)
+  mips_abi_gpr: n32
+
+  asm_path: asm
+  src_path: src
+  build_path: build
+
+  ld_script_path: build/moh3rdvd.ld
+  ld_dependencies: True
+  ld_align_section_vram_end: False
+  ld_wildcard_sections: True
+  ld_bss_contains_common: True
+
+  create_asm_dependencies: True
+
+  find_file_boundaries: False
+
+  o_as_suffix: True
+
+  symbol_addrs_path:
+    - config/symbol_addrs.txt
+  reloc_addrs_path:
+    - config/reloc_addrs.txt
+
+  undefined_funcs_auto_path: build/undefined_funcs_auto.txt
+  undefined_syms_auto_path: build/undefined_syms_auto.txt
+
+  extensions_path: tools/splat_ext
+
+  string_encoding: ASCII
+  data_string_encoding: ASCII
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+
+  named_regs_for_c_funcs: False
+
+  section_order:
+    - .text
+    - .data
+    - .rodata
+    - .gcc_except_table
+    - .sbss
+    - .bss
+
+  auto_link_sections:
+    - .data
+    - .rodata
+    - .gcc_except_table
+    - .sbss
+    - .bss
+
+segments:
+  - name: main
+    type: code
+    start: 0x000000
+    vram: 0x00135480
+    bss_size: 0x124880 # to 0x4EAE5C, original ELF memsz end
+    subalign: 128 # original linker aligned every section to 0x80
+    subsegments:
+      - [0x000000, asm, main/000000] # .text
+      - [0x224700, data, main/224700] # .data
+      - [0x252B00, rodata, main/252B00] # .rodata
+      - [0x291100, gcc_except_table, main/291100] # .gcc_except_table
+      - { type: sbss, vram: 0x003C6600, name: main/003C6600 } # .sbss
+      - { type: bss, vram: 0x003C6680, name: main/003C6680 } # .bss
+  - [0x29115C]

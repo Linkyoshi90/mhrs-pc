@@ -1,0 +1,71 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index bb03879..30f284b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -986,9 +986,22 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+     }
+     {
+         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
++        // SetupThread(stack = -1) puts the main stack at the top of RAM, as the kernel does, so callback
++        // stacks carved from there overwrite its live frames. Retail programs load at 0x100000 or above;
++        // the kernel-reserved range below them is free for these stacks.
++        constexpr uint32_t kUserMemoryBase = 0x00100000u;
++        constexpr uint32_t kKernelReservedCallbackFloor = 0x00080000u;
++        if (moduleBase != std::numeric_limits<uint32_t>::max() && (moduleBase & 0x1FFFFFFFu) >= kUserMemoryBase)
++        {
++            m_asyncCallbackStackFloor = kKernelReservedCallbackFloor;
++            m_asyncCallbackStackTop = kUserMemoryBase;
++        }
++        else
++        {
++            const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++            m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
++            m_asyncCallbackStackTop = PS2_RAM_SIZE;
++        }
+     }
+ 
+     LoadedModule module;
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 972fbbe..66aa8db 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -1,3 +1,5 @@
++#include <fstream>
++#include <filesystem>
+ #include "MiniTest.h"
+ #include "ps2_runtime.h"
+ #include "ps2_runtime_macros.h"
+@@ -1097,6 +1099,30 @@ void register_ps2_runtime_kernel_tests()
+             t.Equals(::getRegU32(&env.ctx, 2), PS2_RAM_SIZE,
+                      "automatic main stack pointer should start at the top of its region (stacks grow down)");
+ 
++            {
++                // A one-segment ELF at the usual user base: callback stacks must stay clear of the main stack.
++                const std::string elfPath = (std::filesystem::temp_directory_path() / "ps2x_callback_stack_test.elf").string();
++                {
++                    uint8_t elf[52 + 32 + 16] = {};
++                    const uint8_t ident[] = {0x7F, 'E', 'L', 'F', 1, 1, 1};
++                    std::memcpy(elf, ident, sizeof(ident));
++                    auto put16 = [&](size_t off, uint16_t v) { std::memcpy(elf + off, &v, 2); };
++                    auto put32 = [&](size_t off, uint32_t v) { std::memcpy(elf + off, &v, 4); };
++                    put16(16, 2); put16(18, 8); put32(20, 1); put32(24, 0x00100000u); put32(28, 52);
++                    put16(40, 52); put16(42, 32); put16(44, 1);
++                    put32(52, 1); put32(56, 84); put32(60, 0x00100000u); put32(64, 0x00100000u);
++                    put32(68, 16); put32(72, 16); put32(76, 7); put32(80, 16);
++                    std::ofstream(elfPath, std::ios::binary).write(reinterpret_cast<const char *>(elf), sizeof(elf));
++                }
++                PS2Runtime elfRuntime;
++                t.IsTrue(elfRuntime.memory().initialize(), "runtime memory initialize should succeed");
++                t.IsTrue(elfRuntime.loadELF(elfPath), "minimal user-base ELF should load");
++                const uint32_t callbackTop = elfRuntime.reserveAsyncCallbackStack(0x4000u, 16u);
++                t.IsTrue(callbackTop > 0x00080000u && callbackTop <= 0x00100000u,
++                         "callback stacks should come from the kernel-reserved range, not the main stack at the top of RAM");
++                std::filesystem::remove(elfPath);
++            }
++
+             // ReferThreadStatus can be called after many nested frames have moved $sp.
+             // It must report the initial stack recorded by SetupThread, not this live snapshot.
+             constexpr uint32_t kTransientSp = kExpectedStack - 0x80u;
