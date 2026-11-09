@@ -24,3 +24,4 @@ ps2recomp-vu1-immediate-writes.patch
 ps2recomp-gs-band-raster.patch
 ps2recomp-vu1-compiled-blocks.patch
 ps2recomp-vu1-store-xgkick.patch
+ps2recomp-gif-vu1-worker.patch
