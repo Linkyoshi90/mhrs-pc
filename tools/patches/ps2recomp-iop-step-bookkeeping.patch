@@ -1,0 +1,77 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 2ebeeb5..992bd21 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -68,6 +68,7 @@ namespace ps2x::iop::detail
+         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
+ 
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
++        [[nodiscard]] bool hasDmaStart() const noexcept { return m_dmaStart.has_value(); }
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+         [[nodiscard]] std::span<uint8_t> ramMutable() noexcept { return m_ram; }
+ 
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index b3471e4..b790ece 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -129,6 +129,7 @@ namespace ps2x::iop::detail
+             timrman.reset();
+             ioman.reset();
+             pendingDmaInterrupts.clear();
++            nextDmaDue = UINT64_MAX;
+             pendingGuestCallbacks.clear();
+             nativeSlots.clear();
+             nextModuleId = 1;
+@@ -182,8 +183,13 @@ namespace ps2x::iop::detail
+ 
+         void schedulePendingDma()
+         {
++            if (!memory.hasDmaStart())
++                return;
+             if (const auto dma = memory.takeDmaStart())
++            {
+                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
++                nextDmaDue = std::min(nextDmaDue, totalCycles + dma->delayCycles);
++            }
+         }
+ 
+         bool readRam(uint32_t address, void *destination, size_t size) const
+@@ -384,7 +390,7 @@ namespace ps2x::iop::detail
+             if (checkInterrupt(cpu))
+                 return true;
+ 
+-            if (const auto import = imports.decode(cpu.pc))
++            if (const auto import = memory.read32(cpu.pc) == 0x03E00008u ? imports.decode(cpu.pc) : std::nullopt)
+             {
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+                 ++totalInstructions;
+@@ -412,9 +418,9 @@ namespace ps2x::iop::detail
+             {
+                 if (!step(cpu))
+                     break;
+-                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
++                if (!servicingDmaInterrupts && totalCycles >= nextDmaDue && !pendingDmaInterrupts.empty())
+                     servicePendingDmaInterrupts();
+-                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
++                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty() && pendingGuestCallbacks.begin()->first <= totalCycles)
+                     servicePendingGuestCallbacks();
+             }
+             activeCpu = previous;
+@@ -523,6 +529,9 @@ namespace ps2x::iop::detail
+                 throw;
+             }
+             servicingDmaInterrupts = false;
++            nextDmaDue = UINT64_MAX;
++            for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
++                nextDmaDue = std::min(nextDmaDue, completionCycle);
+         }
+ 
+         void servicePendingGuestCallbacks()
+@@ -711,6 +720,7 @@ namespace ps2x::iop::detail
+         IopLoadcore loadcore;
+         std::map<int, Module> modules;
+         std::map<int, uint64_t> pendingDmaInterrupts;
++        uint64_t nextDmaDue = UINT64_MAX; // no pending DMA interrupt completes before this cycle
+ 
+         // Native function overrides (see NativeFunction). Primary opcode 0x1B is unused on the R3000.
+         static constexpr uint32_t kNativeTrapOpcode = 0x1Bu;

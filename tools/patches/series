@@ -25,3 +25,6 @@ ps2recomp-gs-band-raster.patch
 ps2recomp-vu1-compiled-blocks.patch
 ps2recomp-vu1-store-xgkick.patch
 ps2recomp-gif-vu1-worker.patch
+ps2recomp-vu1-static-timing.patch
+ps2recomp-gs-fast-pixels.patch
+ps2recomp-iop-step-bookkeeping.patch

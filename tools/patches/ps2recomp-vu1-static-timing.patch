@@ -1,0 +1,486 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 33b24c8..055d9d5 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -47,6 +47,17 @@ struct VU1State
+     uint32_t branchDelay;
+ };
+ 
++// A VU1 pair's timing known when a compiled block is built (VU1Interpreter::CompiledAccess::block): how many
++// cycles it stalls before it issues, and which lanes of the registers it writes still have a write in flight then.
++struct Vu1StaticPairTiming
++{
++    bool known = false;
++    uint8_t stall = 0;
++    uint8_t upperPending = 0; // lanes (VU1Interpreter::laneForComponent bits) of the upper VF write
++    uint8_t lowerPending = 0; // lanes of the lower VF write
++    bool viPending = false;
++};
++
+ class VU1Interpreter
+ {
+ public:
+@@ -335,7 +346,9 @@ private:
+              uint8_t *vuData, uint32_t dataSize,
+              GS &gs, PS2Memory *memory, uint32_t maxCycles);
+ 
+-    template <bool kCompiled>
++    using StaticPairTiming = Vu1StaticPairTiming;
++
++    template <bool kCompiled, StaticPairTiming kTiming = StaticPairTiming{}>
+     PairResult stepPair(const DecodedInstructionPair &decoded, uint32_t codeSize, uint64_t budgetEnd);
+ 
+     static constexpr InstructionUsage decodeUpperUsage(uint32_t upper);
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.h b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+index c982f0d..58a33c8 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+@@ -13,6 +13,7 @@
+ #include <bit>
+ #include <cmath>
+ #include <cstring>
++#include <utility>
+ #include <limits>
+ #if defined(_MSC_VER)
+ #include <intrin.h>
+@@ -1008,24 +1009,35 @@ VU1_ALWAYS_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPa
+ 
+ // One instruction pair: wait for its operands (stalling cycle by cycle), issue it, and step one cycle.
+ // The interpreter loop and compiled blocks (with a constexpr pair, so it folds to that pair) share it.
+-template <bool kCompiled>
++// With kTiming.known (a plain pair inside a compiled block whose entry check passed, see CompiledAccess::block)
++// the stall and the in-flight state of the written registers are constants; it never stops, and the caller
++// moves pc on.
++template <bool kCompiled, VU1Interpreter::StaticPairTiming kTiming>
+ VU1_ALWAYS_INLINE VU1Interpreter::PairResult VU1Interpreter::stepPair(const DecodedInstructionPair &decoded,
+                                                                      uint32_t codeSize, uint64_t budgetEnd)
+ {
+     bool programEnded = false;
+-    uint64_t readyCycle = calculatePairReadyCycle(decoded);
+-    while (readyCycle > m_cycle)
++    if constexpr (kTiming.known)
+     {
+-        if (readyCycle >= budgetEnd)
++        for (uint32_t cycle = 0; cycle < kTiming.stall; ++cycle)
++            advanceOneCycle();
++    }
++    else
++    {
++        uint64_t readyCycle = calculatePairReadyCycle(decoded);
++        while (readyCycle > m_cycle)
+         {
+-            advanceTo(budgetEnd);
+-            break;
++            if (readyCycle >= budgetEnd)
++            {
++                advanceTo(budgetEnd);
++                break;
++            }
++            advanceTo(readyCycle);
++            readyCycle = calculatePairReadyCycle(decoded);
+         }
+-        advanceTo(readyCycle);
+-        readyCycle = calculatePairReadyCycle(decoded);
++        if (m_cycle >= budgetEnd)
++            return PairResult::Stopped;
+     }
+-    if (m_cycle >= budgetEnd)
+-        return PairResult::Stopped;
+ 
+     uint8_t writtenVi = 0u;
+     int32_t oldVi = 0;
+@@ -1033,7 +1045,8 @@ VU1_ALWAYS_INLINE VU1Interpreter::PairResult VU1Interpreter::stepPair(const Deco
+     {
+         writtenVi = static_cast<uint8_t>(std::countr_zero(viWrites));
+         // The value the pipeline shows: a branch in the next pair reads it (recordViWriteForBranch).
+-        oldVi = m_ready[kViSlot + writtenVi] > m_cycle ? m_viChainStart[writtenVi] : m_state.vi[writtenVi];
++        const bool viPending = kTiming.known ? kTiming.viPending : m_ready[kViSlot + writtenVi] > m_cycle;
++        oldVi = viPending ? m_viChainStart[writtenVi] : m_state.vi[writtenVi];
+     }
+ 
+     const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+@@ -1045,10 +1058,27 @@ VU1_ALWAYS_INLINE VU1Interpreter::PairResult VU1Interpreter::stepPair(const Deco
+         syncFlags();
+     float oldUpperVf[4];
+     float oldLowerVf[4];
+-    if (hasUpperWrite)
+-        std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+-    if (hasDistinctLowerWrite)
+-        std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++    if constexpr (kTiming.known)
++    {
++        // A write to a lane with nothing in flight starts a chain: the lane shows its old value until it lands.
++        const auto startChains = [this](uint8_t reg, uint8_t lanes) VU1_LAMBDA_ALWAYS_INLINE
++        {
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((lanes & laneForComponent(component)) != 0u)
++                    m_vfChainStart[reg][component] = m_state.vf[reg][component];
++        };
++        if (hasUpperWrite)
++            startChains(upperWrite.reg, upperWrite.lanes & static_cast<uint8_t>(~kTiming.upperPending));
++        if (hasDistinctLowerWrite)
++            startChains(lowerWrite.reg, lowerWrite.lanes & static_cast<uint8_t>(~kTiming.lowerPending));
++    }
++    else
++    {
++        if (hasUpperWrite)
++            std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
++        if (hasDistinctLowerWrite)
++            std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++    }
+ 
+     const auto execUpperOf = [this](const DecodedInstructionPair &pair) VU1_LAMBDA_ALWAYS_INLINE
+     {
+@@ -1108,17 +1138,43 @@ VU1_ALWAYS_INLINE VU1Interpreter::PairResult VU1Interpreter::stepPair(const Deco
+ 
+     // Writes land in m_state now; the scoreboard (markPairWrites) keeps readers from seeing them early.
+     // ACC (latency 1) is readable by the next pair, so it needs neither.
+-    if (hasUpperWrite)
+-        noteVfWrite(upperWrite.reg, upperWrite.lanes, oldUpperVf,
+-                    decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency : decoded.upperUsage.latency);
+-    if (hasDistinctLowerWrite)
+-        noteVfWrite(lowerWrite.reg, lowerWrite.lanes, oldLowerVf,
+-                    decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency : decoded.lowerUsage.latency);
+-    if (writtenVi != 0u)
+-    {
+-        m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
+-        noteViWrite(writtenVi, oldVi,
+-                    decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
++    if constexpr (kTiming.known)
++    {
++        // noteVfWrite/noteViWrite with the in-flight state known (the block's entry check found no deferred
++        // writes, so there are no write sequences to bump).
++        if (hasUpperWrite)
++        {
++            m_vfWrittenLanes[upperWrite.reg] |= upperWrite.lanes;
++            m_inflightReady = std::max<uint64_t>(m_inflightReady, m_cycle + (decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency : decoded.upperUsage.latency));
++        }
++        if (hasDistinctLowerWrite)
++        {
++            m_vfWrittenLanes[lowerWrite.reg] |= lowerWrite.lanes;
++            m_inflightReady = std::max<uint64_t>(m_inflightReady, m_cycle + (decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency : decoded.lowerUsage.latency));
++        }
++        if (writtenVi != 0u)
++        {
++            m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
++            if (!kTiming.viPending)
++                m_viChainStart[writtenVi] = oldVi;
++            m_viWritten |= static_cast<uint16_t>(1u << writtenVi);
++            m_inflightReady = std::max<uint64_t>(m_inflightReady, m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency));
++        }
++    }
++    else
++    {
++        if (hasUpperWrite)
++            noteVfWrite(upperWrite.reg, upperWrite.lanes, oldUpperVf,
++                        decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency : decoded.upperUsage.latency);
++        if (hasDistinctLowerWrite)
++            noteVfWrite(lowerWrite.reg, lowerWrite.lanes, oldLowerVf,
++                        decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency : decoded.lowerUsage.latency);
++        if (writtenVi != 0u)
++        {
++            m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
++            noteViWrite(writtenVi, oldVi,
++                        decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
++        }
+     }
+ 
+     markPairWrites(decoded);
+@@ -1131,6 +1187,13 @@ VU1_ALWAYS_INLINE VU1Interpreter::PairResult VU1Interpreter::stepPair(const Deco
+     m_state.vf[0][3] = 1.0f;
+     m_state.vi[0] = 0;
+ 
++    if constexpr (kTiming.known)
++    {
++        // A plain pair: no branch, no E/D/T bit, and none pending from before (the block's entry check).
++        advanceOneCycle();
++        return PairResult::Next;
++    }
++
+     uint32_t nextPc = m_state.pc + 8u;
+     if (nextPc >= codeSize)
+         nextPc = 0u;
+@@ -1219,6 +1282,209 @@ struct VU1Interpreter::CompiledAccess
+             return exit;
+         return vu.m_state.pc == nextPc ? kNext : kLeave;
+     }
++
++    // A block (generated: block<words, pc>) runs a run of plain pairs (no branch or delay slot, no E/D/T bit,
++    // no FDIV/EFU/XGKICK whose stalls depend on those units) on timing worked out here, at compile time: each
++    // pair's stall and which lanes it writes still have a write in flight. That holds when, as the run starts,
++    // no register it touches has a write landing after the run first touches it, nothing is pending from a
++    // branch or E bit, no stopped run left deferred writes, and the run ends before the budget does: the entry
++    // check. Otherwise the run's pairs step as usual. Either way every pair leaves the interpreter's state.
++    struct RegisterCheck
++    {
++        uint8_t slot;    // VF: reg * 4 (all four lanes), VI: kViSlot + reg
++        bool vf;
++        uint16_t offset; // cycles after the run starts when it first reads or writes the register
++    };
++
++    template <size_t N>
++    struct BlockPlan
++    {
++        std::array<StaticPairTiming, N> timing{};
++        std::array<uint16_t, N> runEnd{};    // at a run's first pair: the index after its last one (else 0)
++        std::array<uint16_t, N> lastIssue{}; // at a run's first pair: when its last pair issues
++        std::array<uint16_t, N> checkBegin{};
++        std::array<uint16_t, N> checkCount{};
++        std::array<RegisterCheck, N * 8u + 48u> checks{};
++    };
++
++    static constexpr bool isPlain(const DecodedInstructionPair &pair)
++    {
++        const InstructionUsage &lower = pair.lowerUsage;
++        return !pair.upperUsage.reserved && !lower.reserved && !pair.eBit && !pair.dBit && !pair.tBit &&
++               lower.pipeline != PipelineBranch && lower.pipeline != PipelineFdiv && lower.pipeline != PipelineEfu &&
++               lower.pipeline != PipelineXgkick && !lower.waitQ && !lower.waitP;
++    }
++
++    template <size_t N>
++    static constexpr BlockPlan<N> planBlock(const uint32_t (&words)[N * 2u], uint32_t pc)
++    {
++        BlockPlan<N> plan{};
++        std::array<DecodedInstructionPair, N> pairs{};
++        for (size_t i = 0; i < N; ++i)
++            pairs[i] = decodePair(words[2u * i], words[2u * i + 1u], Unit::VU1);
++        size_t checkTotal = 0;
++        for (size_t start = 0; start < N;)
++        {
++            const auto plainAt = [&](size_t i)
++            {
++                return isPlain(pairs[i]) && !(i > 0 && (pairs[i - 1].lowerUsage.pipeline == PipelineBranch || pairs[i - 1].eBit));
++            };
++            if (!plainAt(start))
++            {
++                ++start;
++                continue;
++            }
++            // The interpreter's schedule from the run's start: ready[slot] = when a write in the run lands (m_ready
++            // relative to the start), -1 for registers no pair of the run wrote yet (the entry check covers them).
++            std::array<int32_t, kViSlot + 16u> ready{};
++            ready.fill(-1);
++            std::array<int32_t, 48> firstTouch{}; // VF 0..31, VI 32..47
++            firstTouch.fill(-1);
++            int32_t t = 0, issue = 0;
++            size_t end = start;
++            for (; end < N && plainAt(end); ++end)
++            {
++                const DecodedInstructionPair &pair = pairs[end];
++                int32_t at = t;
++                for (uint32_t r = 0; r < pair.readSlotCount; ++r)
++                    at = std::max(at, ready[pair.readSlots[r]]);
++                if (at - t > 255)
++                    break;
++                issue = at;
++                const auto touch = [&](uint32_t slot)
++                {
++                    const uint32_t reg = slot < kViSlot ? slot / 4u : 32u + (slot - kViSlot);
++                    if (firstTouch[reg] < 0)
++                        firstTouch[reg] = issue;
++                };
++                for (uint32_t r = 0; r < pair.readSlotCount; ++r)
++                    touch(pair.readSlots[r]);
++                for (uint32_t w = 0; w < pair.writeSlotCount; ++w)
++                    touch(pair.writeSlots[w]);
++
++                const auto pendingLanes = [&](uint8_t reg)
++                {
++                    uint8_t lanes = 0u;
++                    for (uint32_t component = 0; component < 4u; ++component)
++                        if (ready[reg * 4u + component] > issue)
++                            lanes |= laneForComponent(component);
++                    return lanes;
++                };
++                StaticPairTiming &timing = plan.timing[end];
++                timing.known = true;
++                timing.stall = static_cast<uint8_t>(issue - t);
++                timing.upperPending = pendingLanes(pair.upperUsage.vfWrite.reg);
++                timing.lowerPending = pendingLanes(pair.lowerUsage.vfWrite.reg);
++                if (const uint32_t viWrites = pair.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
++                    timing.viPending = ready[kViSlot + std::countr_zero(viWrites)] > issue;
++
++                for (uint32_t w = 0; w < pair.writeSlotCount; ++w)
++                    ready[pair.writeSlots[w]] = issue + pair.writeLatency[w];
++                t = issue + 1;
++            }
++            if (end == start)
++            {
++                ++start;
++                continue;
++            }
++            plan.runEnd[start] = static_cast<uint16_t>(end);
++            plan.lastIssue[start] = static_cast<uint16_t>(issue);
++            plan.checkBegin[start] = static_cast<uint16_t>(checkTotal);
++            for (uint32_t reg = 1; reg < 48u; ++reg) // VF0/VI0 are never written
++            {
++                if (reg == 32u || firstTouch[reg] < 0)
++                    continue;
++                plan.checks[checkTotal++] = reg < 32u ? RegisterCheck{static_cast<uint8_t>(reg * 4u), true, static_cast<uint16_t>(firstTouch[reg])}
++                                                      : RegisterCheck{static_cast<uint8_t>(kViSlot + reg - 32u), false, static_cast<uint16_t>(firstTouch[reg])};
++            }
++            plan.checkCount[start] = static_cast<uint16_t>(checkTotal - plan.checkBegin[start]);
++            start = end;
++        }
++        return plan;
++    }
++
++    template <const auto &Words, uint32_t Pc>
++    struct BlockInfo
++    {
++        static constexpr size_t N = std::size(Words) / 2u;
++        static constexpr BlockPlan<N> plan = planBlock<N>(Words, Pc);
++    };
++
++    template <uint32_t Lower, uint32_t Upper, StaticPairTiming kTiming>
++    static VU1_NOINLINE VU1_NO_STACK_PROTECTOR void plainPair(VU1Interpreter &vu)
++    {
++        static constexpr DecodedInstructionPair kPair = decodePair(Lower, Upper, Unit::VU1);
++        vu.stepPair<true, kTiming>(kPair, kCompiledCodeSize, 0u);
++    }
++
++    template <const auto &Words, uint32_t Pc, size_t I, size_t... C>
++    static VU1_ALWAYS_INLINE bool runReady(VU1Interpreter &vu, uint64_t budgetEnd, std::index_sequence<C...>)
++    {
++        constexpr const BlockPlan<BlockInfo<Words, Pc>::N> &plan = BlockInfo<Words, Pc>::plan;
++        const uint64_t start = vu.m_cycle;
++        if (start + plan.lastIssue[I] >= budgetEnd || vu.m_stopRequested || vu.m_state.branchPending ||
++            vu.m_state.haltAfterDelaySlot || vu.m_state.ebit || (vu.m_vfWriteMask | vu.m_viWriteMask) != 0u)
++            return false;
++        const auto settled = [&](const RegisterCheck &check) VU1_LAMBDA_ALWAYS_INLINE
++        {
++            const uint64_t bound = start + check.offset;
++            if (!check.vf)
++                return vu.m_ready[check.slot] <= bound;
++            return std::max(std::max(vu.m_ready[check.slot], vu.m_ready[check.slot + 1u]),
++                            std::max(vu.m_ready[check.slot + 2u], vu.m_ready[check.slot + 3u])) <= bound;
++        };
++        return (settled(plan.checks[plan.checkBegin[I] + C]) && ...);
++    }
++
++    // A plain pair of a run that passed its entry check; false if the run must stop after it.
++    template <const auto &Words, uint32_t Pc, size_t I>
++    static VU1_ALWAYS_INLINE bool plainStep(VU1Interpreter &vu)
++    {
++        plainPair<Words[2u * I], Words[2u * I + 1u], BlockInfo<Words, Pc>::plan.timing[I]>(vu);
++        vu.m_state.pc = (Pc + 8u * static_cast<uint32_t>(I + 1u)) % kCompiledCodeSize;
++        return !vu.m_stopRequested; // the next pair would not start
++    }
++
++    template <const auto &Words, uint32_t Pc, size_t I, size_t... K>
++    static VU1_ALWAYS_INLINE bool runPlain(VU1Interpreter &vu, std::index_sequence<K...>)
++    {
++        return (plainStep<Words, Pc, I + K>(vu) && ...);
++    }
++
++    // Pair I of a block; pairs before fastUntil already ran in a plain run.
++    template <const auto &Words, uint32_t Pc, size_t I>
++    static VU1_ALWAYS_INLINE int blockPair(VU1Interpreter &vu, uint64_t budgetEnd, size_t &fastUntil)
++    {
++        using Info = BlockInfo<Words, Pc>;
++        if (I < fastUntil)
++            return kNext;
++        if constexpr (Info::plan.runEnd[I] != 0u)
++        {
++            constexpr size_t End = Info::plan.runEnd[I];
++            if (runReady<Words, Pc, I>(vu, budgetEnd, std::make_index_sequence<Info::plan.checkCount[I]>{}))
++            {
++                fastUntil = End;
++                return runPlain<Words, Pc, I>(vu, std::make_index_sequence<End - I>{}) ? kNext : kLeave;
++            }
++        }
++        return step<Words[2u * I], Words[2u * I + 1u]>(vu, budgetEnd, (Pc + 8u * static_cast<uint32_t>(I + 1u)) % kCompiledCodeSize);
++    }
++
++    template <const auto &Words, uint32_t Pc, size_t... I>
++    static VU1_ALWAYS_INLINE int runBlock(VU1Interpreter &vu, uint64_t budgetEnd, std::index_sequence<I...>)
++    {
++        size_t fastUntil = 0;
++        int exit = kNext;
++        (((exit = blockPair<Words, Pc, I>(vu, budgetEnd, fastUntil)) == kNext) && ...);
++        return exit == kNext ? kLeave : exit;
++    }
++
++    // A whole block: Words are its pairs' lower/upper words (a constexpr array), Pc where it starts.
++    template <const auto &Words, uint32_t Pc>
++    static int block(VU1Interpreter &vu, uint64_t budgetEnd)
++    {
++        return runBlock<Words, Pc>(vu, budgetEnd, std::make_index_sequence<BlockInfo<Words, Pc>::N>{});
++    }
+ };
+ 
+ #endif
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index ef71fd2..90c9b30 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -190,6 +190,18 @@ namespace
+     }
+     const VU1Interpreter::CompiledBlock kCompiledTestBlock{0u, 3u, kCompiledTestWords, compiledTestBlock};
+ 
++    // ADD.xyzw vf3, vf1, vf2 | NOP; ADD.xyzw vf4, vf3, vf1 (stalls 3 on vf3) | IADDIU vi1, vi0, 7; ADD.x vf4, vf1, vf1
++    // (vf4.x still in flight) | NOP; NOP with the E bit | NOP; NOP | NOP. The first three pairs are a plain run.
++    constexpr uint32_t kStaticBlockWords[] = {0x8000033Cu, 0x01E208E8u, 0x10010007u, 0x01E11928u, 0x8000033Cu, 0x01010928u,
++                                              0x8000033Cu, kVuUpperNop | 0x40000000u, 0x8000033Cu, kVuUpperNop};
++    using StaticBlockInfo = VU1Interpreter::CompiledAccess::BlockInfo<kStaticBlockWords, 8u>;
++    static_assert(StaticBlockInfo::plan.runEnd[0] == 3u, "the first three pairs are one plain run");
++    static_assert(StaticBlockInfo::plan.timing[1].stall == 3u, "ADD reading vf3 waits for it");
++    static_assert(StaticBlockInfo::plan.timing[2].upperPending == 0xFu, "all of vf4 is still in flight");
++    static_assert(StaticBlockInfo::plan.lastIssue[0] == 5u, "the run's last pair issues at 5");
++    const VU1Interpreter::CompiledBlock kStaticBlock{8u, 5u, kStaticBlockWords,
++                                                     &VU1Interpreter::CompiledAccess::block<kStaticBlockWords, 8u>};
++
+     void writeVuInstructionPair(uint8_t *code, uint32_t pc, uint32_t lower, uint32_t upper)
+     {
+         std::memcpy(code + pc, &lower, sizeof(lower));
+@@ -1807,6 +1819,50 @@ void register_ps2_vu1_tests()
+             }
+         });
+ 
++        tc.Run("a compiled block with static timing matches the interpreter at every budget, in flight or not", [](TestCase &t)
++        {
++            VU1Interpreter::registerCompiledBlocks(&kStaticBlock, 1u);
++            // pc 0: NOP, or ADD.xyzw vf1, vf2, vf2 so that vf1 (read by the run) is still landing when it starts.
++            for (const uint32_t first : {kVuUpperNop, 0x01E210A8u})
++            {
++                int mismatches = 0;
++                for (uint32_t budget = 1u; budget <= 24u; ++budget)
++                {
++                    VU1State results[2];
++                    VU1State stopped[2];
++                    for (int compiled = 0; compiled < 2; ++compiled)
++                    {
++                        VU1Interpreter::setCompiledBlocksEnabled(compiled != 0);
++                        Vu1Fixture fx;
++                        t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++                        writeVuInstructionPair(fx.code, 0u, 0x8000033Cu, first);
++                        for (uint32_t pair = 0; pair < 5u; ++pair)
++                            writeVuInstructionPair(fx.code, 8u + pair * 8u, kStaticBlockWords[pair * 2u], kStaticBlockWords[pair * 2u + 1u]);
++                        VU1Interpreter vu1;
++                        for (int reg = 1; reg < 5; ++reg)
++                            for (int lane = 0; lane < 4; ++lane)
++                                vu1.state().vf[reg][lane] = static_cast<float>(reg * 100 + lane * 7 + 1);
++                        vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, budget);
++                        stopped[compiled] = vu1.state(); // writes still in flight show their chain start here
++                        if (budget < 24u)
++                            vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 3u);
++                        results[compiled] = vu1.state();
++                    }
++                    VU1Interpreter::setCompiledBlocksEnabled(true);
++                    const auto same = [](const VU1State &a, const VU1State &b)
++                    {
++                        return std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0 && std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0 &&
++                               std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0 && a.pc == b.pc && a.cycles == b.cycles &&
++                               a.mac == b.mac && a.status == b.status && a.ebit == b.ebit;
++                    };
++                    if (!same(stopped[0], stopped[1]) || !same(results[0], results[1]))
++                        ++mismatches;
++                }
++                t.Equals(mismatches, 0, first == kVuUpperNop ? "compiled == interpreted (run entered settled)"
++                                                              : "compiled == interpreted (vf1 in flight at the run)");
++            }
++        });
++
+         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
+         {
+             Vu1Fixture fx;

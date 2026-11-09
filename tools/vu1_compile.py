@@ -6,13 +6,13 @@ that runs started at (directories are searched for both). Blocks start at the en
 branch target or return address reachable from them, and run to the next block start or to the delay slot
 of an unconditional jump or E-bit. A block is keyed by its pc and words, so images that share a program
 share its blocks. VU1Interpreter binds a block wherever the uploaded code matches its words; everything
-else stays interpreted. Writes N (default 8) files <outdir>/vu1_blocks_<n>.cpp.
+else stays interpreted. Writes N (default 24) files <outdir>/vu1_blocks_<n>.cpp.
 """
 import glob, os, sys
 
 CODE_SIZE = 0x4000
-MAX_PAIRS = 512
-FILES = 8
+MAX_PAIRS = 200  # CompiledAccess::block recurses over a block's pairs: stay under GCC's template depth
+FILES = 24  # block files cost ~1.5 GB each to compile at this size; keep -j low
 
 
 def words(img, pc):
@@ -109,17 +109,10 @@ def emit(out, blocks):
         table = []
         for i, (pc, code) in enumerate(chunk):
             name = "b%04x_%d" % (pc, i)
-            src.append("int %s(VU1Interpreter &vu, uint64_t end)" % name)
-            src.append("{")
             pairs = len(code) // 8
-            for k in range(pairs):
-                lower, upper = words(code, k * 8)
-                nxt = (pc + (k + 1) * 8) % CODE_SIZE
-                src.append("    if (const int r = A::step<0x%08Xu, 0x%08Xu>(vu, end, 0x%04Xu)) return r;" % (lower, upper, nxt))
-            src.append("    return A::kLeave;")
-            src.append("}")
             ws = ", ".join("0x%08Xu" % int.from_bytes(code[j:j + 4], "little") for j in range(0, len(code), 4))
-            src.append("const uint32_t %s_words[] = {%s};" % (name, ws))
+            src.append("constexpr uint32_t %s_words[] = {%s};" % (name, ws))
+            src.append("int %s(VU1Interpreter &vu, uint64_t end) { return A::block<%s_words, 0x%04Xu>(vu, end); }" % (name, name, pc))
             src.append("")
             table.append("    {0x%04Xu, %du, %s_words, %s}," % (pc, pairs, name, name))
         src.append("const VU1Interpreter::CompiledBlock kBlocks[] = {")
