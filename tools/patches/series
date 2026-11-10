@@ -28,3 +28,17 @@ ps2recomp-gif-vu1-worker.patch
 ps2recomp-vu1-static-timing.patch
 ps2recomp-gs-fast-pixels.patch
 ps2recomp-iop-step-bookkeeping.patch
+ps2recomp-vu1-worker-overheads.patch
+ps2recomp-vu1-fmac-fast-flags.patch
+ps2recomp-vu1-lean-programs.patch
+ps2recomp-iop-fast-memory.patch
+ps2recomp-spu2-autodma-pace.patch
+ps2recomp-vif1-ee-unpack.patch
+ps2recomp-gs-async-batching.patch
+ps2recomp-gs-frontend-batch.patch
+ps2recomp-dma-chain-reserve.patch
+ps2recomp-vif1-unpack-batch.patch
+ps2recomp-gs-packet-pool.patch
+ps2recomp-gs-upload-runs.patch
+ps2recomp-gs-async-draw-ranges.patch
+ps2recomp-sio2-dualshock.patch

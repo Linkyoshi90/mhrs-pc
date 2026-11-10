@@ -1,0 +1,145 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 9086b2e..cbeb5cf 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -618,8 +618,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             // Offset/difference mode adds ROW to the kept lanes too, and unknown formats copy raw bytes: those results
+             // depend on what VU1 memory holds, so they are computed where it is (the GIF/VU worker). Difference mode
+             // also feeds kept lanes into ROW, which the EE needs: only that waits for the worker.
+-            const bool readsMemory = !knownFormat || ((mode == 1u || mode == 2u) && sourceLanes != 0xFu);
+-            const bool rowFromMemory = knownFormat && mode == 2u && sourceLanes != 0xFu;
++            // Kept lanes (not supplied by the format) written as data (mask 0) take VU1 memory plus ROW in modes 1/2.
++            // Only cycle positions that read source data have such lanes; their mask cycle is min(position, 3).
++            const auto maskSpecAt = [&](uint32_t maskCycle, uint32_t field) -> uint32_t
++            { return maskEnable ? (vif1_regs.mask >> ((maskCycle * 4u + field) * 2u)) & 3u : 0u; };
++            bool keptDataLanes = false;
++            for (uint32_t c = 0; c < std::min<uint32_t>(std::min(cl, wl), 4u); ++c)
++                for (uint32_t field = 0; field < 4u; ++field)
++                    if (((sourceLanes >> field) & 1u) == 0u && maskSpecAt(c, field) == 0u)
++                        keptDataLanes = true;
++            const bool readsMemory = !knownFormat || ((mode == 1u || mode == 2u) && keptDataLanes);
++            const bool rowFromMemory = knownFormat && mode == 2u && keptDataLanes;
+ 
+             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+@@ -859,6 +868,120 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     postGifVu([unpack, mode, mask = vif1_regs.mask, rows, src = std::vector<uint8_t>(data + pos, data + pos + totalBytes)]() mutable
+                               { unpack(src.data(), true, mode, mask, rows.row, rows.col, nullptr); });
+                 }
++                else if (cl == wl && knownFormat)
++                {
++                    // Every cycle position reads a source vector and vectors land on consecutive qwords. Lanes per
++                    // mask cycle: data (mask 0) where the format supplies the lane, ROW (1), COL (2); 3 and kept lanes
++                    // stay (kept lanes in modes 1/2 went to readsMemory above).
++                    uint8_t laneMask[4];
++                    for (uint32_t c = 0; c < 4u; ++c)
++                    {
++                        laneMask[c] = 0u;
++                        for (uint32_t field = 0; field < 4u; ++field)
++                        {
++                            const uint32_t spec = maskSpecAt(c, field);
++                            if ((spec == 0u && ((sourceLanes >> field) & 1u) != 0u) || spec == 1u || spec == 2u)
++                                laneMask[c] |= static_cast<uint8_t>(1u << field);
++                        }
++                    }
++                    const uint32_t usedCycles = std::min<uint32_t>(wl, 4u);
++                    bool allLanes = true;
++                    for (uint32_t c = 0; c < usedCycles; ++c)
++                        allLanes = allLanes && laneMask[c] == 0xFu;
++
++                    std::vector<uint32_t> block(static_cast<size_t>(writeVectorCount) * 4u, 0u);
++                    std::vector<uint8_t> masks(allLanes ? 0u : writeVectorCount);
++                    const uint8_t *src = data + pos;
++                    const bool addRow = (vl != 3u || vn != 3u) && (mode == 1u || mode == 2u);
++                    const uint32_t count = static_cast<uint32_t>(components > 4 ? 4 : components);
++                    uint32_t cyclePos = 0;
++                    for (uint32_t i = 0; i < writeVectorCount; ++i, src += bytesPerVector)
++                    {
++                        uint32_t d[4] = {0u, 0u, 0u, 0u};
++                        if (vl == 0u)
++                        {
++                            for (uint32_t c = 0; c < count; ++c)
++                                std::memcpy(&d[c], src + c * 4u, 4u);
++                        }
++                        else if (vl == 1u)
++                        {
++                            for (uint32_t c = 0; c < count; ++c)
++                            {
++                                uint16_t raw;
++                                std::memcpy(&raw, src + c * 2u, 2u);
++                                d[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
++                            }
++                        }
++                        else if (vl == 2u)
++                        {
++                            for (uint32_t c = 0; c < count; ++c)
++                                d[c] = zeroExtend ? src[c] : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(src[c])));
++                        }
++                        else
++                        {
++                            uint16_t packed;
++                            std::memcpy(&packed, src, 2u);
++                            d[0] = packed & 0x1Fu;
++                            d[1] = (packed >> 5) & 0x1Fu;
++                            d[2] = (packed >> 10) & 0x1Fu;
++                            d[3] = (packed >> 15) & 0x01u;
++                        }
++                        if (components == 1)
++                            d[1] = d[2] = d[3] = d[0];
++
++                        const uint32_t maskCycle = cyclePos > 3u ? 3u : cyclePos;
++                        uint32_t *v = &block[static_cast<size_t>(i) * 4u];
++                        for (uint32_t field = 0; field < 4u; ++field)
++                        {
++                            const uint32_t spec = maskSpecAt(maskCycle, field);
++                            if (spec == 0u)
++                            {
++                                if (((sourceLanes >> field) & 1u) == 0u)
++                                    continue;
++                                uint32_t value = d[field];
++                                if (addRow)
++                                {
++                                    value += vif1_regs.row[field];
++                                    if (mode == 2u)
++                                        vif1_regs.row[field] = value;
++                                }
++                                v[field] = value;
++                            }
++                            else if (spec == 1u)
++                                v[field] = vif1_regs.row[field];
++                            else if (spec == 2u)
++                                v[field] = vif1_regs.col[maskCycle];
++                        }
++                        if (!allLanes)
++                            masks[i] = laneMask[maskCycle];
++                        if (++cyclePos == wl)
++                            cyclePos = 0;
++                    }
++                    postGifVu([this, start = vuAddr, block = std::move(block), masks = std::move(masks)]
++                              {
++                                  const uint32_t total = static_cast<uint32_t>(block.size() / 4u);
++                                  for (uint32_t i = 0; i < total;)
++                                  {
++                                      const uint32_t dest = (start + i) & 0x3FFu;
++                                      const uint32_t run = std::min<uint32_t>(total - i, 1024u - dest);
++                                      if (masks.empty())
++                                          std::memcpy(m_vu1Data + dest * 16u, &block[static_cast<size_t>(i) * 4u], run * 16u);
++                                      else
++                                          for (uint32_t j = 0; j < run; ++j)
++                                          {
++                                              const uint8_t lanes = masks[i + j];
++                                              if (lanes == 0xFu)
++                                              {
++                                                  std::memcpy(m_vu1Data + (dest + j) * 16u, &block[static_cast<size_t>(i + j) * 4u], 16u);
++                                                  continue;
++                                              }
++                                              for (uint32_t f = 0; f < 4u; ++f)
++                                                  if ((lanes >> f) & 1u)
++                                                      std::memcpy(m_vu1Data + (dest + j) * 16u + f * 4u, &block[static_cast<size_t>(i + j) * 4u + f], 4u);
++                                          }
++                                      i += run;
++                                  } });
++                }
+                 else
+                 {
+                     std::vector<LaneWrite> writes;

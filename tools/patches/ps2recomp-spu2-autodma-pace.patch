@@ -1,0 +1,66 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 5d2535d..af31042 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -12,6 +12,8 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kDmaStart = 1u << 24u;
+         constexpr int kDmaSpu0Irq = 0x24;
+         constexpr int kDmaSpu1Irq = 0x28;
++        // Auto-DMA plays one stereo 16-bit sample (one word) per 1/48000 s = 768 IOP cycles.
++        constexpr uint64_t kAutoDmaCyclesPerWord = 36864000u / 48000u;
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+@@ -272,9 +274,11 @@ namespace ps2x::iop::detail
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
++        // ADMAS (core base + 0x1B0) is set while a core streams auto-DMA to its sound output.
++        const bool autoDma = (hardwareValue(0x1F9001B0u + (secondCore ? 0x400u : 0u)) & 0xFFFFu) != 0u;
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+-            std::max<uint64_t>(transferWords * 2u, 64u),
++            autoDma ? transferWords * kAutoDmaCyclesPerWord : std::max<uint64_t>(transferWords * 2u, 64u),
+         };
+     }
+ 
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 3035618..7c6ece8 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -326,12 +326,34 @@ namespace
+                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
+                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
+     }
++    bool testSpuAutoDmaPacing()
++    {
++        IopMemory memory;
++        memory.write32(0x1F8010C4u, (4u << 16u) | 16u); // DMA4: 4 blocks of 16 words
++        memory.write32(0x1F8010C8u, 0x01000201u);
++        const auto plain = memory.takeDmaStart();
++        memory.write16(0x1F9001B0u, 1u); // core0 ADMAS: auto-DMA
++        memory.write32(0x1F8010C8u, 0x01000201u);
++        const auto paced = memory.takeDmaStart();
++        memory.write32(0x1F801504u, (4u << 16u) | 16u); // DMA7 (core1)
++        memory.write32(0x1F801508u, 0x01000201u);
++        const auto plainCore1 = memory.takeDmaStart();
++        memory.write16(0x1F9005B0u, 2u); // core1 ADMAS
++        memory.write32(0x1F801508u, 0x01000201u);
++        const auto pacedCore1 = memory.takeDmaStart();
++        const bool ok = plain && plain->delayCycles == 128u && paced && paced->delayCycles == 64u * 768u &&
++                        plainCore1 && plainCore1->delayCycles == 128u && pacedCore1 && pacedCore1->irq == 0x28 &&
++                        pacedCore1->delayCycles == 64u * 768u;
++        if (!ok)
++            std::cerr << "SPU2 auto-DMA should complete at 48 kHz (768 IOP cycles per word), other transfers at 2 per word\n";
++        return ok;
++    }
+ }
+ 
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+-        !testTimrmanPeriodicCallback())
++        !testTimrmanPeriodicCallback() || !testSpuAutoDmaPacing())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;

@@ -1,0 +1,138 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 3f902d7..6c378ab 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2547,57 +2547,97 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         m_transferState.y = dsay + row;
+     };
+ 
++    // Whole pixels of bytesPerPixel each: as many as the data holds and the transfer still takes.
++    const auto runPixels = [&](uint32_t bytesPerPixel, auto writeOne)
++    {
++        const uint32_t n = std::min<uint32_t>((sizeBytes - offset) / bytesPerPixel,
++                                              m_transferState.totalPixels - m_transferState.copiedPixels);
++        uint32_t x = m_transferState.x;
++        uint32_t y = m_transferState.y;
++        const uint8_t *src = data + offset;
++        for (uint32_t i = 0; i < n; ++i, src += bytesPerPixel)
++        {
++            writeOne(src, x, y);
++            if (++column >= rrw)
++            {
++                column = 0u;
++                ++row;
++            }
++            x = dsax + column;
++            y = dsay + row;
++        }
++        offset += n * bytesPerPixel;
++        m_transferState.copiedPixels += n;
++        if (m_transferState.copiedPixels >= m_transferState.totalPixels)
++        {
++            m_transferState.direction = 3u;
++            m_transferState.totalPixels = 0u;
++        }
++        else if (n != 0u)
++        {
++            m_transferState.x = x;
++            m_transferState.y = y;
++        }
++    };
++    using Psm = GSMem::PixelStorageMode;
++    const auto word32 = [](const uint8_t *src)
++    {
++        uint32_t value;
++        std::memcpy(&value, src, sizeof(value));
++        return value;
++    };
++    const auto word24 = [](const uint8_t *src)
++    {
++        return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8u) | (static_cast<uint32_t>(src[2]) << 16u);
++    };
++    const auto word16 = [](const uint8_t *src)
++    {
++        uint16_t value;
++        std::memcpy(&value, src, sizeof(value));
++        return static_cast<uint32_t>(value);
++    };
++
+     switch (dpsm)
+     {
+     case GS_PSM_CT32:
++        runPixels(4u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::C32>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, word32(src)); });
++        break;
+     case GS_PSM_Z32:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            if (sizeBytes - offset < 4u)
+-                return;
+-            uint32_t value = 0u;
+-            std::memcpy(&value, data + offset, sizeof(value));
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 4u;
+-            advancePixel(1u);
+-        }
++        runPixels(4u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::Z32>::Write(GSMem::PageTableZ32, m_vram, dbp, dbw, x, y, word32(src)); });
+         break;
+     case GS_PSM_CT24:
++        runPixels(3u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::C24>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, word24(src)); });
++        break;
+     case GS_PSM_Z24:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            if (sizeBytes - offset < 3u)
+-                return;
+-            const uint32_t value = static_cast<uint32_t>(data[offset]) |
+-                                   (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
+-                                   (static_cast<uint32_t>(data[offset + 2u]) << 16u);
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 3u;
+-            advancePixel(1u);
+-        }
++        runPixels(3u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::Z24>::Write(GSMem::PageTableZ32, m_vram, dbp, dbw, x, y, word24(src)); });
+         break;
+     case GS_PSM_CT16:
++        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::C16>::Write(GSMem::PageTableC16, m_vram, dbp, dbw, x, y, word16(src)); });
++        break;
+     case GS_PSM_CT16S:
++        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::C16S>::Write(GSMem::PageTableC16S, m_vram, dbp, dbw, x, y, word16(src)); });
++        break;
+     case GS_PSM_Z16:
++        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::Z16>::Write(GSMem::PageTableZ16, m_vram, dbp, dbw, x, y, word16(src)); });
++        break;
+     case GS_PSM_Z16S:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            if (sizeBytes - offset < 2u)
+-                return;
+-            uint16_t value = 0u;
+-            std::memcpy(&value, data + offset, sizeof(value));
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 2u;
+-            advancePixel(1u);
+-        }
++        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::Z16S>::Write(GSMem::PageTableZ16S, m_vram, dbp, dbw, x, y, word16(src)); });
+         break;
+     case GS_PSM_T8:
++        runPixels(1u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::P8>::Write(GSMem::PageTableP8, m_vram, dbp, dbw, x, y, *src); });
++        break;
+     case GS_PSM_T8H:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, m_transferState.x, m_transferState.y, data[offset++]);
+-            advancePixel(1u);
+-        }
++        runPixels(1u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::P8H>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, *src); });
+         break;
+     case GS_PSM_T4:
+     case GS_PSM_T4HL:

@@ -1,0 +1,196 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 7e38fbc..992e1c3 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -6,6 +6,7 @@
+ #include <cstdint>
+ #include <array>
+ #include <functional>
++#include <thread>
+ #include <vector>
+ #include <unordered_map>
+ #include <atomic>
+@@ -361,7 +362,11 @@ public:
+         m_gifVuWorker.stop(); // it posts to the GS stage
+         m_gsWorker.stop();
+     }
+-    void postGifVu(std::function<void()> job) { m_gifVuWorker.post(std::move(job)); }
++    void postGifVu(std::function<void()> job)
++    {
++        flushUnpackBlocks(); // UNPACK results the EE decoded before this job come first
++        m_gifVuWorker.post(std::move(job));
++    }
+     // The GS frontend (packets reaching the GS, native GS uploads) runs as a second ordered stage after the
+     // GIF/VU worker, so the worker does not wait for it. postGs from the GIF/VU worker keeps their order;
+     // postGsAfterGifVu orders an EE request after the GIF/VU work the EE issued before it.
+@@ -373,6 +378,7 @@ public:
+     bool gsStageInline() const { return m_gsWorker.mode() == OrderedWorker::Mode::Inline; }
+     void drainGifVu() const
+     {
++        flushUnpackBlocks();
+         m_gifVuWorker.drain(); // what it posted to the GS stage is queued there now
+         m_gsWorker.drain();
+     }
+@@ -446,6 +452,19 @@ public:
+     bool m_path3Masked = false;       // GIF/VU worker side
+     bool m_path3MaskedIssued = false; // EE side, see isPath3Masked()
+     bool m_vif1UnpackReference = false;
++    // CL == WL UNPACK results decoded on the EE, not yet posted to the GIF/VU worker (see flushUnpackBlocks).
++    struct UnpackBlock
++    {
++        uint32_t start;   // first VU1 qword (wraps at 1024)
++        uint32_t count;   // qwords
++        size_t data;      // index of its first word in m_unpackData (4 per qword)
++        size_t masks;     // index of its lane masks in m_unpackMasks, SIZE_MAX when every lane is written
++    };
++    mutable std::vector<UnpackBlock> m_unpackBlocks;
++    mutable std::vector<uint32_t> m_unpackData;
++    mutable std::vector<uint8_t> m_unpackMasks;
++    std::atomic<std::thread::id> m_unpackOwner{}; // the thread filling the batch (only it flushes)
++    void flushUnpackBlocks() const;
+     uint32_t m_vif1PendingPath2ImageQwc = 0u;
+     bool m_vif1PendingPath2DirectHl = false;
+     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index cbeb5cf..04fd6c2 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,3 +1,4 @@
++#include <thread>
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <array>
+@@ -296,10 +297,53 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+     processVIF1Data(m_rdram + srcPhys, sizeBytes);
+ }
+ 
++void PS2Memory::flushUnpackBlocks() const
++{
++    if (std::this_thread::get_id() != m_unpackOwner.load(std::memory_order_relaxed) || m_unpackBlocks.empty())
++        return;
++    std::vector<UnpackBlock> blocks;
++    std::vector<uint32_t> words;
++    std::vector<uint8_t> masks;
++    blocks.swap(m_unpackBlocks);
++    words.swap(m_unpackData);
++    masks.swap(m_unpackMasks);
++    m_unpackBlocks.reserve(blocks.size());
++    m_unpackData.reserve(words.size());
++    m_unpackMasks.reserve(masks.size());
++    m_gifVuWorker.post([this, blocks = std::move(blocks), words = std::move(words), masks = std::move(masks)]
++                       {
++                           uint8_t *const vu1 = m_vu1Data;
++                           for (const UnpackBlock &b : blocks)
++                           {
++                               const uint32_t *src = words.data() + b.data;
++                               for (uint32_t i = 0; i < b.count;)
++                               {
++                                   const uint32_t dest = (b.start + i) & 0x3FFu;
++                                   const uint32_t run = std::min<uint32_t>(b.count - i, 1024u - dest);
++                                   if (b.masks == SIZE_MAX)
++                                       std::memcpy(vu1 + dest * 16u, src + static_cast<size_t>(i) * 4u, run * 16u);
++                                   else
++                                       for (uint32_t j = 0; j < run; ++j)
++                                       {
++                                           const uint8_t lanes = masks[b.masks + i + j];
++                                           for (uint32_t f = 0; f < 4u; ++f)
++                                               if ((lanes >> f) & 1u)
++                                                   std::memcpy(vu1 + (dest + j) * 16u + f * 4u, src + static_cast<size_t>(i + j) * 4u + f, 4u);
++                                       }
++                                   i += run;
++                               }
++                           } });
++}
++
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u)
+         return;
++    struct FlushUnpacksOnReturn
++    {
++        PS2Memory &memory;
++        ~FlushUnpacksOnReturn() { memory.flushUnpackBlocks(); }
++    } flushUnpacksOnReturn{*this};
+ 
+     // Stalled by an I-bit VIFcode: hold the data until FBRST.STC (the DMA would wait on hardware).
+     if (m_vif1Stalled)
+@@ -874,12 +918,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     // mask cycle: data (mask 0) where the format supplies the lane, ROW (1), COL (2); 3 and kept lanes
+                     // stay (kept lanes in modes 1/2 went to readsMemory above).
+                     uint8_t laneMask[4];
++                    uint8_t specs[4][4];
+                     for (uint32_t c = 0; c < 4u; ++c)
+                     {
+                         laneMask[c] = 0u;
+                         for (uint32_t field = 0; field < 4u; ++field)
+                         {
+                             const uint32_t spec = maskSpecAt(c, field);
++                            specs[c][field] = static_cast<uint8_t>(spec);
+                             if ((spec == 0u && ((sourceLanes >> field) & 1u) != 0u) || spec == 1u || spec == 2u)
+                                 laneMask[c] |= static_cast<uint8_t>(1u << field);
+                         }
+@@ -889,8 +935,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     for (uint32_t c = 0; c < usedCycles; ++c)
+                         allLanes = allLanes && laneMask[c] == 0xFu;
+ 
+-                    std::vector<uint32_t> block(static_cast<size_t>(writeVectorCount) * 4u, 0u);
+-                    std::vector<uint8_t> masks(allLanes ? 0u : writeVectorCount);
++                    m_unpackOwner.store(std::this_thread::get_id(), std::memory_order_relaxed);
++                    const size_t dataAt = m_unpackData.size();
++                    const size_t masksAt = allLanes ? SIZE_MAX : m_unpackMasks.size();
++                    m_unpackData.resize(dataAt + static_cast<size_t>(writeVectorCount) * 4u, 0u);
++                    if (!allLanes)
++                        m_unpackMasks.resize(masksAt + writeVectorCount);
++                    m_unpackBlocks.push_back(UnpackBlock{vuAddr, writeVectorCount, dataAt, masksAt});
+                     const uint8_t *src = data + pos;
+                     const bool addRow = (vl != 3u || vn != 3u) && (mode == 1u || mode == 2u);
+                     const uint32_t count = static_cast<uint32_t>(components > 4 ? 4 : components);
+@@ -930,10 +981,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                             d[1] = d[2] = d[3] = d[0];
+ 
+                         const uint32_t maskCycle = cyclePos > 3u ? 3u : cyclePos;
+-                        uint32_t *v = &block[static_cast<size_t>(i) * 4u];
++                        uint32_t *v = m_unpackData.data() + dataAt + static_cast<size_t>(i) * 4u;
+                         for (uint32_t field = 0; field < 4u; ++field)
+                         {
+-                            const uint32_t spec = maskSpecAt(maskCycle, field);
++                            const uint32_t spec = specs[maskCycle][field];
+                             if (spec == 0u)
+                             {
+                                 if (((sourceLanes >> field) & 1u) == 0u)
+@@ -953,34 +1004,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                                 v[field] = vif1_regs.col[maskCycle];
+                         }
+                         if (!allLanes)
+-                            masks[i] = laneMask[maskCycle];
++                            m_unpackMasks[masksAt + i] = laneMask[maskCycle];
+                         if (++cyclePos == wl)
+                             cyclePos = 0;
+                     }
+-                    postGifVu([this, start = vuAddr, block = std::move(block), masks = std::move(masks)]
+-                              {
+-                                  const uint32_t total = static_cast<uint32_t>(block.size() / 4u);
+-                                  for (uint32_t i = 0; i < total;)
+-                                  {
+-                                      const uint32_t dest = (start + i) & 0x3FFu;
+-                                      const uint32_t run = std::min<uint32_t>(total - i, 1024u - dest);
+-                                      if (masks.empty())
+-                                          std::memcpy(m_vu1Data + dest * 16u, &block[static_cast<size_t>(i) * 4u], run * 16u);
+-                                      else
+-                                          for (uint32_t j = 0; j < run; ++j)
+-                                          {
+-                                              const uint8_t lanes = masks[i + j];
+-                                              if (lanes == 0xFu)
+-                                              {
+-                                                  std::memcpy(m_vu1Data + (dest + j) * 16u, &block[static_cast<size_t>(i + j) * 4u], 16u);
+-                                                  continue;
+-                                              }
+-                                              for (uint32_t f = 0; f < 4u; ++f)
+-                                                  if ((lanes >> f) & 1u)
+-                                                      std::memcpy(m_vu1Data + (dest + j) * 16u + f * 4u, &block[static_cast<size_t>(i + j) * 4u + f], 4u);
+-                                          }
+-                                      i += run;
+-                                  } });
+                 }
+                 else
+                 {

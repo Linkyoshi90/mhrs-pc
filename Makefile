@@ -53,7 +53,8 @@ RECOMP_BIN := $(PS2RECOMP)/out/linux
 
 .PHONY: recomp runner vu1
 
-# VU1 microcode the game uploads, compiled to C++ blocks the runtime runs instead of interpreting.
+# VU1 microcode the game uploads, compiled to C++ the runtime runs instead of interpreting: blocks (any pc)
+# and lean programs (whole programs from their entries, see PS2Recomp's ps2xRuntime/tools/vu1_lean_gen.cpp).
 # Record more with `PS2_VU1_DUMP_DIR=$(VU1_DUMPS) make boot` (code images + entry pcs); unrecorded code
 # stays interpreted. Both are game code, so they live in build/.
 VU1_DUMPS := build/vu1/dumps
@@ -61,6 +62,9 @@ VU1_OUT   := build/vu1/src
 vu1:
 	@mkdir -p $(VU1_DUMPS)
 	python3 tools/vu1_compile.py $(VU1_OUT) $(VU1_DUMPS)
+	test -f $(RECOMP_BIN)/build.ninja -o -f $(RECOMP_BIN)/Makefile || cmake -S $(PS2RECOMP) -B $(RECOMP_BIN)
+	cmake --build $(RECOMP_BIN) --target ps2x_vu1_lean_gen
+	$(RECOMP_BIN)/ps2xRuntime/ps2x_vu1_lean_gen $(VU1_OUT) $(VU1_DUMPS)
 
 # Function boundaries from splat, SDK names from the recomp config.
 build/functions.csv: asm/main/000000.s $(RECOMP_CFG) tools/funcs_csv.py
@@ -87,7 +91,7 @@ runner: recomp vu1
 
 # The runtime maps cdrom0: to the ELF's folder, so boot a copy placed at the disc root.
 # The game also reads raw sectors (it parses ISO9660 itself), so it needs the disc image too.
-ISO ?= iso/mohrs.iso
+ISO ?= ISO/Medal of Honor - Rising Sun.iso
 boot:
 	@test -f "$(ISO)" || { echo "Missing disc image $(ISO): put your ISO there or pass ISO=path"; exit 1; }
 	cp -u $(ORIG) extracted/
