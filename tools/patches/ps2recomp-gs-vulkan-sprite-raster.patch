@@ -1,0 +1,1333 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 99347c4..832bef1 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -550,16 +550,23 @@ find_program(PS2X_GLSLANG_VALIDATOR
+     HINTS "$ENV{GLSLANG_VALIDATOR_BIN}" "$ENV{HOME}/bin"
+ )
+ if(Vulkan_FOUND AND PS2X_GLSLANG_VALIDATOR AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+-    set(PS2X_VK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/shaders/present_deswizzle.comp")
+-    set(PS2X_VK_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/shaders/present_deswizzle.h")
+-    add_custom_command(
+-        OUTPUT "${PS2X_VK_SHADER_HEADER}"
+-        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+-        COMMAND "${PS2X_GLSLANG_VALIDATOR}" -V --vn kPresentDeswizzleSpv "${PS2X_VK_SHADER_SOURCE}" -o "${PS2X_VK_SHADER_HEADER}"
+-        DEPENDS "${PS2X_VK_SHADER_SOURCE}"
+-        VERBATIM
+-    )
+-    add_custom_target(ps2x_gs_vulkan_shaders DEPENDS "${PS2X_VK_SHADER_HEADER}")
++    set(PS2X_VK_SHADER_HEADERS "")
++    foreach(PS2X_VK_SHADER IN ITEMS "present_deswizzle:kPresentDeswizzleSpv" "raster_sprite:kRasterSpriteSpv")
++        string(REGEX MATCH "^([^:]+):(.+)$" _ "${PS2X_VK_SHADER}")
++        set(PS2X_VK_SHADER_NAME "${CMAKE_MATCH_1}")
++        set(PS2X_VK_SHADER_VAR "${CMAKE_MATCH_2}")
++        set(PS2X_VK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/shaders/${PS2X_VK_SHADER_NAME}.comp")
++        set(PS2X_VK_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/shaders/${PS2X_VK_SHADER_NAME}.h")
++        add_custom_command(
++            OUTPUT "${PS2X_VK_SHADER_HEADER}"
++            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
++            COMMAND "${PS2X_GLSLANG_VALIDATOR}" -V --vn "${PS2X_VK_SHADER_VAR}" "${PS2X_VK_SHADER_SOURCE}" -o "${PS2X_VK_SHADER_HEADER}"
++            DEPENDS "${PS2X_VK_SHADER_SOURCE}"
++            VERBATIM
++        )
++        list(APPEND PS2X_VK_SHADER_HEADERS "${PS2X_VK_SHADER_HEADER}")
++    endforeach()
++    add_custom_target(ps2x_gs_vulkan_shaders DEPENDS ${PS2X_VK_SHADER_HEADERS})
+     add_dependencies(ps2_runtime ps2x_gs_vulkan_shaders)
+     target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_VULKAN=1)
+     target_include_directories(ps2_runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2fe044d..b66b751 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -35,6 +35,9 @@ public:
+     void SnapshotVram(std::vector<uint8_t> &out) const override;
+     GSTransferSnapshot GetTransferSnapshot() const override;
+ 
++    // Current CLUT contents (the GPU backend mirrors them into a storage buffer).
++    const std::array<uint16_t, 512> &clutEntries() const { return m_clut; }
++
+ private:
+     void ResetUnlocked();
+     bool ApplyClutLoad(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+diff --git a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+index 06fa806..b9720ee 100755
+--- a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+@@ -5,6 +5,7 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <mutex>
+ 
+ // Vulkan GS backend (work in progress).
+ //
+@@ -49,12 +50,20 @@ private:
+     struct VkState;
+     std::unique_ptr<VkState> m_vk;
+     GSCpuBackend m_cpu;
++    // Serializes all GPU use: raster dispatches run on the GS worker thread while Present
++    // runs on the calling thread; both share one command buffer, fence and VRAM buffer.
++    std::mutex m_gpuMutex;
+     bool m_gpuOk = false;
+     bool m_gpuPresent = false;
++    bool m_gpuRaster = false;
++    bool m_rasterVerify = false;
+ 
+     bool initVulkan();
+     void shutdownVulkan();
+     PresentationFrame presentGpu(const GSPresentationRequest &request);
++    // Compute-shader sprite rasterization (PS2X_VK_RASTER=1); PS2X_VK_RASTER_VERIFY=1
++    // replays each sprite through the CPU backend on the same VRAM and diffs 4MB.
++    void submitSpriteGpu(const GSPrimitiveBatch &batch);
+     // Mirrors GSCpuBackend::CopyFrameToHostRgba(useLocalMemoryLayout=true) on the GPU.
+     bool gpuCopyFrame(const GSFrameReg &frame,
+                       uint32_t width,
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index 6a0cfed..caf978a 100755
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/gs/ps2_gs_common.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -12,6 +13,7 @@
+ #if defined(PS2X_HAS_VULKAN)
+ #include <vulkan/vulkan.h>
+ #include "present_deswizzle.h" // generated by glslangValidator --vn kPresentDeswizzleSpv
++#include "raster_sprite.h"     // generated by glslangValidator --vn kRasterSpriteSpv
+ #endif
+ 
+ namespace
+@@ -188,6 +190,16 @@ struct GSVulkanBackend::VkState
+     VkDeviceMemory outMemory = VK_NULL_HANDLE;
+     void *outMapped = nullptr;
+ 
++    VkBuffer clutBuffer = VK_NULL_HANDLE;
++    VkDeviceMemory clutMemory = VK_NULL_HANDLE;
++    void *clutMapped = nullptr;
++
++    VkBuffer paramsBuffer = VK_NULL_HANDLE;
++    VkDeviceMemory paramsMemory = VK_NULL_HANDLE;
++    void *paramsMapped = nullptr;
++
++    VkPipeline rasterPipeline = VK_NULL_HANDLE;
++
+     VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
+     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+@@ -339,21 +351,35 @@ bool GSVulkanBackend::initVulkan()
+         std::cerr << "[gs-vulkan] output buffer allocation failed, CPU fallback" << std::endl;
+         return false;
+     }
++    // CLUT widened to uint (512 entries) and per-primitive raster params.
++    if (!createMappedBuffer(vk.device, vk.phys, 512u * 4u,
++                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                            vk.clutBuffer, vk.clutMemory, vk.clutMapped) ||
++        !createMappedBuffer(vk.device, vk.phys, 1024u,
++                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                            vk.paramsBuffer, vk.paramsMemory, vk.paramsMapped))
++    {
++        std::cerr << "[gs-vulkan] clut/params buffer allocation failed, CPU fallback" << std::endl;
++        return false;
++    }
+ 
+-    VkDescriptorSetLayoutBinding bindings[2]{};
+-    bindings[0].binding = 0;
+-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+-    bindings[0].descriptorCount = 1;
+-    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+-    bindings[1] = bindings[0];
+-    bindings[1].binding = 1;
++    // Bindings: 0 = VRAM, 1 = present output, 2 = CLUT, 3 = raster params.
++    // Shaders use subsets of these; the layout and set are shared.
++    VkDescriptorSetLayoutBinding bindings[4]{};
++    for (uint32_t i = 0; i < 4; ++i)
++    {
++        bindings[i].binding = i;
++        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        bindings[i].descriptorCount = 1;
++        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++    }
+     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+-    layoutInfo.bindingCount = 2;
++    layoutInfo.bindingCount = 4;
+     layoutInfo.pBindings = bindings;
+     if (vkCreateDescriptorSetLayout(vk.device, &layoutInfo, nullptr, &vk.descriptorLayout) != VK_SUCCESS)
+         return false;
+ 
+-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
++    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+     poolInfo.maxSets = 1;
+     poolInfo.poolSizeCount = 1;
+@@ -370,17 +396,22 @@ bool GSVulkanBackend::initVulkan()
+ 
+     VkDescriptorBufferInfo vramDesc{vk.vramBuffer, 0, VK_WHOLE_SIZE};
+     VkDescriptorBufferInfo outDesc{vk.outBuffer, 0, VK_WHOLE_SIZE};
+-    VkWriteDescriptorSet writes[2]{};
+-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-    writes[0].dstSet = vk.descriptorSet;
+-    writes[0].dstBinding = 0;
+-    writes[0].descriptorCount = 1;
+-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    VkDescriptorBufferInfo clutDesc{vk.clutBuffer, 0, VK_WHOLE_SIZE};
++    VkDescriptorBufferInfo paramsDesc{vk.paramsBuffer, 0, VK_WHOLE_SIZE};
++    VkWriteDescriptorSet writes[4]{};
++    for (uint32_t i = 0; i < 4; ++i)
++    {
++        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++        writes[i].dstSet = vk.descriptorSet;
++        writes[i].dstBinding = i;
++        writes[i].descriptorCount = 1;
++        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    }
+     writes[0].pBufferInfo = &vramDesc;
+-    writes[1] = writes[0];
+-    writes[1].dstBinding = 1;
+     writes[1].pBufferInfo = &outDesc;
+-    vkUpdateDescriptorSets(vk.device, 2, writes, 0, nullptr);
++    writes[2].pBufferInfo = &clutDesc;
++    writes[3].pBufferInfo = &paramsDesc;
++    vkUpdateDescriptorSets(vk.device, 4, writes, 0, nullptr);
+ 
+     VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PresentPushConstants)};
+     VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+@@ -412,6 +443,27 @@ bool GSVulkanBackend::initVulkan()
+     if (pipelineResult != VK_SUCCESS)
+         return false;
+ 
++    // Sprite rasterizer pipeline (same layout; uses bindings 0, 2, 3).
++    VkShaderModuleCreateInfo rasterShaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++    rasterShaderInfo.codeSize = sizeof(kRasterSpriteSpv);
++    rasterShaderInfo.pCode = kRasterSpriteSpv;
++    VkShaderModule rasterShaderModule = VK_NULL_HANDLE;
++    if (vkCreateShaderModule(vk.device, &rasterShaderInfo, nullptr, &rasterShaderModule) != VK_SUCCESS)
++    {
++        std::cerr << "[gs-vulkan] raster shader module creation failed, CPU fallback" << std::endl;
++        return false;
++    }
++    VkComputePipelineCreateInfo rasterPipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++    rasterPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    rasterPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++    rasterPipelineInfo.stage.module = rasterShaderModule;
++    rasterPipelineInfo.stage.pName = "main";
++    rasterPipelineInfo.layout = vk.pipelineLayout;
++    const VkResult rasterResult = vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &rasterPipelineInfo, nullptr, &vk.rasterPipeline);
++    vkDestroyShaderModule(vk.device, rasterShaderModule, nullptr);
++    if (rasterResult != VK_SUCCESS)
++        return false;
++
+     VkCommandPoolCreateInfo commandPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+     commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+     commandPoolInfo.queueFamilyIndex = vk.queueFamily;
+@@ -449,6 +501,8 @@ void GSVulkanBackend::shutdownVulkan()
+             vkDestroyCommandPool(vk.device, vk.commandPool, nullptr);
+         if (vk.pipeline)
+             vkDestroyPipeline(vk.device, vk.pipeline, nullptr);
++        if (vk.rasterPipeline)
++            vkDestroyPipeline(vk.device, vk.rasterPipeline, nullptr);
+         if (vk.pipelineLayout)
+             vkDestroyPipelineLayout(vk.device, vk.pipelineLayout, nullptr);
+         if (vk.descriptorPool)
+@@ -459,6 +513,14 @@ void GSVulkanBackend::shutdownVulkan()
+             vkDestroyBuffer(vk.device, vk.outBuffer, nullptr);
+         if (vk.outMemory)
+             vkFreeMemory(vk.device, vk.outMemory, nullptr);
++        if (vk.clutBuffer)
++            vkDestroyBuffer(vk.device, vk.clutBuffer, nullptr);
++        if (vk.clutMemory)
++            vkFreeMemory(vk.device, vk.clutMemory, nullptr);
++        if (vk.paramsBuffer)
++            vkDestroyBuffer(vk.device, vk.paramsBuffer, nullptr);
++        if (vk.paramsMemory)
++            vkFreeMemory(vk.device, vk.paramsMemory, nullptr);
+         if (vk.vramBuffer)
+             vkDestroyBuffer(vk.device, vk.vramBuffer, nullptr);
+         if (vk.vramMemory)
+@@ -654,6 +716,256 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+     return result;
+ }
+ 
++namespace
++{
++    // Matches the std430 Params block in raster_sprite.comp exactly (all 4-byte fields).
++    struct SpriteParams
++    {
++        int32_t drawX0, drawY0, drawX1, drawY1;
++        int32_t unclippedX0, unclippedY0;
++        float spriteW, spriteH;
++        float u0f, v0f, u1f, v1f;
++        uint32_t vertR, vertG, vertB, vertA;
++        uint32_t vertFog, z1;
++        int32_t sx0, sx1, sy0, sy1;
++        uint32_t fge, fogR, fogG, fogB;
++        uint32_t fbp, fbw, fpsm, zbp, zpsm;
++        uint32_t testLo, testHi;
++        uint32_t abe, pabe;
++        uint32_t asel, bsel, csel, dsel, fixv;
++        uint32_t fbaOn, fbmsk, zmask, frame16;
++        uint32_t tme, fst, linear;
++        int32_t texW, texH;
++        uint32_t wrapU, wrapV, minU, maxU, minV, maxV;
++        uint32_t texPsm, tbp0, tbw;
++        uint32_t tcc, tfx;
++        uint32_t ta0, ta1, aem;
++        uint32_t cpsm, csm, csa;
++    };
++    static_assert(sizeof(SpriteParams) <= 1024u);
++
++    float spriteFabsQ(float q)
++    {
++        return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
++    }
++}
++
++void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
++{
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    VkState &vk = *m_vk;
++    const GSDrawState &state = batch.state;
++    const GSVertex &v0 = batch.vertices[0];
++    const GSVertex &v1 = batch.vertices[1];
++    const GSContext &ctx = state.context;
++
++    // DrawSprite's rectangle setup with identical rounding.
++    const int ofx = ctx.xyoffset.ofx >> 4;
++    const int ofy = ctx.xyoffset.ofy >> 4;
++    int x0 = static_cast<int>(v0.x) - ofx;
++    int y0 = static_cast<int>(v0.y) - ofy;
++    int x1 = static_cast<int>(v1.x) - ofx;
++    int y1 = static_cast<int>(v1.y) - ofy;
++    if (x0 > x1)
++        std::swap(x0, x1);
++    if (y0 > y1)
++        std::swap(y0, y1);
++    const int unclippedX0 = x0;
++    const int unclippedY0 = y0;
++    const int spanX = std::max(1, x1 - x0);
++    const int spanY = std::max(1, y1 - y0);
++    const int unclippedX1 = unclippedX0 + spanX - 1;
++    const int unclippedY1 = unclippedY0 + spanY - 1;
++    if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
++        unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
++        return; // fully clipped: draws nothing, same as DrawSprite
++
++    SpriteParams p{};
++    p.drawX0 = GSInternal::clampInt(unclippedX0, ctx.scissor.x0, ctx.scissor.x1);
++    p.drawY0 = GSInternal::clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
++    p.drawX1 = GSInternal::clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
++    p.drawY1 = GSInternal::clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
++    p.unclippedX0 = unclippedX0;
++    p.unclippedY0 = unclippedY0;
++    p.spriteW = std::max(1.0f, static_cast<float>(spanX));
++    p.spriteH = std::max(1.0f, static_cast<float>(spanY));
++
++    const int texW = state.textureWidth;
++    const int texH = state.textureHeight;
++    if (state.prim.fst)
++    {
++        p.u0f = static_cast<float>(v0.u >> 4);
++        p.v0f = static_cast<float>(v0.v >> 4);
++        p.u1f = static_cast<float>(v1.u >> 4);
++        p.v1f = static_cast<float>(v1.v >> 4);
++    }
++    else
++    {
++        const float q0 = spriteFabsQ(v0.q);
++        const float q1 = spriteFabsQ(v1.q);
++        p.u0f = (v0.s / q0) * static_cast<float>(texW);
++        p.v0f = (v0.t / q0) * static_cast<float>(texH);
++        p.u1f = (v1.s / q1) * static_cast<float>(texW);
++        p.v1f = (v1.t / q1) * static_cast<float>(texH);
++    }
++
++    p.vertR = v1.r;
++    p.vertG = v1.g;
++    p.vertB = v1.b;
++    p.vertA = v1.a;
++    p.vertFog = v1.fog;
++    p.z1 = static_cast<uint32_t>(v1.z);
++
++    // MakePixelPipe equivalents.
++    p.sx0 = ctx.scissor.x0;
++    p.sx1 = ctx.scissor.x1;
++    p.sy0 = ctx.scissor.y0;
++    p.sy1 = ctx.scissor.y1;
++    p.fge = state.prim.fge ? 1u : 0u;
++    p.fogR = state.fogR;
++    p.fogG = state.fogG;
++    p.fogB = state.fogB;
++    p.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
++    p.fbw = std::max(ctx.frame.fbw, 1u);
++    p.fpsm = ctx.frame.psm;
++    p.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
++    p.zpsm = ctx.zbuf.psm;
++    p.testLo = static_cast<uint32_t>(ctx.test);
++    p.testHi = static_cast<uint32_t>(ctx.test >> 32);
++    p.abe = state.prim.abe ? 1u : 0u;
++    p.pabe = state.pabe ? 1u : 0u;
++    p.asel = ctx.alpha & 3u;
++    p.bsel = (ctx.alpha >> 2u) & 3u;
++    p.csel = (ctx.alpha >> 4u) & 3u;
++    p.dsel = (ctx.alpha >> 6u) & 3u;
++    p.fixv = static_cast<uint32_t>((ctx.alpha >> 32u) & 0xFFu);
++    p.fbaOn = ((ctx.fba & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24) ? 1u : 0u;
++    p.fbmsk = ctx.frame.fbmsk;
++    p.zmask = ctx.zbuf.zmask ? 1u : 0u;
++    p.frame16 = GSInternal::bitsPerPixel(ctx.frame.psm) == 16u ? 1u : 0u;
++
++    // MakeTexSampler + combine state.
++    p.tme = state.prim.tme ? 1u : 0u;
++    p.fst = state.prim.fst ? 1u : 0u;
++    p.linear = state.linearFilter ? 1u : 0u;
++    p.texW = texW;
++    p.texH = texH;
++    p.wrapU = static_cast<uint32_t>(ctx.clamp & 0x3u);
++    p.wrapV = static_cast<uint32_t>((ctx.clamp >> 2u) & 0x3u);
++    p.minU = static_cast<uint32_t>((ctx.clamp >> 4u) & 0x3FFu);
++    p.maxU = static_cast<uint32_t>((ctx.clamp >> 14u) & 0x3FFu);
++    p.minV = static_cast<uint32_t>((ctx.clamp >> 24u) & 0x3FFu);
++    p.maxV = static_cast<uint32_t>((ctx.clamp >> 34u) & 0x3FFu);
++    p.texPsm = ctx.tex0.psm;
++    p.tbp0 = ctx.tex0.tbp0;
++    p.tbw = ctx.tex0.tbw;
++    p.tcc = ctx.tex0.tcc;
++    p.tfx = ctx.tex0.tfx;
++    p.ta0 = state.texa.ta0;
++    p.ta1 = state.texa.ta1;
++    p.aem = state.texa.aem ? 1u : 0u;
++    p.cpsm = ctx.tex0.cpsm;
++    p.csm = ctx.tex0.csm;
++    p.csa = ctx.tex0.csa;
++
++    // Mirror the current CLUT (widened u16 -> u32) for the indexed fetch path.
++    uint32_t *clutDst = static_cast<uint32_t *>(vk.clutMapped);
++    const auto &clut = m_cpu.clutEntries();
++    for (size_t i = 0; i < clut.size(); ++i)
++        clutDst[i] = clut[i];
++
++    std::vector<uint8_t> before;
++    if (m_rasterVerify)
++    {
++        before.resize(static_cast<size_t>(vk.vramBufferSize));
++        std::memcpy(before.data(), vk.vramMapped, before.size());
++    }
++
++    std::memcpy(vk.paramsMapped, &p, sizeof(p));
++
++    vkResetFences(vk.device, 1, &vk.fence);
++    vkResetCommandBuffer(vk.commandBuffer, 0);
++    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (vkBeginCommandBuffer(vk.commandBuffer, &beginInfo) != VK_SUCCESS)
++    {
++        m_cpu.Submit(batch);
++        return;
++    }
++    vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.rasterPipeline);
++    vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 0, nullptr);
++    vkCmdDispatch(vk.commandBuffer,
++                  static_cast<uint32_t>((p.drawX1 - p.drawX0) / 8 + 1),
++                  static_cast<uint32_t>((p.drawY1 - p.drawY0) / 8 + 1),
++                  1);
++    vkEndCommandBuffer(vk.commandBuffer);
++
++    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &vk.commandBuffer;
++    if (vkQueueSubmit(vk.queue, 1, &submitInfo, vk.fence) != VK_SUCCESS ||
++        vkWaitForFences(vk.device, 1, &vk.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
++    {
++        std::cerr << "[gs-vulkan] sprite dispatch failed, CPU fallback for this primitive" << std::endl;
++        m_cpu.Submit(batch);
++        return;
++    }
++
++    if (m_rasterVerify)
++    {
++        std::vector<uint8_t> gpuResult(static_cast<size_t>(vk.vramBufferSize));
++        std::memcpy(gpuResult.data(), vk.vramMapped, gpuResult.size());
++        std::memcpy(vk.vramMapped, before.data(), before.size());
++        m_cpu.Submit(batch);
++        const uint8_t *cpuResult = static_cast<const uint8_t *>(vk.vramMapped);
++        uint64_t diffBytes = 0, firstDiff = UINT64_MAX;
++        for (size_t i = 0; i < gpuResult.size(); ++i)
++            if (gpuResult[i] != cpuResult[i])
++            {
++                ++diffBytes;
++                if (firstDiff == UINT64_MAX)
++                    firstDiff = i;
++            }
++        static uint64_t checks = 0, mismatches = 0;
++        ++checks;
++        if (diffBytes != 0)
++        {
++            ++mismatches;
++            std::cerr << "[gs-vulkan-raster-verify] MISMATCH #" << mismatches << "/" << checks
++                      << " diffBytes=" << diffBytes << " first=0x" << std::hex << firstDiff << std::dec
++                      << " fbp=0x" << std::hex << p.fbp << " fpsm=" << p.fpsm << " tme=" << p.tme
++                      << " texPsm=" << p.texPsm << " fst=" << p.fst << " linear=" << p.linear
++                      << " rect=(" << std::dec << p.drawX0 << "," << p.drawY0 << ")-(" << p.drawX1 << "," << p.drawY1 << ")"
++                      << std::endl;
++            if (mismatches <= 3)
++            {
++                // byte-level detail plus the full sampler state for offline reproduction
++                uint32_t shown = 0;
++                for (size_t i = 0; i < gpuResult.size() && shown < 8; ++i)
++                    if (gpuResult[i] != cpuResult[i])
++                    {
++                        std::cerr << "   [diff] off=0x" << std::hex << i << " gpu=0x" << unsigned(gpuResult[i])
++                                  << " cpu=0x" << unsigned(cpuResult[i]) << std::dec << std::endl;
++                        ++shown;
++                    }
++                std::cerr << "   [case] u=(" << p.u0f << "," << p.v0f << ")->(" << p.u1f << "," << p.v1f << ")"
++                          << " unclipped=(" << p.unclippedX0 << "," << p.unclippedY0 << ") span=(" << p.spriteW << "," << p.spriteH << ")"
++                          << " tex=(" << p.texW << "x" << p.texH << " tbp0=0x" << std::hex << p.tbp0 << " tbw=" << std::dec << p.tbw
++                          << " cpsm=" << p.cpsm << " csm=" << p.csm << " csa=" << p.csa << ")"
++                          << " wrap=(" << p.wrapU << "," << p.wrapV << ") min=(" << p.minU << "," << p.minV << ") max=(" << p.maxU << "," << p.maxV << ")"
++                          << " testLo=0x" << std::hex << p.testLo << " alpha=0x" << (p.asel | (p.bsel << 2) | (p.csel << 4) | (p.dsel << 6))
++                          << " abe=" << std::dec << p.abe << " fge=" << p.fge << " vertA=" << p.vertA << " ta0=" << p.ta0 << " ta1=" << p.ta1 << " aem=" << p.aem
++                          << std::endl;
++            }
++        }
++        else if (checks % 500 == 0)
++        {
++            std::cerr << "[gs-vulkan-raster-verify] " << checks << " sprites, all identical so far" << std::endl;
++        }
++        // VRAM now holds the CPU result (authoritative during verify).
++    }
++}
++
+ #else // !PS2X_HAS_VULKAN — no Vulkan in this build: everything stays on the CPU backend.
+ 
+ struct GSVulkanBackend::VkState
+@@ -675,6 +987,11 @@ bool GSVulkanBackend::gpuCopyFrame(const GSFrameReg &, uint32_t, uint32_t, std::
+     return false;
+ }
+ 
++void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
++{
++    m_cpu.Submit(batch);
++}
++
+ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &)
+ {
+     return {};
+@@ -685,6 +1002,8 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &)
+ GSVulkanBackend::GSVulkanBackend()
+ {
+     m_gpuPresent = std::getenv("PS2X_VK_PRESENT") != nullptr;
++    m_gpuRaster = std::getenv("PS2X_VK_RASTER") != nullptr;
++    m_rasterVerify = std::getenv("PS2X_VK_RASTER_VERIFY") != nullptr;
+     m_gpuOk = initVulkan();
+     if (!m_gpuOk)
+         shutdownVulkan();
+@@ -720,6 +1039,11 @@ void GSVulkanBackend::Reset()
+ 
+ void GSVulkanBackend::Submit(const GSPrimitiveBatch &batch)
+ {
++    if (m_gpuOk && m_gpuRaster && batch.vertexCount == 2 && batch.state.prim.type == GS_PRIM_SPRITE)
++    {
++        submitSpriteGpu(batch);
++        return;
++    }
+     m_cpu.Submit(batch);
+ }
+ 
+@@ -730,7 +1054,26 @@ void GSVulkanBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclu
+ 
+ void GSVulkanBackend::SubmitMany(const GSDrawStep *steps, size_t count)
+ {
+-    m_cpu.SubmitMany(steps, count);
++    // The async backend coalesces consecutive draws into SubmitMany, so this is where
++    // sprites actually arrive. Run the steps in order, GPU-rasterizing sprites.
++    if (!(m_gpuOk && m_gpuRaster))
++    {
++        m_cpu.SubmitMany(steps, count);
++        return;
++    }
++    for (size_t i = 0; i < count; ++i)
++    {
++        if (!steps[i].draw)
++        {
++            m_cpu.LoadClut(steps[i].tex0, steps[i].texclut);
++            continue;
++        }
++        const GSPrimitiveBatch &batch = *steps[i].draw;
++        if (batch.vertexCount == 2 && batch.state.prim.type == GS_PRIM_SPRITE)
++            submitSpriteGpu(batch);
++        else
++            m_cpu.Submit(batch);
++    }
+ }
+ 
+ void GSVulkanBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -760,6 +1103,7 @@ void GSVulkanBackend::Sync(GSSyncReason reason)
+ 
+ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
+ {
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+     if (m_gpuOk && m_gpuPresent)
+     {
+ #if defined(PS2X_HAS_VULKAN)
+diff --git a/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp b/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp
+new file mode 100755
+index 0000000..e4f96c2
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp
+@@ -0,0 +1,750 @@
++#version 450
++
++// Sprite rasterizer for the Vulkan GS backend: one dispatch per GS sprite primitive, one
++// invocation per candidate output pixel. Ports GSCpuBackend::DrawSprite + WritePixelFast +
++// SampleTextureFast + the GSMem swizzled pixel access, operating directly on GS VRAM in a
++// storage buffer. Invocations within a dispatch never touch the same pixel, and dispatches
++// are serialized, so plain loads/stores are sufficient.
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(set = 0, binding = 0, std430) buffer Vram
++{
++    uint vram[];
++};
++
++// CPU backend's 512-entry u16 CLUT, widened to uint per entry.
++layout(set = 0, binding = 2, std430) readonly buffer Clut
++{
++    uint clut[];
++};
++
++layout(set = 0, binding = 3, std430) readonly buffer Params
++{
++    // sprite geometry (CPU-precomputed, matches DrawSprite)
++    int drawX0;
++    int drawY0;
++    int drawX1;
++    int drawY1;
++    int unclippedX0;
++    int unclippedY0;
++    float spriteW;
++    float spriteH;
++    float u0f;
++    float v0f;
++    float u1f;
++    float v1f;
++    uint vertR;
++    uint vertG;
++    uint vertB;
++    uint vertA;
++    uint vertFog;
++    uint z1;
++    // pixel pipe (matches MakePixelPipe)
++    int sx0;
++    int sx1;
++    int sy0;
++    int sy1;
++    uint fge;
++    uint fogR;
++    uint fogG;
++    uint fogB;
++    uint fbp;   // blocks (framePageBaseToBlock applied)
++    uint fbw;
++    uint fpsm;
++    uint zbp;   // blocks
++    uint zpsm;
++    uint testLo;
++    uint testHi;
++    uint abe;
++    uint pabe;
++    uint asel;
++    uint bsel;
++    uint csel;
++    uint dsel;
++    uint fixv;
++    uint fbaOn;
++    uint fbmsk;
++    uint zmask;
++    uint frame16;
++    // sampler (matches MakeTexSampler + combine state)
++    uint tme;
++    uint fst;
++    uint linear;
++    int texW;
++    int texH;
++    uint wrapU;
++    uint wrapV;
++    uint minU;
++    uint maxU;
++    uint minV;
++    uint maxV;
++    uint texPsm;
++    uint tbp0;  // blocks
++    uint tbw;
++    uint tcc;
++    uint tfx;
++    uint ta0;
++    uint ta1;
++    uint aem;
++    uint cpsm;
++    uint csm;
++    uint csa;
++} pr;
++
++const uint WORD_MASK = 0xFFFFFu;   // (4MB / 4) - 1
++
++// ---------------------------------------------------------------------------
++// GS swizzled memory access (mirrors PixelStorageTraits + ps2_gs_memory tables)
++// ---------------------------------------------------------------------------
++
++const uint BlockTableC32[32] = uint[](
++    0u, 1u, 4u, 5u, 16u, 17u, 20u, 21u,
++    2u, 3u, 6u, 7u, 18u, 19u, 22u, 23u,
++    8u, 9u, 12u, 13u, 24u, 25u, 28u, 29u,
++    10u, 11u, 14u, 15u, 26u, 27u, 30u, 31u);
++
++const uint BlockTableZ32[32] = uint[](
++    24u, 25u, 28u, 29u, 8u, 9u, 12u, 13u,
++    26u, 27u, 30u, 31u, 10u, 11u, 14u, 15u,
++    16u, 17u, 20u, 21u, 0u, 1u, 4u, 5u,
++    18u, 19u, 22u, 23u, 2u, 3u, 6u, 7u);
++
++const uint ColumnTable32[64] = uint[](
++    0u, 1u, 4u, 5u, 8u, 9u, 12u, 13u,
++    2u, 3u, 6u, 7u, 10u, 11u, 14u, 15u,
++    16u, 17u, 20u, 21u, 24u, 25u, 28u, 29u,
++    18u, 19u, 22u, 23u, 26u, 27u, 30u, 31u,
++    32u, 33u, 36u, 37u, 40u, 41u, 44u, 45u,
++    34u, 35u, 38u, 39u, 42u, 43u, 46u, 47u,
++    48u, 49u, 52u, 53u, 56u, 57u, 60u, 61u,
++    50u, 51u, 54u, 55u, 58u, 59u, 62u, 63u);
++
++const uint BlockTableC16[32] = uint[](
++    0u, 2u, 8u, 10u,
++    1u, 3u, 9u, 11u,
++    4u, 6u, 12u, 14u,
++    5u, 7u, 13u, 15u,
++    16u, 18u, 24u, 26u,
++    17u, 19u, 25u, 27u,
++    20u, 22u, 28u, 30u,
++    21u, 23u, 29u, 31u);
++
++const uint BlockTableC16S[32] = uint[](
++    0u, 2u, 16u, 18u,
++    1u, 3u, 17u, 19u,
++    8u, 10u, 24u, 26u,
++    9u, 11u, 25u, 27u,
++    4u, 6u, 20u, 22u,
++    5u, 7u, 21u, 23u,
++    12u, 14u, 28u, 30u,
++    13u, 15u, 29u, 31u);
++
++const uint BlockTableZ16[32] = uint[](
++    24u, 26u, 16u, 18u,
++    25u, 27u, 17u, 19u,
++    28u, 30u, 20u, 22u,
++    29u, 31u, 21u, 23u,
++    8u, 10u, 0u, 2u,
++    9u, 11u, 1u, 3u,
++    12u, 14u, 4u, 6u,
++    13u, 15u, 5u, 7u);
++
++const uint BlockTableZ16S[32] = uint[](
++    24u, 26u, 8u, 10u,
++    25u, 27u, 9u, 11u,
++    16u, 18u, 0u, 2u,
++    17u, 19u, 1u, 3u,
++    28u, 30u, 12u, 14u,
++    29u, 31u, 13u, 15u,
++    20u, 22u, 4u, 6u,
++    21u, 23u, 5u, 7u);
++
++const uint ColumnTable16[128] = uint[](
++    0u, 2u, 8u, 10u, 16u, 18u, 24u, 26u, 1u, 3u, 9u, 11u, 17u, 19u, 25u, 27u,
++    4u, 6u, 12u, 14u, 20u, 22u, 28u, 30u, 5u, 7u, 13u, 15u, 21u, 23u, 29u, 31u,
++    32u, 34u, 40u, 42u, 48u, 50u, 56u, 58u, 33u, 35u, 41u, 43u, 49u, 51u, 57u, 59u,
++    36u, 38u, 44u, 46u, 52u, 54u, 60u, 62u, 37u, 39u, 45u, 47u, 53u, 55u, 61u, 63u,
++    64u, 66u, 72u, 74u, 80u, 82u, 88u, 90u, 65u, 67u, 73u, 75u, 81u, 83u, 89u, 91u,
++    68u, 70u, 76u, 78u, 84u, 86u, 92u, 94u, 69u, 71u, 77u, 79u, 85u, 87u, 93u, 95u,
++    96u, 98u, 104u, 106u, 112u, 114u, 120u, 122u, 97u, 99u, 105u, 107u, 113u, 115u, 121u, 123u,
++    100u, 102u, 108u, 110u, 116u, 118u, 124u, 126u, 101u, 103u, 109u, 111u, 117u, 119u, 125u, 127u);
++
++// T8 shares the C32 block table; T4 shares the C16 block table.
++const uint ColumnTable8[256] = uint[](
++    0u, 4u, 16u, 20u, 32u, 36u, 48u, 52u, 2u, 6u, 18u, 22u, 34u, 38u, 50u, 54u,
++    8u, 12u, 24u, 28u, 40u, 44u, 56u, 60u, 10u, 14u, 26u, 30u, 42u, 46u, 58u, 62u,
++    33u, 37u, 49u, 53u, 1u, 5u, 17u, 21u, 35u, 39u, 51u, 55u, 3u, 7u, 19u, 23u,
++    41u, 45u, 57u, 61u, 9u, 13u, 25u, 29u, 43u, 47u, 59u, 63u, 11u, 15u, 27u, 31u,
++    96u, 100u, 112u, 116u, 64u, 68u, 80u, 84u, 98u, 102u, 114u, 118u, 66u, 70u, 82u, 86u,
++    104u, 108u, 120u, 124u, 72u, 76u, 88u, 92u, 106u, 110u, 122u, 126u, 74u, 78u, 90u, 94u,
++    65u, 69u, 81u, 85u, 97u, 101u, 113u, 117u, 67u, 71u, 83u, 87u, 99u, 103u, 115u, 119u,
++    73u, 77u, 89u, 93u, 105u, 109u, 121u, 125u, 75u, 79u, 91u, 95u, 107u, 111u, 123u, 127u,
++    128u, 132u, 144u, 148u, 160u, 164u, 176u, 180u, 130u, 134u, 146u, 150u, 162u, 166u, 178u, 182u,
++    136u, 140u, 152u, 156u, 168u, 172u, 184u, 188u, 138u, 142u, 154u, 158u, 170u, 174u, 186u, 190u,
++    161u, 165u, 177u, 181u, 129u, 133u, 145u, 149u, 163u, 167u, 179u, 183u, 131u, 135u, 147u, 151u,
++    169u, 173u, 185u, 189u, 137u, 141u, 153u, 157u, 171u, 175u, 187u, 191u, 139u, 143u, 155u, 159u,
++    224u, 228u, 240u, 244u, 192u, 196u, 208u, 212u, 226u, 230u, 242u, 246u, 194u, 198u, 210u, 214u,
++    232u, 236u, 248u, 252u, 200u, 204u, 216u, 220u, 234u, 238u, 250u, 254u, 202u, 206u, 218u, 222u,
++    193u, 197u, 209u, 213u, 225u, 229u, 241u, 245u, 195u, 199u, 211u, 215u, 227u, 231u, 243u, 247u,
++    201u, 205u, 217u, 221u, 233u, 237u, 249u, 253u, 203u, 207u, 219u, 223u, 235u, 239u, 251u, 255u);
++
++const uint ColumnTable4[512] = uint[](
++    0u, 8u, 32u, 40u, 64u, 72u, 96u, 104u, 2u, 10u, 34u, 42u, 66u, 74u, 98u, 106u, 4u, 12u, 36u, 44u, 68u, 76u, 100u, 108u, 6u, 14u, 38u, 46u, 70u, 78u, 102u, 110u,
++    16u, 24u, 48u, 56u, 80u, 88u, 112u, 120u, 18u, 26u, 50u, 58u, 82u, 90u, 114u, 122u, 20u, 28u, 52u, 60u, 84u, 92u, 116u, 124u, 22u, 30u, 54u, 62u, 86u, 94u, 118u, 126u,
++    65u, 73u, 97u, 105u, 1u, 9u, 33u, 41u, 67u, 75u, 99u, 107u, 3u, 11u, 35u, 43u, 69u, 77u, 101u, 109u, 5u, 13u, 37u, 45u, 71u, 79u, 103u, 111u, 7u, 15u, 39u, 47u,
++    81u, 89u, 113u, 121u, 17u, 25u, 49u, 57u, 83u, 91u, 115u, 123u, 19u, 27u, 51u, 59u, 85u, 93u, 117u, 125u, 21u, 29u, 53u, 61u, 87u, 95u, 119u, 127u, 23u, 31u, 55u, 63u,
++    192u, 200u, 224u, 232u, 128u, 136u, 160u, 168u, 194u, 202u, 226u, 234u, 130u, 138u, 162u, 170u, 196u, 204u, 228u, 236u, 132u, 140u, 164u, 172u, 198u, 206u, 230u, 238u, 134u, 142u, 166u, 174u,
++    208u, 216u, 240u, 248u, 144u, 152u, 176u, 184u, 210u, 218u, 242u, 250u, 146u, 154u, 178u, 186u, 212u, 220u, 244u, 252u, 148u, 156u, 180u, 188u, 214u, 222u, 246u, 254u, 150u, 158u, 182u, 190u,
++    129u, 137u, 161u, 169u, 193u, 201u, 225u, 233u, 131u, 139u, 163u, 171u, 195u, 203u, 227u, 235u, 133u, 141u, 165u, 173u, 197u, 205u, 229u, 237u, 135u, 143u, 167u, 175u, 199u, 207u, 231u, 239u,
++    145u, 153u, 177u, 185u, 209u, 217u, 241u, 249u, 147u, 155u, 179u, 187u, 211u, 219u, 243u, 251u, 149u, 157u, 181u, 189u, 213u, 221u, 245u, 253u, 151u, 159u, 183u, 191u, 215u, 223u, 247u, 255u,
++    256u, 264u, 288u, 296u, 320u, 328u, 352u, 360u, 258u, 266u, 290u, 298u, 322u, 330u, 354u, 362u, 260u, 268u, 292u, 300u, 324u, 332u, 356u, 364u, 262u, 270u, 294u, 302u, 326u, 334u, 358u, 366u,
++    272u, 280u, 304u, 312u, 336u, 344u, 368u, 376u, 274u, 282u, 306u, 314u, 338u, 346u, 370u, 378u, 276u, 284u, 308u, 316u, 340u, 348u, 372u, 380u, 278u, 286u, 310u, 318u, 342u, 350u, 374u, 382u,
++    321u, 329u, 353u, 361u, 257u, 265u, 289u, 297u, 323u, 331u, 355u, 363u, 259u, 267u, 291u, 299u, 325u, 333u, 357u, 365u, 261u, 269u, 293u, 301u, 327u, 335u, 359u, 367u, 263u, 271u, 295u, 303u,
++    337u, 345u, 369u, 377u, 273u, 281u, 305u, 313u, 339u, 347u, 371u, 379u, 275u, 283u, 307u, 315u, 341u, 349u, 373u, 381u, 277u, 285u, 309u, 317u, 343u, 351u, 375u, 383u, 279u, 287u, 311u, 319u,
++    448u, 456u, 480u, 488u, 384u, 392u, 416u, 424u, 450u, 458u, 482u, 490u, 386u, 394u, 418u, 426u, 452u, 460u, 484u, 492u, 388u, 396u, 420u, 428u, 454u, 462u, 486u, 494u, 390u, 398u, 422u, 430u,
++    464u, 472u, 496u, 504u, 400u, 408u, 432u, 440u, 466u, 474u, 498u, 506u, 402u, 410u, 434u, 442u, 468u, 476u, 500u, 508u, 404u, 412u, 436u, 444u, 470u, 478u, 502u, 510u, 406u, 414u, 438u, 446u,
++    385u, 393u, 417u, 425u, 449u, 457u, 481u, 489u, 387u, 395u, 419u, 427u, 451u, 459u, 483u, 491u, 389u, 397u, 421u, 429u, 453u, 461u, 485u, 493u, 391u, 399u, 423u, 431u, 455u, 463u, 487u, 495u,
++    401u, 409u, 433u, 441u, 465u, 473u, 497u, 505u, 403u, 411u, 435u, 443u, 467u, 475u, 499u, 507u, 405u, 413u, 437u, 445u, 469u, 477u, 501u, 509u, 407u, 415u, 439u, 447u, 471u, 479u, 503u, 511u);
++
++// PSM ids (gs_types.h GSPsm)
++const uint PSM_CT32 = 0u;
++const uint PSM_CT24 = 1u;
++const uint PSM_CT16 = 2u;
++const uint PSM_CT16S = 10u;
++const uint PSM_T8 = 19u;
++const uint PSM_T4 = 20u;
++const uint PSM_T8H = 27u;
++const uint PSM_T4HL = 36u;
++const uint PSM_T4HH = 44u;
++const uint PSM_Z32 = 48u;
++const uint PSM_Z24 = 49u;
++const uint PSM_Z16 = 50u;
++const uint PSM_Z16S = 58u;
++
++bool is32Family(uint psm) { return psm == PSM_CT32 || psm == PSM_CT24 || psm == PSM_Z32 || psm == PSM_Z24; }
++bool is16Family(uint psm) { return psm == PSM_CT16 || psm == PSM_CT16S || psm == PSM_Z16 || psm == PSM_Z16S; }
++bool isZFamily(uint psm) { return psm == PSM_Z32 || psm == PSM_Z24 || psm == PSM_Z16 || psm == PSM_Z16S; }
++
++uint readVram8(uint byteAddr)
++{
++    return (vram[byteAddr >> 2u] >> ((byteAddr & 3u) * 8u)) & 0xFFu;
++}
++
++uint readVram16(uint byteAddr)
++{
++    return (vram[byteAddr >> 2u] >> ((byteAddr & 2u) * 8u)) & 0xFFFFu;
++}
++
++void writeVram16(uint byteAddr, uint value)
++{
++    const uint shift = (byteAddr & 2u) * 8u;
++    const uint wordAddr = byteAddr >> 2u;
++    vram[wordAddr] = (vram[wordAddr] & ~(0xFFFFu << shift)) | ((value & 0xFFFFu) << shift);
++}
++
++void writeVram8(uint byteAddr, uint value)
++{
++    const uint shift = (byteAddr & 3u) * 8u;
++    const uint wordAddr = byteAddr >> 2u;
++    vram[wordAddr] = (vram[wordAddr] & ~(0xFFu << shift)) | ((value & 0xFFu) << shift);
++}
++
++// Generic swizzled read, mirroring PixelStorageTraits<>::Read for the storage modes the
++// rasterizer can meet as frame/z/texture formats. Returns the raw stored value.
++uint readPixel(uint psm, uint base, uint bw, uint x, uint y)
++{
++    if (psm == PSM_CT32 || psm == PSM_CT24 || psm == PSM_Z32 || psm == PSM_Z24 ||
++        psm == PSM_T8H || psm == PSM_T4HL || psm == PSM_T4HH)
++    {
++        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
++        const bool ztab = psm == PSM_Z32 || psm == PSM_Z24;
++        const uint block = (ztab ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
++        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
++        const uint pixel = page * 2048u + ((base & 31u) + block) * 64u + column;
++        const uint word = vram[pixel & WORD_MASK];
++        if (psm == PSM_CT24 || psm == PSM_Z24)
++            return word & 0x00FFFFFFu;
++        if (psm == PSM_T8H)
++            return (word >> 24u) & 0xFFu;
++        if (psm == PSM_T4HL)
++            return (word >> 24u) & 0x0Fu;
++        if (psm == PSM_T4HH)
++            return (word >> 28u) & 0x0Fu;
++        return word;
++    }
++    if (is16Family(psm))
++    {
++        const uint page = (base >> 5u) + (y >> 6u) * bw + (x >> 6u);
++        uint block;
++        if (psm == PSM_CT16)
++            block = BlockTableC16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else if (psm == PSM_CT16S)
++            block = BlockTableC16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else if (psm == PSM_Z16)
++            block = BlockTableZ16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else
++            block = BlockTableZ16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        const uint column = ColumnTable16[(y & 7u) * 16u + (x & 15u)];
++        const uint pixel = page * 4096u + ((base & 31u) + block) * 128u + column;
++        return readVram16((pixel * 2u) & 0x3FFFFEu);
++    }
++    if (psm == PSM_T8)
++    {
++        // page 128x64, blocks 8x4 of 16x16, block table shared with C32
++        const uint page = (base >> 5u) + (y >> 6u) * ((bw * 64u) / 128u) + (x >> 7u);
++        const uint block = BlockTableC32[((y >> 4u) & 3u) * 8u + ((x >> 4u) & 7u)];
++        const uint column = ColumnTable8[(y & 15u) * 16u + (x & 15u)];
++        const uint pixel = page * 8192u + ((base & 31u) + block) * 256u + column;
++        return readVram8(pixel & 0x3FFFFFu);
++    }
++    if (psm == PSM_T4)
++    {
++        // page 128x128, blocks 4x8 of 32x16, block table shared with C16
++        const uint page = (base >> 5u) + (y >> 7u) * ((bw * 64u) / 128u) + (x >> 7u);
++        const uint block = BlockTableC16[((y >> 4u) & 7u) * 4u + ((x >> 5u) & 3u)];
++        const uint column = ColumnTable4[(y & 15u) * 32u + (x & 31u)];
++        const uint pixel = page * 16384u + ((base & 31u) + block) * 512u + column;
++        const uint bits = pixel * 4u;
++        return (readVram8((bits >> 3u) & 0x3FFFFFu) >> (bits & 7u)) & 0x0Fu;
++    }
++    return 0xFFFF00FFu;
++}
++
++// Swizzled write for frame/z formats (mirrors PixelStorageTraits<>::Write).
++void writePixel(uint psm, uint base, uint bw, uint x, uint y, uint value)
++{
++    if (psm == PSM_CT32 || psm == PSM_Z32)
++    {
++        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
++        const uint block = (psm == PSM_Z32 ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
++        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
++        vram[(page * 2048u + ((base & 31u) + block) * 64u + column) & WORD_MASK] = value;
++        return;
++    }
++    if (psm == PSM_CT24 || psm == PSM_Z24)
++    {
++        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
++        const uint block = (psm == PSM_Z24 ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
++        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
++        const uint addr = (page * 2048u + ((base & 31u) + block) * 64u + column) & WORD_MASK;
++        vram[addr] = (vram[addr] & 0xFF000000u) | (value & 0x00FFFFFFu);
++        return;
++    }
++    if (is16Family(psm))
++    {
++        const uint page = (base >> 5u) + (y >> 6u) * bw + (x >> 6u);
++        uint block;
++        if (psm == PSM_CT16)
++            block = BlockTableC16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else if (psm == PSM_CT16S)
++            block = BlockTableC16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else if (psm == PSM_Z16)
++            block = BlockTableZ16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else
++            block = BlockTableZ16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        const uint column = ColumnTable16[(y & 7u) * 16u + (x & 15u)];
++        const uint pixel = page * 4096u + ((base & 31u) + block) * 128u + column;
++        writeVram16((pixel * 2u) & 0x3FFFFEu, value);
++        return;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Pixel pipeline helpers (ports of the gs_cpu_backend.cpp free functions)
++// ---------------------------------------------------------------------------
++
++int clampInt(int v, int lo, int hi)
++{
++    return v < lo ? lo : (v > hi ? hi : v);
++}
++
++uint clampU8(int v)
++{
++    return uint(clampInt(v, 0, 255));
++}
++
++uint rgba5551to8888(uint c)
++{
++    const uint r = (c & 0x1Fu) << 3u;
++    const uint g = ((c >> 5u) & 0x1Fu) << 3u;
++    const uint b = ((c >> 10u) & 0x1Fu) << 3u;
++    const uint a = ((c >> 15u) & 1u) << 7u;
++    return r | (g << 8u) | (b << 16u) | (a << 24u);
++}
++
++uint rgba8888to5551(uint c)
++{
++    const uint r = ((c >> 3u) & 0x1Fu);
++    const uint g = ((c >> 11u) & 0x1Fu);
++    const uint b = ((c >> 19u) & 0x1Fu);
++    const uint a = ((c >> 31u) & 1u);
++    return r | (g << 5u) | (b << 10u) | (a << 15u);
++}
++
++uint applyTexa(uint psm, uint texel)
++{
++    if (psm == PSM_CT32 || psm == PSM_Z32)
++        return texel;
++
++    const uint r = texel & 0xFFu;
++    const uint g = (texel >> 8u) & 0xFFu;
++    const uint b = (texel >> 16u) & 0xFFu;
++    const bool rgbZero = r == 0u && g == 0u && b == 0u;
++    uint a = (texel >> 24u) & 0xFFu;
++
++    if (psm == PSM_CT24 || psm == PSM_Z24)
++    {
++        a = (pr.aem != 0u && rgbZero) ? 0u : pr.ta0;
++    }
++    else // 16-bit formats
++    {
++        if ((a & 0x80u) != 0u)
++            a = pr.ta1;
++        else
++            a = (pr.aem != 0u && rgbZero) ? 0u : pr.ta0;
++    }
++    return (texel & 0x00FFFFFFu) | (a << 24u);
++}
++
++int wrapTextureCoordinate(int coordinate, int textureSize, uint mode, uint regionMin, uint regionMax)
++{
++    switch (mode & 3u)
++    {
++    case 0u: // REPEAT
++        return int(uint(coordinate) & uint(textureSize - 1));
++    case 1u: // CLAMP
++        return clampInt(coordinate, 0, textureSize - 1);
++    case 2u: // REGION_CLAMP
++        return min(max(coordinate, int(regionMin)), int(regionMax));
++    case 3u: // REGION_REPEAT
++        return int((uint(coordinate) & regionMin) | regionMax);
++    }
++    return coordinate;
++}
++
++uint lookupClut(uint index)
++{
++    const bool sixteenBit = pr.cpsm == PSM_CT16 || pr.cpsm == PSM_CT16S;
++    const uint csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
++    const uint clutBase = (pr.csa & csaMask) << 4u;
++    const bool fourBit = pr.texPsm == PSM_T4 || pr.texPsm == PSM_T4HL || pr.texPsm == PSM_T4HH;
++    const uint sourceIndex = fourBit ? (index & 0x0Fu) : index;
++
++    uint clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
++    if (!sixteenBit && pr.csm == 0u && (pr.texPsm == PSM_T8 || pr.texPsm == PSM_T8H))
++    {
++        const uint block = min((sourceIndex & 0xF0u) + clutBase, 240u);
++        clutIndex = block + (sourceIndex & 0x0Fu);
++    }
++
++    if (pr.cpsm == PSM_CT32)
++    {
++        const uint raw = clut[clutIndex] | (clut[clutIndex + 256u] << 16u);
++        return applyTexa(pr.cpsm, raw);
++    }
++    if (pr.cpsm == PSM_CT24)
++    {
++        const uint raw = clut[clutIndex] | (clut[clutIndex + 256u] << 16u);
++        return applyTexa(pr.cpsm, raw & 0x00FFFFFFu);
++    }
++    if (sixteenBit)
++        return applyTexa(pr.cpsm, rgba5551to8888(clut[clutIndex]));
++    return 0xFFFF00FFu;
++}
++
++uint fetchTexel(int u, int v)
++{
++    const uint raw = readPixel(pr.texPsm, pr.tbp0, pr.tbw, uint(u), uint(v));
++    if (pr.texPsm == PSM_CT32 || pr.texPsm == PSM_Z32 || pr.texPsm == PSM_CT24 || pr.texPsm == PSM_Z24)
++        return applyTexa(pr.texPsm, raw);
++    if (is16Family(pr.texPsm))
++        return applyTexa(pr.texPsm, rgba5551to8888(raw));
++    // indexed formats
++    return lookupClut(raw & 0xFFu);
++}
++
++uint lerpChannel(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
++{
++    // Matches the CPU SSE path exactly: trunc toward zero, then round up when the
++    // fractional part reaches 0.5. `precise` blocks FMA contraction so the float
++    // ops round identically to _mm_mul_ps/_mm_add_ps.
++    precise const float top = float(c00) + (float(c10) - float(c00)) * fx;
++    precise const float bottom = float(c01) + (float(c11) - float(c01)) * fx;
++    precise const float v = top + (bottom - top) * fy;
++    float i = trunc(v);
++    const float frac = v - i;
++    if (frac >= 0.5)
++        i += 1.0;
++    if (frac <= -0.5)
++        i -= 1.0;
++    return clampU8(int(i));
++}
++
++uint lerpTexels(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
++{
++    uint outv = 0u;
++    for (uint shift = 0u; shift < 32u; shift += 8u)
++    {
++        outv |= lerpChannel((c00 >> shift) & 0xFFu, (c10 >> shift) & 0xFFu,
++                            (c01 >> shift) & 0xFFu, (c11 >> shift) & 0xFFu, fx, fy) << shift;
++    }
++    return outv;
++}
++
++uint samplePoint(float texUf, float texVf, int su, int sv)
++{
++    const int sampleU = wrapTextureCoordinate(su, pr.texW, pr.wrapU, pr.minU, pr.maxU);
++    const int sampleV = wrapTextureCoordinate(sv, pr.texH, pr.wrapV, pr.minV, pr.maxV);
++    return fetchTexel(sampleU, sampleV);
++}
++
++uint sampleTexture(float s, float t, float q, uint u, uint v)
++{
++    precise float texUf, texVf;
++    if (pr.fst != 0u)
++    {
++        texUf = float(u) / 16.0;
++        texVf = float(v) / 16.0;
++    }
++    else
++    {
++        const float invQ = 1.0 / (abs(q) > 1.0e-8 ? q : 1.0);
++        texUf = s * invQ * float(pr.texW);
++        texVf = t * invQ * float(pr.texH);
++    }
++
++    if (pr.linear == 0u)
++        return samplePoint(texUf, texVf, int(texUf), int(texVf));
++
++    const float sampleU = texUf - 0.5;
++    const float sampleV = texVf - 0.5;
++    const int u0 = int(floor(sampleU));
++    const int v0 = int(floor(sampleV));
++    const float fx = sampleU - float(u0);
++    const float fy = sampleV - float(v0);
++    const uint c00 = samplePoint(texUf, texVf, u0, v0);
++    const uint c10 = samplePoint(texUf, texVf, u0 + 1, v0);
++    const uint c01 = samplePoint(texUf, texVf, u0, v0 + 1);
++    const uint c11 = samplePoint(texUf, texVf, u0 + 1, v0 + 1);
++    return lerpTexels(c00, c10, c01, c11, fx, fy);
++}
++
++// combineTexture from gs_cpu_backend.cpp
++void combineTexture(uint tr, uint tg, uint tb, uint ta,
++                    inout uint r, inout uint g, inout uint b, inout uint a)
++{
++    const bool textureHasAlpha = pr.tcc != 0u;
++    const uint vr = r, vg = g, vb = b, va = a;
++    r = tr; g = tg; b = tb; a = textureHasAlpha ? ta : va;
++    switch (pr.tfx)
++    {
++    case 0u: // MODULATE
++        r = clampU8(int(tr * vr) >> 7);
++        g = clampU8(int(tg * vg) >> 7);
++        b = clampU8(int(tb * vb) >> 7);
++        a = textureHasAlpha ? clampU8(int(ta * va) >> 7) : va;
++        break;
++    case 1u: // DECAL
++        break;
++    case 2u: // HIGHLIGHT
++        r = clampU8((int(tr * vr) >> 7) + int(va));
++        g = clampU8((int(tg * vg) >> 7) + int(va));
++        b = clampU8((int(tb * vb) >> 7) + int(va));
++        a = textureHasAlpha ? clampU8(int(ta + va)) : va;
++        break;
++    case 3u: // HIGHLIGHT2
++        r = clampU8((int(tr * vr) >> 7) + int(va));
++        g = clampU8((int(tg * vg) >> 7) + int(va));
++        b = clampU8((int(tb * vb) >> 7) + int(va));
++        a = textureHasAlpha ? ta : va;
++        break;
++    }
++}
++
++// passesAlphaTest
++bool passesAlphaTest(uint alpha)
++{
++    if ((pr.testLo & 1u) == 0u)
++        return true;
++    const uint atst = (pr.testLo >> 1u) & 7u;
++    const uint aref = (pr.testLo >> 4u) & 0xFFu;
++    switch (atst)
++    {
++    case 0u: return false;
++    case 1u: return true;
++    case 2u: return alpha < aref;
++    case 3u: return alpha <= aref;
++    case 4u: return alpha == aref;
++    case 5u: return alpha >= aref;
++    case 6u: return alpha > aref;
++    default: return alpha != aref;
++    }
++}
++
++bool passesDestinationAlphaTest(uint rawFramebufferPixel)
++{
++    const bool date = ((pr.testLo >> 14u) & 1u) != 0u;
++    if (!date)
++        return true;
++    const bool datm = ((pr.testLo >> 15u) & 1u) != 0u;
++    if (pr.fpsm == PSM_CT32)
++        return (((rawFramebufferPixel >> 31u) & 1u) != 0u) == datm;
++    if (pr.fpsm == PSM_CT16 || pr.fpsm == PSM_CT16S)
++        return (((rawFramebufferPixel >> 15u) & 1u) != 0u) == datm;
++    return true; // RGB24: no destination alpha, DATE always passes
++}
++
++// WritePixelFast from gs_cpu_backend.cpp
++void writePixelPipe(int x, int y, uint z, uint r, uint g, uint b, uint a, uint fog)
++{
++    if (x < pr.sx0 || x > pr.sx1 || y < pr.sy0 || y > pr.sy1)
++        return;
++
++    if (pr.fge != 0u)
++    {
++        const uint inverseFog = 255u - fog;
++        r = ((fog * r) >> 8u) + ((inverseFog * pr.fogR) >> 8u);
++        g = ((fog * g) >> 8u) + ((inverseFog * pr.fogG) >> 8u);
++        b = ((fog * b) >> 8u) + ((inverseFog * pr.fogB) >> 8u);
++    }
++
++    // classifyAlphaTest
++    bool writeRgb = true, writeAlpha = true, writeDepth = true;
++    if (!passesAlphaTest(a))
++    {
++        const uint afail = (pr.testLo >> 12u) & 3u;
++        if (afail == 1u) { writeDepth = false; }                     // FB_ONLY
++        else if (afail == 2u) { writeRgb = false; writeAlpha = false; } // ZB_ONLY
++        else if (afail == 3u)
++        {
++            // RGB_ONLY: only distinct for RGBA32; FB_ONLY otherwise
++            writeDepth = false;
++            if (pr.fpsm == PSM_CT32)
++                writeAlpha = false;
++        }
++        else { writeRgb = false; writeAlpha = false; writeDepth = false; } // KEEP
++    }
++    if (!((writeRgb || writeAlpha) || writeDepth))
++        return;
++
++    const bool preserveDestinationAlpha = writeRgb && !writeAlpha && pr.fpsm == PSM_CT32;
++    const bool dateRead = ((pr.testLo >> 14u) & 1u) != 0u &&
++                          (pr.fpsm == PSM_CT32 || pr.fpsm == PSM_CT16 || pr.fpsm == PSM_CT16S);
++    const bool frmw = dateRead || ((writeRgb || writeAlpha) && (pr.fbmsk != 0u || pr.abe != 0u || preserveDestinationAlpha));
++
++    uint rawFramebufferPixel = 0u;
++    uint fbrgba = 0u;
++    if (frmw)
++    {
++        rawFramebufferPixel = readPixel(pr.fpsm, pr.fbp, pr.fbw, uint(x), uint(y));
++        fbrgba = rawFramebufferPixel;
++        if (pr.frame16 != 0u)
++            fbrgba = rgba5551to8888(fbrgba);
++        else if (pr.fpsm == PSM_CT24)
++            fbrgba |= 0x80000000u; // the GS supplies 0x80 as destination alpha for RGB24 blending
++    }
++
++    if (!passesDestinationAlphaTest(rawFramebufferPixel))
++        return;
++
++    bool zpass = false;
++    const uint ztest = (pr.testLo >> 17u) & 3u;
++    if (ztest == 1u)
++        zpass = true;
++    else if (ztest == 2u)
++        zpass = z >= readPixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y));
++    else if (ztest == 3u)
++        zpass = z > readPixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y));
++    if (!zpass)
++        return;
++
++    if (writeRgb || writeAlpha)
++    {
++        if (pr.abe != 0u)
++        {
++            const uint dr = fbrgba & 0xFFu;
++            const uint dg = (fbrgba >> 8u) & 0xFFu;
++            const uint db = (fbrgba >> 16u) & 0xFFu;
++            const uint da = (fbrgba >> 24u) & 0xFFu;
++            // PABE disables alpha blending when the source alpha MSB is clear.
++            if (!(pr.pabe != 0u && (a & 0x80u) == 0u))
++            {
++                const int cAlpha = pr.csel == 0u ? int(a) : (pr.csel == 1u ? int(da) : int(pr.fixv));
++                const int sr = int(r), sg = int(g), sb = int(b);
++                const int idr = int(dr), idg = int(dg), idb = int(db);
++                const int ar = pr.asel == 0u ? sr : (pr.asel == 1u ? idr : 0);
++                const int br_ = pr.bsel == 0u ? sr : (pr.bsel == 1u ? idr : 0);
++                const int drr = pr.dsel == 0u ? sr : (pr.dsel == 1u ? idr : 0);
++                const int ag = pr.asel == 0u ? sg : (pr.asel == 1u ? idg : 0);
++                const int bg = pr.bsel == 0u ? sg : (pr.bsel == 1u ? idg : 0);
++                const int dg2 = pr.dsel == 0u ? sg : (pr.dsel == 1u ? idg : 0);
++                const int ab = pr.asel == 0u ? sb : (pr.asel == 1u ? idb : 0);
++                const int bb = pr.bsel == 0u ? sb : (pr.bsel == 1u ? idb : 0);
++                const int db2 = pr.dsel == 0u ? sb : (pr.dsel == 1u ? idb : 0);
++                r = clampU8(((ar - br_) * cAlpha >> 7) + drr);
++                g = clampU8(((ag - bg) * cAlpha >> 7) + dg2);
++                b = clampU8(((ab - bb) * cAlpha >> 7) + db2);
++            }
++        }
++
++        if (writeAlpha && pr.fbaOn != 0u)
++            a |= 0x80u;
++
++        uint pixel = r | (g << 8u) | (b << 16u) | (a << 24u);
++        if (pr.fbmsk != 0u)
++            pixel = (pixel & ~pr.fbmsk) | (fbrgba & pr.fbmsk);
++        if (preserveDestinationAlpha)
++            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
++        if (pr.frame16 != 0u)
++            pixel = rgba8888to5551(pixel);
++        writePixel(pr.fpsm, pr.fbp, pr.fbw, uint(x), uint(y), pixel);
++    }
++
++    if (writeDepth && pr.zmask == 0u)
++        writePixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y), z);
++}
++
++void main()
++{
++    const int x = pr.drawX0 + int(gl_GlobalInvocationID.x);
++    const int y = pr.drawY0 + int(gl_GlobalInvocationID.y);
++    if (x > pr.drawX1 || y > pr.drawY1)
++        return;
++
++    uint r = pr.vertR, g = pr.vertG, b = pr.vertB, a = pr.vertA;
++
++    if (pr.tme != 0u)
++    {
++        // precise: no FMA contraction — must round like the CPU's scalar float ops
++        precise const float ty = (float(y - pr.unclippedY0) + 0.5) / pr.spriteH;
++        precise const float tx = (float(x - pr.unclippedX0) + 0.5) / pr.spriteW;
++        precise const float texVf = pr.v0f + (pr.v1f - pr.v0f) * ty;
++        precise const float texUf = pr.u0f + (pr.u1f - pr.u0f) * tx;
++
++        uint texel;
++        if (pr.fst != 0u)
++        {
++            // precise: texUf * 16 + 0.5 must not fuse into an FMA (CPU rounds as two ops)
++            precise const float fixedUf = texUf * 16.0 + 0.5;
++            precise const float fixedVf = texVf * 16.0 + 0.5;
++            const int fixedU = int(fixedUf);
++            const int fixedV = int(fixedVf);
++            const uint sampleU = uint(clampInt(fixedU, 0, 65535));
++            const uint sampleV = uint(clampInt(fixedV, 0, 65535));
++            texel = sampleTexture(0.0, 0.0, 1.0, sampleU, sampleV);
++        }
++        else
++        {
++            texel = sampleTexture(texUf / float(pr.texW), texVf / float(pr.texH), 1.0, 0u, 0u);
++        }
++
++        const uint tr = texel & 0xFFu;
++        const uint tg = (texel >> 8u) & 0xFFu;
++        const uint tb = (texel >> 16u) & 0xFFu;
++        const uint ta = (texel >> 24u) & 0xFFu;
++        combineTexture(tr, tg, tb, ta, r, g, b, a);
++    }
++
++    writePixelPipe(x, y, pr.z1, r, g, b, a, pr.vertFog);
++}
