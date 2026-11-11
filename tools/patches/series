@@ -49,3 +49,4 @@ ps2recomp-vu1-lean-gen-link-stubs.patch
 ps2recomp-spu2-audio-stream.patch
 ps2recomp-gs-vulkan-backend.patch
 ps2recomp-gs-vulkan-sprite-raster.patch
+ps2recomp-gs-vulkan-triangle-raster.patch
