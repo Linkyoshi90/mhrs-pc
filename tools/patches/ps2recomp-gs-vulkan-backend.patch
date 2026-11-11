@@ -1,0 +1,1123 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 99547b0..99347c4 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -385,6 +385,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
+     src/lib/gs/gs_async_backend.cpp
++    src/lib/gs/gs_vulkan_backend.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+@@ -540,6 +541,33 @@ target_include_directories(ps2_runtime PUBLIC
+ )
+ 
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++
++# Optional Vulkan GS backend: headless compute, no swapchain. gs_vulkan_backend.cpp is always
++# compiled; without Vulkan or a shader compiler it builds as a pure CPU-backend passthrough.
++find_package(Vulkan QUIET)
++find_program(PS2X_GLSLANG_VALIDATOR
++    NAMES glslangValidator
++    HINTS "$ENV{GLSLANG_VALIDATOR_BIN}" "$ENV{HOME}/bin"
++)
++if(Vulkan_FOUND AND PS2X_GLSLANG_VALIDATOR AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
++    set(PS2X_VK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/shaders/present_deswizzle.comp")
++    set(PS2X_VK_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/shaders/present_deswizzle.h")
++    add_custom_command(
++        OUTPUT "${PS2X_VK_SHADER_HEADER}"
++        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
++        COMMAND "${PS2X_GLSLANG_VALIDATOR}" -V --vn kPresentDeswizzleSpv "${PS2X_VK_SHADER_SOURCE}" -o "${PS2X_VK_SHADER_HEADER}"
++        DEPENDS "${PS2X_VK_SHADER_SOURCE}"
++        VERBATIM
++    )
++    add_custom_target(ps2x_gs_vulkan_shaders DEPENDS "${PS2X_VK_SHADER_HEADER}")
++    add_dependencies(ps2_runtime ps2x_gs_vulkan_shaders)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_VULKAN=1)
++    target_include_directories(ps2_runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/shaders")
++    target_link_libraries(ps2_runtime PUBLIC Vulkan::Vulkan)
++    message(STATUS "ps2xRuntime: Vulkan GS backend enabled (glslangValidator: ${PS2X_GLSLANG_VALIDATOR})")
++else()
++    message(STATUS "ps2xRuntime: Vulkan GS backend disabled (Vulkan: ${Vulkan_FOUND}, glslangValidator: ${PS2X_GLSLANG_VALIDATOR})")
++endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+diff --git a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+new file mode 100755
+index 0000000..06fa806
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include "runtime/gs/gs_backend.h"
++#include "runtime/gs/gs_cpu_backend.h"
++
++#include <cstdint>
++#include <memory>
++
++// Vulkan GS backend (work in progress).
++//
++// Canonical GS VRAM lives in a HOST_VISIBLE|HOST_COHERENT Vulkan buffer; the embedded CPU
++// backend runs directly on its mapped pointer, so anything not yet ported to the GPU keeps
++// working with zero divergence. Piece by piece, raster work moves to compute shaders that
++// read/write the same buffer. GPU work only becomes CPU-visible at Sync/Present/readback
++// points, mirroring the CPU backend's locking semantics.
++//
++// Selected with PS2X_GS_BACKEND=vulkan; falls back to pure CPU behavior when no usable
++// Vulkan device exists. PS2X_VK_PRESENT=1 also moves the display deswizzle to the GPU.
++class GSVulkanBackend final : public GSRasterBackend
++{
++public:
++    GSVulkanBackend();
++    ~GSVulkanBackend() override;
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    void SubmitMany(const GSDrawStep *steps, size_t count) override;
++
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++private:
++    struct VkState;
++    std::unique_ptr<VkState> m_vk;
++    GSCpuBackend m_cpu;
++    bool m_gpuOk = false;
++    bool m_gpuPresent = false;
++
++    bool initVulkan();
++    void shutdownVulkan();
++    PresentationFrame presentGpu(const GSPresentationRequest &request);
++    // Mirrors GSCpuBackend::CopyFrameToHostRgba(useLocalMemoryLayout=true) on the GPU.
++    bool gpuCopyFrame(const GSFrameReg &frame,
++                      uint32_t width,
++                      uint32_t height,
++                      std::vector<uint8_t> &outPixels,
++                      bool preserveAlpha,
++                      bool frameBaseIsPages,
++                      uint32_t sourceOriginX,
++                      uint32_t sourceOriginY);
++};
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+new file mode 100755
+index 0000000..6a0cfed
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -0,0 +1,838 @@
++#include "runtime/gs/gs_vulkan_backend.h"
++
++#include "runtime/gs/ps2_gs_common.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <vector>
++
++#if defined(PS2X_HAS_VULKAN)
++#include <vulkan/vulkan.h>
++#include "present_deswizzle.h" // generated by glslangValidator --vn kPresentDeswizzleSpv
++#endif
++
++namespace
++{
++    // Present-path helpers, mirrored from gs_cpu_backend.cpp (they are file-local there).
++    static constexpr uint32_t kHostFrameWidth = 640u;
++    static constexpr uint32_t kHostFrameHeight = 512u;
++    static constexpr uint32_t kDefaultDisplayWidth = 640u;
++    static constexpr uint32_t kDefaultDisplayHeight = 448u;
++
++    void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
++    {
++        const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
++        const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
++        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
++
++        outWidth = (dw + 1u) / (magh + 1u);
++        outHeight = dh + 1u;
++        if (outWidth < 64u || outHeight < 64u)
++        {
++            outWidth = kDefaultDisplayWidth;
++            outHeight = kDefaultDisplayHeight;
++        }
++        outWidth = std::min<uint32_t>(outWidth, kHostFrameWidth);
++        outHeight = std::min<uint32_t>(outHeight, kHostFrameHeight);
++    }
++
++    GSFrameReg decodeDisplayFrame(uint64_t dispfb64)
++    {
++        GSFrameReg frame{};
++        frame.fbp = static_cast<uint32_t>(dispfb64 & 0x1FFu);
++        frame.fbw = static_cast<uint32_t>((dispfb64 >> 9) & 0x3Fu);
++        frame.psm = static_cast<uint8_t>((dispfb64 >> 15) & 0x1Fu);
++        return frame;
++    }
++
++    struct GSDisplayReadOrigin
++    {
++        uint32_t x = 0u;
++        uint32_t y = 0u;
++    };
++
++    GSDisplayReadOrigin decodeDisplayReadOrigin(uint64_t dispfb64)
++    {
++        return {
++            static_cast<uint32_t>((dispfb64 >> 32) & 0x7FFu),
++            static_cast<uint32_t>((dispfb64 >> 43) & 0x7FFu)};
++    }
++
++    bool hasDisplaySetup(uint64_t display64, const GSFrameReg &frame)
++    {
++        const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
++        const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
++        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
++        return frame.fbw != 0u || dw != 0u || dh != 0u || magh != 0u;
++    }
++
++    struct GSPmodeState
++    {
++        bool enableCrt1 = false;
++        bool enableCrt2 = false;
++        bool mmod = false;
++        bool amod = false;
++        bool slbg = false;
++        uint8_t alp = 0u;
++    };
++
++    GSPmodeState decodePmode(uint64_t pmode64)
++    {
++        return {
++            (pmode64 & 0x1ull) != 0ull,
++            (pmode64 & 0x2ull) != 0ull,
++            ((pmode64 >> 5) & 0x1ull) != 0ull,
++            ((pmode64 >> 6) & 0x1ull) != 0ull,
++            ((pmode64 >> 7) & 0x1ull) != 0ull,
++            static_cast<uint8_t>((pmode64 >> 8) & 0xFFu)};
++    }
++
++    struct GSSmode2State
++    {
++        bool interlaced = false;
++        bool frameMode = true;
++    };
++
++    GSSmode2State decodeSMode2(uint64_t smode2)
++    {
++        return {(smode2 & 0x1ull) != 0ull, ((smode2 >> 1) & 0x1ull) != 0ull};
++    }
++
++    void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
++    {
++        if (pixels.empty() || width == 0u || height < 2u)
++            return;
++        const std::vector<uint8_t> source = pixels;
++        for (uint32_t y = 0; y < height; ++y)
++        {
++            uint32_t sourceY = ((y >> 1u) << 1u) + (oddField ? 1u : 0u);
++            if (sourceY >= height)
++                sourceY = height - 1u;
++            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u,
++                        source.data() + sourceY * kHostFrameWidth * 4u,
++                        width * 4u);
++        }
++    }
++
++    void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
++    {
++        for (uint32_t y = 0; y < height; ++y)
++        {
++            uint8_t *row = pixels.data() + y * kHostFrameWidth * 4u;
++            for (uint32_t x = 0; x < width; ++x)
++                row[x * 4u + 3u] = 255u;
++        }
++    }
++
++    uint8_t blendPresentationChannel(uint8_t src, uint8_t dst, uint32_t factor)
++    {
++        const int delta = static_cast<int>(src) - static_cast<int>(dst);
++        return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 255));
++    }
++
++    uint32_t countNonBlackPixels(const std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
++    {
++        uint32_t count = 0u;
++        for (uint32_t y = 0; y < height; ++y)
++        {
++            const uint8_t *row = pixels.data() + y * kHostFrameWidth * 4u;
++            for (uint32_t x = 0; x < width; ++x)
++            {
++                if (row[x * 4u] != 0u || row[x * 4u + 1u] != 0u || row[x * 4u + 2u] != 0u)
++                    ++count;
++            }
++        }
++        return count;
++    }
++
++    // TEMP-DEBUG(mhrs): same frame dump as GSCpuBackend::Present, so Vulkan and CPU runs
++    // produce comparable build/frame_NNN.ppm series.
++    void debugDumpFrame(const PresentationFrame &frame)
++    {
++        static const char *every = std::getenv("MHRS_FRAME_EVERY");
++        static uint64_t presents = 0, written = 0;
++        if (every && frame.width && frame.height && !frame.pixels.empty() && (++presents % std::strtoull(every, nullptr, 10)) == 0)
++        {
++            char path[64];
++            std::snprintf(path, sizeof(path), "build/frame_%03llu.ppm", static_cast<unsigned long long>(written++));
++            if (FILE *f = std::fopen(path, "wb"))
++            {
++                std::fprintf(f, "P6\n%u %u\n255\n", frame.width, frame.height);
++                for (uint32_t y = 0; y < frame.height; ++y)
++                    for (uint32_t x = 0; x < frame.width; ++x)
++                        std::fwrite(frame.pixels.data() + (y * 640u + x) * 4u, 1, 3, f);
++                std::fclose(f);
++            }
++        }
++    }
++}
++
++#if defined(PS2X_HAS_VULKAN)
++struct GSVulkanBackend::VkState
++{
++    VkInstance instance = VK_NULL_HANDLE;
++    VkPhysicalDevice phys = VK_NULL_HANDLE;
++    VkDevice device = VK_NULL_HANDLE;
++    VkQueue queue = VK_NULL_HANDLE;
++    uint32_t queueFamily = 0;
++
++    VkBuffer vramBuffer = VK_NULL_HANDLE;
++    VkDeviceMemory vramMemory = VK_NULL_HANDLE;
++    void *vramMapped = nullptr;
++    VkDeviceSize vramBufferSize = 0;
++
++    VkBuffer outBuffer = VK_NULL_HANDLE;
++    VkDeviceMemory outMemory = VK_NULL_HANDLE;
++    void *outMapped = nullptr;
++
++    VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
++    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
++    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
++    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    VkCommandPool commandPool = VK_NULL_HANDLE;
++    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
++    VkFence fence = VK_NULL_HANDLE;
++};
++
++namespace
++{
++    struct PresentPushConstants
++    {
++        uint32_t basePtr;
++        uint32_t fbw;
++        uint32_t psm;
++        uint32_t width;
++        uint32_t height;
++        uint32_t originX;
++        uint32_t originY;
++        uint32_t flags;
++        uint32_t wordMask;
++        uint32_t byteMask16;
++    };
++
++    uint32_t findHostCoherentMemoryType(VkPhysicalDevice phys, uint32_t typeBits)
++    {
++        VkPhysicalDeviceMemoryProperties props{};
++        vkGetPhysicalDeviceMemoryProperties(phys, &props);
++        const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++        for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
++            if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & wanted) == wanted)
++                return i;
++        return UINT32_MAX;
++    }
++
++    bool createMappedBuffer(VkDevice device,
++                            VkPhysicalDevice phys,
++                            VkDeviceSize size,
++                            VkBufferUsageFlags usage,
++                            VkBuffer &outBuffer,
++                            VkDeviceMemory &outMemory,
++                            void *&outMapped)
++    {
++        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++        bufferInfo.size = size;
++        bufferInfo.usage = usage;
++        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++        if (vkCreateBuffer(device, &bufferInfo, nullptr, &outBuffer) != VK_SUCCESS)
++            return false;
++
++        VkMemoryRequirements reqs{};
++        vkGetBufferMemoryRequirements(device, outBuffer, &reqs);
++        const uint32_t typeIndex = findHostCoherentMemoryType(phys, reqs.memoryTypeBits);
++        if (typeIndex == UINT32_MAX)
++            return false;
++
++        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++        allocInfo.allocationSize = reqs.size;
++        allocInfo.memoryTypeIndex = typeIndex;
++        if (vkAllocateMemory(device, &allocInfo, nullptr, &outMemory) != VK_SUCCESS)
++            return false;
++        if (vkBindBufferMemory(device, outBuffer, outMemory, 0) != VK_SUCCESS)
++            return false;
++        return vkMapMemory(device, outMemory, 0, size, 0, &outMapped) == VK_SUCCESS;
++    }
++}
++
++bool GSVulkanBackend::initVulkan()
++{
++    m_vk = std::make_unique<VkState>();
++    VkState &vk = *m_vk;
++
++    VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++    appInfo.pApplicationName = "ps2x-vulkan-gs";
++    appInfo.apiVersion = VK_API_VERSION_1_1;
++    VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++    instanceInfo.pApplicationInfo = &appInfo;
++    if (vkCreateInstance(&instanceInfo, nullptr, &vk.instance) != VK_SUCCESS)
++    {
++        std::cerr << "[gs-vulkan] vkCreateInstance failed, CPU fallback" << std::endl;
++        return false;
++    }
++
++    uint32_t deviceCount = 0;
++    vkEnumeratePhysicalDevices(vk.instance, &deviceCount, nullptr);
++    if (deviceCount == 0)
++    {
++        std::cerr << "[gs-vulkan] no Vulkan devices, CPU fallback" << std::endl;
++        return false;
++    }
++    std::vector<VkPhysicalDevice> devices(deviceCount);
++    vkEnumeratePhysicalDevices(vk.instance, &deviceCount, devices.data());
++
++    // First device with a compute queue and host-coherent memory wins.
++    for (VkPhysicalDevice candidate : devices)
++    {
++        uint32_t familyCount = 0;
++        vkGetPhysicalDeviceQueueFamilyProperties(candidate, &familyCount, nullptr);
++        std::vector<VkQueueFamilyProperties> families(familyCount);
++        vkGetPhysicalDeviceQueueFamilyProperties(candidate, &familyCount, families.data());
++        for (uint32_t i = 0; i < familyCount; ++i)
++        {
++            if (!(families[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
++                continue;
++            vk.phys = candidate;
++            vk.queueFamily = i;
++            break;
++        }
++        if (vk.phys != VK_NULL_HANDLE)
++            break;
++    }
++    if (vk.phys == VK_NULL_HANDLE)
++    {
++        std::cerr << "[gs-vulkan] no compute queue, CPU fallback" << std::endl;
++        return false;
++    }
++
++    const float priority = 1.0f;
++    VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++    queueInfo.queueFamilyIndex = vk.queueFamily;
++    queueInfo.queueCount = 1;
++    queueInfo.pQueuePriorities = &priority;
++    VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++    deviceInfo.queueCreateInfoCount = 1;
++    deviceInfo.pQueueCreateInfos = &queueInfo;
++    if (vkCreateDevice(vk.phys, &deviceInfo, nullptr, &vk.device) != VK_SUCCESS)
++    {
++        std::cerr << "[gs-vulkan] vkCreateDevice failed, CPU fallback" << std::endl;
++        return false;
++    }
++    vkGetDeviceQueue(vk.device, vk.queueFamily, 0, &vk.queue);
++
++    // Buffers are sized in Initialize(); create them lazily-sized to 4MB (GS VRAM size) here
++    // and re-check in Initialize. GS VRAM is always 4MB.
++    vk.vramBufferSize = 4u * 1024u * 1024u;
++    if (!createMappedBuffer(vk.device, vk.phys, vk.vramBufferSize,
++                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                            vk.vramBuffer, vk.vramMemory, vk.vramMapped))
++    {
++        std::cerr << "[gs-vulkan] VRAM buffer allocation failed, CPU fallback" << std::endl;
++        return false;
++    }
++    if (!createMappedBuffer(vk.device, vk.phys, kHostFrameWidth * kHostFrameHeight * 4u,
++                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                            vk.outBuffer, vk.outMemory, vk.outMapped))
++    {
++        std::cerr << "[gs-vulkan] output buffer allocation failed, CPU fallback" << std::endl;
++        return false;
++    }
++
++    VkDescriptorSetLayoutBinding bindings[2]{};
++    bindings[0].binding = 0;
++    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    bindings[0].descriptorCount = 1;
++    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++    bindings[1] = bindings[0];
++    bindings[1].binding = 1;
++    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++    layoutInfo.bindingCount = 2;
++    layoutInfo.pBindings = bindings;
++    if (vkCreateDescriptorSetLayout(vk.device, &layoutInfo, nullptr, &vk.descriptorLayout) != VK_SUCCESS)
++        return false;
++
++    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
++    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++    poolInfo.maxSets = 1;
++    poolInfo.poolSizeCount = 1;
++    poolInfo.pPoolSizes = &poolSize;
++    if (vkCreateDescriptorPool(vk.device, &poolInfo, nullptr, &vk.descriptorPool) != VK_SUCCESS)
++        return false;
++
++    VkDescriptorSetAllocateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++    setInfo.descriptorPool = vk.descriptorPool;
++    setInfo.descriptorSetCount = 1;
++    setInfo.pSetLayouts = &vk.descriptorLayout;
++    if (vkAllocateDescriptorSets(vk.device, &setInfo, &vk.descriptorSet) != VK_SUCCESS)
++        return false;
++
++    VkDescriptorBufferInfo vramDesc{vk.vramBuffer, 0, VK_WHOLE_SIZE};
++    VkDescriptorBufferInfo outDesc{vk.outBuffer, 0, VK_WHOLE_SIZE};
++    VkWriteDescriptorSet writes[2]{};
++    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[0].dstSet = vk.descriptorSet;
++    writes[0].dstBinding = 0;
++    writes[0].descriptorCount = 1;
++    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    writes[0].pBufferInfo = &vramDesc;
++    writes[1] = writes[0];
++    writes[1].dstBinding = 1;
++    writes[1].pBufferInfo = &outDesc;
++    vkUpdateDescriptorSets(vk.device, 2, writes, 0, nullptr);
++
++    VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PresentPushConstants)};
++    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++    pipelineLayoutInfo.setLayoutCount = 1;
++    pipelineLayoutInfo.pSetLayouts = &vk.descriptorLayout;
++    pipelineLayoutInfo.pushConstantRangeCount = 1;
++    pipelineLayoutInfo.pPushConstantRanges = &pushRange;
++    if (vkCreatePipelineLayout(vk.device, &pipelineLayoutInfo, nullptr, &vk.pipelineLayout) != VK_SUCCESS)
++        return false;
++
++    VkShaderModuleCreateInfo shaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++    shaderInfo.codeSize = sizeof(kPresentDeswizzleSpv);
++    shaderInfo.pCode = kPresentDeswizzleSpv;
++    VkShaderModule shaderModule = VK_NULL_HANDLE;
++    if (vkCreateShaderModule(vk.device, &shaderInfo, nullptr, &shaderModule) != VK_SUCCESS)
++    {
++        std::cerr << "[gs-vulkan] shader module creation failed, CPU fallback" << std::endl;
++        return false;
++    }
++
++    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++    pipelineInfo.stage.module = shaderModule;
++    pipelineInfo.stage.pName = "main";
++    pipelineInfo.layout = vk.pipelineLayout;
++    const VkResult pipelineResult = vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk.pipeline);
++    vkDestroyShaderModule(vk.device, shaderModule, nullptr);
++    if (pipelineResult != VK_SUCCESS)
++        return false;
++
++    VkCommandPoolCreateInfo commandPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++    commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    commandPoolInfo.queueFamilyIndex = vk.queueFamily;
++    if (vkCreateCommandPool(vk.device, &commandPoolInfo, nullptr, &vk.commandPool) != VK_SUCCESS)
++        return false;
++
++    VkCommandBufferAllocateInfo commandBufferInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++    commandBufferInfo.commandPool = vk.commandPool;
++    commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    commandBufferInfo.commandBufferCount = 1;
++    if (vkAllocateCommandBuffers(vk.device, &commandBufferInfo, &vk.commandBuffer) != VK_SUCCESS)
++        return false;
++
++    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++    if (vkCreateFence(vk.device, &fenceInfo, nullptr, &vk.fence) != VK_SUCCESS)
++        return false;
++
++    VkPhysicalDeviceProperties props{};
++    vkGetPhysicalDeviceProperties(vk.phys, &props);
++    std::cerr << "[gs-vulkan] using device: " << props.deviceName << std::endl;
++    return true;
++}
++
++void GSVulkanBackend::shutdownVulkan()
++{
++    if (!m_vk)
++        return;
++    VkState &vk = *m_vk;
++    if (vk.device != VK_NULL_HANDLE)
++    {
++        vkDeviceWaitIdle(vk.device);
++        if (vk.fence)
++            vkDestroyFence(vk.device, vk.fence, nullptr);
++        if (vk.commandPool)
++            vkDestroyCommandPool(vk.device, vk.commandPool, nullptr);
++        if (vk.pipeline)
++            vkDestroyPipeline(vk.device, vk.pipeline, nullptr);
++        if (vk.pipelineLayout)
++            vkDestroyPipelineLayout(vk.device, vk.pipelineLayout, nullptr);
++        if (vk.descriptorPool)
++            vkDestroyDescriptorPool(vk.device, vk.descriptorPool, nullptr);
++        if (vk.descriptorLayout)
++            vkDestroyDescriptorSetLayout(vk.device, vk.descriptorLayout, nullptr);
++        if (vk.outBuffer)
++            vkDestroyBuffer(vk.device, vk.outBuffer, nullptr);
++        if (vk.outMemory)
++            vkFreeMemory(vk.device, vk.outMemory, nullptr);
++        if (vk.vramBuffer)
++            vkDestroyBuffer(vk.device, vk.vramBuffer, nullptr);
++        if (vk.vramMemory)
++            vkFreeMemory(vk.device, vk.vramMemory, nullptr);
++        vkDestroyDevice(vk.device, nullptr);
++    }
++    if (vk.instance)
++        vkDestroyInstance(vk.instance, nullptr);
++    m_vk.reset();
++}
++
++bool GSVulkanBackend::gpuCopyFrame(const GSFrameReg &frame,
++                                   uint32_t width,
++                                   uint32_t height,
++                                   std::vector<uint8_t> &outPixels,
++                                   bool preserveAlpha,
++                                   bool frameBaseIsPages,
++                                   uint32_t sourceOriginX,
++                                   uint32_t sourceOriginY)
++{
++    // Mirrors GSCpuBackend::CopyFrameToHostRgba with useLocalMemoryLayout=true.
++    outPixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
++    if (frame.psm != GS_PSM_CT32 && frame.psm != GS_PSM_CT24 && frame.psm != GS_PSM_CT16 && frame.psm != GS_PSM_CT16S)
++    {
++        outPixels.clear();
++        return false;
++    }
++
++    VkState &vk = *m_vk;
++    PresentPushConstants pc{};
++    pc.basePtr = frameBaseIsPages ? GSInternal::framePageBaseToBlock(frame.fbp) : frame.fbp;
++    pc.fbw = frame.fbw ? frame.fbw : kHostFrameWidth / 64u;
++    pc.psm = frame.psm;
++    pc.width = width;
++    pc.height = height;
++    pc.originX = sourceOriginX;
++    pc.originY = sourceOriginY;
++    pc.flags = preserveAlpha ? 1u : 0u;
++    pc.wordMask = static_cast<uint32_t>(vk.vramBufferSize / 4u - 1u);
++    pc.byteMask16 = static_cast<uint32_t>(vk.vramBufferSize - 2u);
++
++    vkResetFences(vk.device, 1, &vk.fence);
++    vkResetCommandBuffer(vk.commandBuffer, 0);
++    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (vkBeginCommandBuffer(vk.commandBuffer, &beginInfo) != VK_SUCCESS)
++    {
++        outPixels.clear();
++        return false;
++    }
++    vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipeline);
++    vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 0, nullptr);
++    vkCmdPushConstants(vk.commandBuffer, vk.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
++    vkCmdDispatch(vk.commandBuffer, (kHostFrameWidth * kHostFrameHeight + 63u) / 64u, 1, 1);
++    vkEndCommandBuffer(vk.commandBuffer);
++
++    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &vk.commandBuffer;
++    if (vkQueueSubmit(vk.queue, 1, &submitInfo, vk.fence) != VK_SUCCESS ||
++        vkWaitForFences(vk.device, 1, &vk.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
++    {
++        outPixels.clear();
++        return false;
++    }
++
++    std::memcpy(outPixels.data(), vk.outMapped, outPixels.size());
++    return true;
++}
++
++PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &request)
++{
++    // Mirrors GSCpuBackend::PresentFromLocalMemory, with CopyFrameToHostRgba on the GPU.
++    PresentationFrame result{};
++    const GSPmodeState pmode = decodePmode(request.pmode);
++    const GSSmode2State smode2 = decodeSMode2(request.smode2);
++    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
++    const bool oddField = (request.vsyncTick & 1ull) != 0ull;
++    const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
++    const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
++    const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
++    const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
++    uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
++    decodeDisplaySize(request.display1, width1, height1);
++    decodeDisplaySize(request.display2, width2, height2);
++    const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
++    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
++    if (!valid1 && !valid2)
++        return result;
++
++    auto copySource = [&](const GSFrameReg &displayFrame,
++                          const GSDisplayReadOrigin &origin,
++                          uint32_t width,
++                          uint32_t height,
++                          bool allowPreferred,
++                          bool preserveAlpha,
++                          GSFrameReg &selected,
++                          std::vector<uint8_t> &pixels,
++                          bool &usedPreferred) -> bool
++    {
++        selected = displayFrame;
++        pixels.clear();
++        usedPreferred = false;
++        if (allowPreferred && request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp &&
++            (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp) &&
++            gpuCopyFrame(request.preferredSource, width, height, pixels, preserveAlpha, false, 0u, 0u))
++        {
++            selected = request.preferredSource;
++            usedPreferred = true;
++        }
++        if (pixels.empty() && !gpuCopyFrame(displayFrame, width, height, pixels, preserveAlpha, true, origin.x, origin.y))
++            return false;
++
++        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
++        {
++            for (const GSFrameReg &candidate : request.contextFrames)
++            {
++                if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
++                    continue;
++                std::vector<uint8_t> candidatePixels;
++                if (!gpuCopyFrame(candidate, width, height, candidatePixels, preserveAlpha, true, 0u, 0u))
++                    continue;
++                if (countNonBlackPixels(candidatePixels, width, height) == 0u)
++                    continue;
++                selected = candidate;
++                pixels.swap(candidatePixels);
++                break;
++            }
++        }
++        return true;
++    };
++
++    if (valid1 && valid2)
++    {
++        GSFrameReg selected1{}, selected2{};
++        std::vector<uint8_t> crt1, crt2;
++        bool preferred1 = false, preferred2 = false;
++        if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
++            copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
++        {
++            result.width = std::max(width1, width2);
++            result.height = std::max(height1, height2);
++            result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
++            const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
++            const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
++            const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
++            for (uint32_t y = 0; y < result.height; ++y)
++                for (uint32_t x = 0; x < result.width; ++x)
++                {
++                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
++                    dst[0] = bgR;
++                    dst[1] = bgG;
++                    dst[2] = bgB;
++                    dst[3] = pmode.alp;
++                }
++            if (!pmode.slbg)
++                for (uint32_t y = 0; y < height2; ++y)
++                    std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
++            for (uint32_t y = 0; y < height1; ++y)
++                for (uint32_t x = 0; x < width1; ++x)
++                {
++                    const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
++                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
++                    const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
++                    dst[0] = blendPresentationChannel(src[0], dst[0], factor);
++                    dst[1] = blendPresentationChannel(src[1], dst[1], factor);
++                    dst[2] = blendPresentationChannel(src[2], dst[2], factor);
++                    dst[3] = pmode.amod ? dst[3] : src[3];
++                }
++            normalizePresentationAlpha(result.pixels, result.width, result.height);
++            if (fieldMode)
++                applyFieldPresentation(result.pixels, result.width, result.height, oddField);
++            result.displayFbp = displayFrame1.fbp;
++            result.sourceFbp = selected1.fbp;
++            debugDumpFrame(result);
++            return result;
++        }
++    }
++
++    const GSFrameReg &displayFrame = valid1 ? displayFrame1 : displayFrame2;
++    const GSDisplayReadOrigin &origin = valid1 ? origin1 : origin2;
++    result.width = valid1 ? width1 : width2;
++    result.height = valid1 ? height1 : height2;
++    GSFrameReg selected = displayFrame;
++    if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
++        return {};
++    if (fieldMode)
++        applyFieldPresentation(result.pixels, result.width, result.height, oddField);
++    normalizePresentationAlpha(result.pixels, result.width, result.height);
++    result.displayFbp = displayFrame.fbp;
++    result.sourceFbp = selected.fbp;
++    debugDumpFrame(result);
++    return result;
++}
++
++#else // !PS2X_HAS_VULKAN — no Vulkan in this build: everything stays on the CPU backend.
++
++struct GSVulkanBackend::VkState
++{
++};
++
++bool GSVulkanBackend::initVulkan()
++{
++    std::cerr << "[gs-vulkan] built without Vulkan support, CPU fallback" << std::endl;
++    return false;
++}
++
++void GSVulkanBackend::shutdownVulkan()
++{
++}
++
++bool GSVulkanBackend::gpuCopyFrame(const GSFrameReg &, uint32_t, uint32_t, std::vector<uint8_t> &, bool, bool, uint32_t, uint32_t)
++{
++    return false;
++}
++
++PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &)
++{
++    return {};
++}
++
++#endif // PS2X_HAS_VULKAN
++
++GSVulkanBackend::GSVulkanBackend()
++{
++    m_gpuPresent = std::getenv("PS2X_VK_PRESENT") != nullptr;
++    m_gpuOk = initVulkan();
++    if (!m_gpuOk)
++        shutdownVulkan();
++}
++
++GSVulkanBackend::~GSVulkanBackend()
++{
++    shutdownVulkan();
++}
++
++void GSVulkanBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    if (m_gpuOk && m_vk && m_vk->vramMapped && vramSize <= m_vk->vramBufferSize)
++    {
++        std::memcpy(m_vk->vramMapped, vram, vramSize);
++        m_cpu.Initialize(static_cast<uint8_t *>(m_vk->vramMapped), vramSize);
++    }
++    else
++    {
++        if (m_gpuOk)
++        {
++            std::cerr << "[gs-vulkan] VRAM size mismatch, CPU fallback" << std::endl;
++            m_gpuOk = false;
++        }
++        m_cpu.Initialize(vram, vramSize);
++    }
++}
++
++void GSVulkanBackend::Reset()
++{
++    m_cpu.Reset();
++}
++
++void GSVulkanBackend::Submit(const GSPrimitiveBatch &batch)
++{
++    m_cpu.Submit(batch);
++}
++
++void GSVulkanBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    m_cpu.LoadClut(tex0, texclut);
++}
++
++void GSVulkanBackend::SubmitMany(const GSDrawStep *steps, size_t count)
++{
++    m_cpu.SubmitMany(steps, count);
++}
++
++void GSVulkanBackend::BeginTransfer(const GSTransferCommand &command)
++{
++    m_cpu.BeginTransfer(command);
++}
++
++void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    m_cpu.UploadImage(data, sizeBytes);
++}
++
++void GSVulkanBackend::Flush()
++{
++    m_cpu.Flush();
++}
++
++void GSVulkanBackend::TextureFlush()
++{
++    m_cpu.TextureFlush();
++}
++
++void GSVulkanBackend::Sync(GSSyncReason reason)
++{
++    m_cpu.Sync(reason);
++}
++
++PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
++{
++    if (m_gpuOk && m_gpuPresent)
++    {
++#if defined(PS2X_HAS_VULKAN)
++        // TEMP-DEBUG(mhrs): PS2X_VK_PRESENT_VERIFY=1 runs both paths on the same VRAM
++        // contents and reports pixel differences (deterministic deswizzle A/B).
++        static const bool verify = std::getenv("PS2X_VK_PRESENT_VERIFY") != nullptr;
++        if (verify)
++        {
++            PresentationFrame gpuFrame = presentGpu(request);
++            PresentationFrame cpuFrame = m_cpu.Present(request);
++            static uint64_t checks = 0, mismatches = 0;
++            ++checks;
++            if (gpuFrame.width != cpuFrame.width || gpuFrame.height != cpuFrame.height ||
++                gpuFrame.sourceFbp != cpuFrame.sourceFbp || gpuFrame.usedPreferred != cpuFrame.usedPreferred ||
++                gpuFrame.pixels.size() != cpuFrame.pixels.size() ||
++                (!gpuFrame.pixels.empty() && std::memcmp(gpuFrame.pixels.data(), cpuFrame.pixels.data(), gpuFrame.pixels.size()) != 0))
++            {
++                ++mismatches;
++                uint64_t diffBytes = 0, firstDiff = UINT64_MAX;
++                const size_t n = std::min(gpuFrame.pixels.size(), cpuFrame.pixels.size());
++                for (size_t i = 0; i < n; ++i)
++                    if (gpuFrame.pixels[i] != cpuFrame.pixels[i])
++                    {
++                        ++diffBytes;
++                        if (firstDiff == UINT64_MAX)
++                            firstDiff = i;
++                    }
++                std::cerr << "[gs-vulkan-verify] MISMATCH #" << mismatches << "/" << checks
++                          << " gpu=" << gpuFrame.width << "x" << gpuFrame.height << " src=0x" << std::hex << gpuFrame.sourceFbp
++                          << " pref=" << gpuFrame.usedPreferred << " cpu=" << cpuFrame.width << "x" << cpuFrame.height
++                          << " src=0x" << cpuFrame.sourceFbp << " pref=" << cpuFrame.usedPreferred << std::dec
++                          << " diffBytes=" << diffBytes << " first=" << firstDiff
++                          << " (pixel " << (firstDiff != UINT64_MAX ? firstDiff / 4u : 0u) % 640u << ","
++                          << (firstDiff != UINT64_MAX ? firstDiff / 4u : 0u) / 640u << ")" << std::endl;
++            }
++            else if (checks % 300 == 0)
++            {
++                std::cerr << "[gs-vulkan-verify] " << checks << " presents, all identical so far" << std::endl;
++            }
++            return gpuFrame;
++        }
++#endif
++        return presentGpu(request);
++    }
++    return m_cpu.Present(request);
++}
++
++bool GSVulkanBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    return m_cpu.ClearFramebuffer(context, rgba);
++}
++
++uint32_t GSVulkanBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    return m_cpu.ConsumeLocalToHostBytes(dst, maxBytes);
++}
++
++uint32_t GSVulkanBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    return m_cpu.ReadVram(psm, base, bw, x, y);
++}
++
++void GSVulkanBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    m_cpu.WriteVram(psm, base, bw, x, y, value);
++}
++
++void GSVulkanBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    m_cpu.SnapshotVram(out);
++}
++
++GSTransferSnapshot GSVulkanBackend::GetTransferSnapshot() const
++{
++    return m_cpu.GetTransferSnapshot();
++}
+diff --git a/ps2xRuntime/src/lib/gs/shaders/present_deswizzle.comp b/ps2xRuntime/src/lib/gs/shaders/present_deswizzle.comp
+new file mode 100755
+index 0000000..5d5f34c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/present_deswizzle.comp
+@@ -0,0 +1,125 @@
++#version 450
++
++// Display deswizzle for the Vulkan GS backend: one invocation per output pixel of the
++// 640x512 host frame buffer. Reads a CT32/CT24/CT16/CT16S display source out of swizzled
++// GS VRAM (mirrors GSCpuBackend::CopyFrameToHostRgba with useLocalMemoryLayout=true) and
++// writes packed RGBA8. Pixels outside width/height are zeroed, matching the CPU backend's
++// zero-filled outPixels.
++
++layout(local_size_x = 64) in;
++
++layout(set = 0, binding = 0, std430) readonly buffer Vram
++{
++    uint vram[];
++};
++
++layout(set = 0, binding = 1, std430) writeonly buffer OutPixels
++{
++    uint outPixels[];
++};
++
++layout(push_constant) uniform PushConstants
++{
++    uint basePtr; // display base in 8KB-word blocks (framePageBaseToBlock applied by caller)
++    uint fbw;     // frame buffer width in pages (64 pixels)
++    uint psm;     // 0 = CT32, 1 = CT24, 2 = CT16, 10 = CT16S
++    uint width;
++    uint height;
++    uint originX;
++    uint originY;
++    uint flags;      // bit0: preserveAlpha
++    uint wordMask;   // vram word count - 1
++    uint byteMask16; // vram byte count - 2 (CT16 wrap)
++} pc;
++
++const uint HOST_W = 640u;
++const uint HOST_H = 512u;
++
++// CT32 page: 64x32 pixels, 8x4 blocks, 8x8 column per block (matches BlockTableC32/ColumnTable32).
++const uint BlockTableC32[32] = uint[](
++    0u, 1u, 4u, 5u, 16u, 17u, 20u, 21u,
++    2u, 3u, 6u, 7u, 18u, 19u, 22u, 23u,
++    8u, 9u, 12u, 13u, 24u, 25u, 28u, 29u,
++    10u, 11u, 14u, 15u, 26u, 27u, 30u, 31u);
++
++const uint ColumnTable32[64] = uint[](
++    0u, 1u, 4u, 5u, 8u, 9u, 12u, 13u,
++    2u, 3u, 6u, 7u, 10u, 11u, 14u, 15u,
++    16u, 17u, 20u, 21u, 24u, 25u, 28u, 29u,
++    18u, 19u, 22u, 23u, 26u, 27u, 30u, 31u,
++    32u, 33u, 36u, 37u, 40u, 41u, 44u, 45u,
++    34u, 35u, 38u, 39u, 42u, 43u, 46u, 47u,
++    48u, 49u, 52u, 53u, 56u, 57u, 60u, 61u,
++    50u, 51u, 54u, 55u, 58u, 59u, 62u, 63u);
++
++// CT16 page: 64x64 pixels, 4x8 blocks, 16x8 column per block (matches BlockTableC16/ColumnTable16).
++const uint BlockTableC16[32] = uint[](
++    0u, 2u, 8u, 10u,
++    1u, 3u, 9u, 11u,
++    4u, 6u, 12u, 14u,
++    5u, 7u, 13u, 15u,
++    16u, 18u, 24u, 26u,
++    17u, 19u, 25u, 27u,
++    20u, 22u, 28u, 30u,
++    21u, 23u, 29u, 31u);
++
++const uint ColumnTable16[128] = uint[](
++    0u, 2u, 8u, 10u, 16u, 18u, 24u, 26u, 1u, 3u, 9u, 11u, 17u, 19u, 25u, 27u,
++    4u, 6u, 12u, 14u, 20u, 22u, 28u, 30u, 5u, 7u, 13u, 15u, 21u, 23u, 29u, 31u,
++    32u, 34u, 40u, 42u, 48u, 50u, 56u, 58u, 33u, 35u, 41u, 43u, 49u, 51u, 57u, 59u,
++    36u, 38u, 44u, 46u, 52u, 54u, 60u, 62u, 37u, 39u, 45u, 47u, 53u, 55u, 61u, 63u,
++    64u, 66u, 72u, 74u, 80u, 82u, 88u, 90u, 65u, 67u, 73u, 75u, 81u, 83u, 89u, 91u,
++    68u, 70u, 76u, 78u, 84u, 86u, 92u, 94u, 69u, 71u, 77u, 79u, 85u, 87u, 93u, 95u,
++    96u, 98u, 104u, 106u, 112u, 114u, 120u, 122u, 97u, 99u, 105u, 107u, 113u, 115u, 121u, 123u,
++    100u, 102u, 108u, 110u, 116u, 118u, 124u, 126u, 101u, 103u, 109u, 111u, 117u, 119u, 125u, 127u);
++
++void main()
++{
++    const uint gid = gl_GlobalInvocationID.x;
++    if (gid >= HOST_W * HOST_H)
++        return;
++
++    const uint x = gid % HOST_W;
++    const uint y = gid / HOST_W;
++
++    uint rgba = 0u;
++    if (x < pc.width && y < pc.height)
++    {
++        const uint sx = pc.originX + x;
++        const uint sy = pc.originY + y;
++        const uint basePage = pc.basePtr >> 5u;
++        const uint baseBlock = pc.basePtr & 31u;
++        const bool preserveAlpha = (pc.flags & 1u) != 0u;
++
++        if (pc.psm == 0u || pc.psm == 1u) // CT32 / CT24
++        {
++            const uint page = basePage + (sy >> 5u) * pc.fbw + (sx >> 6u);
++            const uint block = BlockTableC32[((sy >> 3u) & 3u) * 8u + ((sx >> 3u) & 7u)];
++            const uint column = ColumnTable32[(sy & 7u) * 8u + (sx & 7u)];
++            const uint pixel = page * 2048u + (baseBlock + block) * 64u + column;
++            const uint word = vram[pixel & pc.wordMask];
++            const uint alpha = (preserveAlpha && pc.psm == 0u) ? (word >> 24u) : 255u;
++            rgba = (word & 0x00FFFFFFu) | (alpha << 24u);
++        }
++        else // CT16 / CT16S
++        {
++            const uint page = basePage + (sy >> 6u) * pc.fbw + (sx >> 6u);
++            const uint block = BlockTableC16[((sy >> 3u) & 7u) * 4u + ((sx >> 4u) & 3u)];
++            const uint column = ColumnTable16[(sy & 7u) * 16u + (sx & 15u)];
++            const uint pixel = page * 4096u + (baseBlock + block) * 128u + column;
++            const uint byteAddr = (pixel * 2u) & pc.byteMask16;
++            const uint word = vram[byteAddr >> 2u];
++            const uint c16 = (word >> ((byteAddr & 2u) * 8u)) & 0xFFFFu;
++            const uint r5 = c16 & 31u;
++            const uint g5 = (c16 >> 5u) & 31u;
++            const uint b5 = (c16 >> 10u) & 31u;
++            const uint r = (r5 << 3u) | (r5 >> 2u);
++            const uint g = (g5 << 3u) | (g5 >> 2u);
++            const uint b = (b5 << 3u) | (b5 >> 2u);
++            const uint alpha = preserveAlpha ? (((c16 & 0x8000u) != 0u) ? 0x80u : 0u) : 255u;
++            rgba = r | (g << 8u) | (b << 16u) | (alpha << 24u);
++        }
++    }
++
++    outPixels[gid] = rgba;
++}
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index a774e13..8f9af66 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -2,6 +2,7 @@
+ #include "games_database.h"
+ #include "runtime/gs/gs_async_backend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/gs_vulkan_backend.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+ #endif
+@@ -224,8 +225,15 @@ int main(int argc, char *argv[])
+ 
+         // Rasterise on a worker thread so drawing overlaps the EE/VU1 work that produces it.
+         // PS2X_GS_SYNC=1 keeps it on the calling thread (for A/B checks).
++        // PS2X_GS_BACKEND=vulkan selects the Vulkan backend (CPU fallback when unavailable).
+         if (!std::getenv("PS2X_GS_SYNC"))
+-            runtime.gs().setRasterBackend(std::make_unique<GSAsyncBackend>(std::make_unique<GSCpuBackend>()));
++        {
++            const char *gsBackend = std::getenv("PS2X_GS_BACKEND");
++            if (gsBackend && std::string(gsBackend) == "vulkan")
++                runtime.gs().setRasterBackend(std::make_unique<GSAsyncBackend>(std::make_unique<GSVulkanBackend>()));
++            else
++                runtime.gs().setRasterBackend(std::make_unique<GSAsyncBackend>(std::make_unique<GSCpuBackend>()));
++        }
+ 
+         if (!runtime.loadELF(filePathStr))
+         {
