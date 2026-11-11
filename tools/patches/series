@@ -42,3 +42,7 @@ ps2recomp-gs-packet-pool.patch
 ps2recomp-gs-upload-runs.patch
 ps2recomp-gs-async-draw-ranges.patch
 ps2recomp-sio2-dualshock.patch
+ps2recomp-gs-trace-debug-tools.patch
+ps2recomp-gs-mipless-filter.patch
+ps2recomp-vu1-lean-gen-elide-revert.patch
+ps2recomp-vu1-lean-gen-link-stubs.patch

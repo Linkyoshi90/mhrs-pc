@@ -1,0 +1,31 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 1c6a291..99547b0 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -470,7 +470,9 @@ else()
+ endif()
+ 
+ # Compiles dumped VU1 microcode into lean programs (ps2_vu1_lean.h) for the runner: see tools/vu1_lean_gen.cpp.
+-add_executable(ps2x_vu1_lean_gen tools/vu1_lean_gen.cpp)
++# The stubs provide the recompiled-function table symbols ps2_runtime expects, which only
++# exist in generated runner code; the generator itself never looks up EE functions.
++add_executable(ps2x_vu1_lean_gen tools/vu1_lean_gen.cpp tools/vu1_lean_gen_stubs.cpp)
+ target_link_libraries(ps2x_vu1_lean_gen PRIVATE ps2_runtime)
+ 
+ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+diff --git a/ps2xRuntime/tools/vu1_lean_gen_stubs.cpp b/ps2xRuntime/tools/vu1_lean_gen_stubs.cpp
+new file mode 100644
+index 0000000..0034a74
+--- /dev/null
++++ b/ps2xRuntime/tools/vu1_lean_gen_stubs.cpp
+@@ -0,0 +1,10 @@
++// Link stubs for ps2x_vu1_lean_gen: ps2_runtime references the recompiled-function
++// table that only exists in generated runner code (ps2xRuntime/src/runner/, produced
++// per game by ps2_recomp). The lean VU1 generator never looks up recompiled EE
++// functions, so empty tables are enough to link standalone.
++#include "ps2_runtime.h"
++
++extern const uint32_t g_ps2RecompiledFunctionTableBase = 0u;
++extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0u;
++extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = 0u;
++PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[1] = {};

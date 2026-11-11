@@ -1,0 +1,79 @@
+diff --git a/ps2xRuntime/tools/vu1_lean_gen.cpp b/ps2xRuntime/tools/vu1_lean_gen.cpp
+index f324fdb..89b872d 100644
+--- a/ps2xRuntime/tools/vu1_lean_gen.cpp
++++ b/ps2xRuntime/tools/vu1_lean_gen.cpp
+@@ -100,8 +100,6 @@ namespace
+         uint8_t saveUpper = 0, saveLower = 0;
+         bool viPending = false, saveVi = false;
+         bool store = false, kick = false, branch = false;
+-        bool fmacFlags = false, readsFlags = false; // queues a MAC/status entry; reads MAC or status
+-        bool elide = false;                        // its entry is never observed: only its sticky bits count
+         Timing before{};           // kick: the timing state at from, for leaving there
+         uint32_t settle = 0;       // kick: from this cycle on (relative) a wait has landed everything in flight
+         int settled = -1;          // kick: the node at this pc after such a wait
+@@ -238,8 +236,6 @@ namespace
+             code_.upper = upper;
+             code_.from = fromRel;
+             code_.store = L::storesVuData(pair);
+-            code_.fmacFlags = L::queuesMacFlags(pair);
+-            code_.readsFlags = L::readsMacFlags(pair);
+             code_.kick = L::isXgkick(pair);
+             code_.branch = op != 0u;
+             if (code_.kick)
+@@ -338,37 +334,6 @@ namespace
+                 }
+             }
+         }
+-        // MAC/status entries nothing observes: at each point that can (a MAC/status read at its issue, an XGKICK at
+-        // from: it may leave or wait, the node exit), keep the entries still in flight and the latest landed one.
+-        {
+-            std::vector<uint32_t> points;
+-            for (const PairCode &p : node.pairs)
+-            {
+-                if (p.readsFlags)
+-                    points.push_back(p.issue);
+-                if (p.kick)
+-                    points.push_back(p.from);
+-            }
+-            points.push_back(node.exit.rel);
+-            for (PairCode &p : node.pairs)
+-                p.elide = p.fmacFlags;
+-            for (uint32_t t : points)
+-            {
+-                int latest = -1;
+-                for (size_t i = 0; i < node.pairs.size(); ++i)
+-                {
+-                    PairCode &p = node.pairs[i];
+-                    if (!p.fmacFlags || p.issue > t)
+-                        continue;
+-                    if (p.issue + L::kFlagLatency > t)
+-                        p.elide = false; // in flight
+-                    else if (latest < 0 || p.issue >= node.pairs[latest].issue)
+-                        latest = static_cast<int>(i);
+-                }
+-                if (latest >= 0)
+-                    node.pairs[latest].elide = false;
+-            }
+-        }
+         // Place the landed Q/P results: before the first pair issuing at or after them, else at the exit.
+         std::sort(landed.begin(), landed.end());
+         landed.erase(std::unique(landed.begin(), landed.end()), landed.end());
+@@ -466,9 +431,6 @@ namespace
+ 
+     void emitProgram(std::ostream &os, const Program &program, size_t index)
+     {
+-        bool fsset = false;
+-        for (const auto &[pc, words] : program.covered)
+-            fsset |= L::isFsset(L::decode(words.first, words.second));
+         os << "namespace p" << index << "\n{\n";
+         for (size_t n = 0; n < program.nodes.size(); ++n)
+             os << "int n" << n << "(VU &vu, uint64_t base, uint64_t budgetEnd);\n";
+@@ -511,7 +473,7 @@ namespace
+                     os << "    vu.state().pc = " << hex(p.pc) << ";\n";
+                 os << "    L::pair<" << hex(p.lower) << ", " << hex(p.upper) << ", " << unsigned(p.saveUpper) << ", "
+                    << unsigned(p.saveLower) << ", " << (p.viPending ? "true" : "false") << ", " << (p.saveVi ? "true" : "false")
+-                   << (p.elide && !fsset ? ", true" : "") << ">(vu);\n";
++                   << ">(vu);\n";
+                 if (p.branch)
+                     os << "    const bool taken = L::taken(vu);\n    const uint32_t target = L::target(vu);\n    (void)taken, (void)target;\n";
+             }
