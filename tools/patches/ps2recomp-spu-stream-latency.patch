@@ -1,0 +1,80 @@
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -329,10 +329,11 @@ void PS2AudioBackend::stopAll()
+ 
+ // ---- SNDDRV software-mixed PCM stream (SPU2 core0 DMA tap) -------------------
+ // The game mixes everything in IOP RAM and DMAs 2048-byte blocks (512 stereo frames at
+-// 48 kHz, laid out [L x256][R x256][L x256][R x256]) toward SPU2 core0. The runtime's
+-// instant DMA completion makes it re-send the current block until the next mix tick, so
+-// only fresh blocks advance the stream. SPSC lock-free ring: producer = IOP thread
+-// (onSpuStreamBlock), consumer = the miniaudio callback thread.
++// 48 kHz, laid out [L x256][R x256][L x256][R x256]) toward SPU2 core0, cycling through a few
++// buffers. The runtime's instant DMA completion makes it re-send each buffer until the next mix
++// tick, so only a buffer whose content changed since it was last sent advances the stream.
++// SPSC lock-free ring: producer = IOP thread (onSpuStreamBlock), consumer = the miniaudio
++// callback thread.
+ #include <algorithm>
+ #include <array>
+ #include <cstdio>
+@@ -342,6 +343,10 @@ namespace
+ {
+     constexpr uint32_t kSpuStreamRate = 48000u;
+     constexpr uint32_t kSpuRingFrames = 1u << 15u; // ~0.68 s of stereo
++    // Most audio queued ahead of playback (~85 ms): when the mixer runs ahead of real time, newer blocks are
++    // dropped instead of letting the ring fill, which kept everything ~0.7 s late.
++    constexpr uint32_t kSpuMaxQueuedFrames = 4096u;
++    constexpr size_t kSpuSourceBuffers = 4u;
+ 
+     struct SpuStreamState
+     {
+@@ -350,8 +355,9 @@ namespace
+         std::array<int16_t, kSpuRingFrames * 2u> pcm{};
+         AudioStream stream{};
+         bool live = false;
+-        std::vector<uint8_t> lastBlock;
+-        bool hasLast = false;
++        // What each source buffer (DMA address) last sent.
++        std::array<std::pair<uint32_t, std::vector<uint8_t>>, kSpuSourceBuffers> lastByMadr{};
++        size_t sources = 0;
+     };
+     SpuStreamState g_spuStream;
+ 
+@@ -393,20 +399,30 @@ void PS2AudioBackend::startSpuStream()
+ 
+ void PS2AudioBackend::onSpuStreamBlock(uint32_t madr, const uint8_t *data, uint32_t sizeBytes)
+ {
+-    (void)madr;
+     if (!g_spuStream.live || !data || sizeBytes != 2048u)
+         return;
+ 
+-    if (g_spuStream.hasLast && std::memcmp(g_spuStream.lastBlock.data(), data, sizeBytes) == 0)
+-        return;
+-    g_spuStream.lastBlock.assign(data, data + sizeBytes);
+-    g_spuStream.hasLast = true;
++    auto &sources = g_spuStream.lastByMadr;
++    auto *last = std::find_if(sources.begin(), sources.begin() + g_spuStream.sources,
++                              [madr](const auto &entry) { return entry.first == madr; });
++    if (last == sources.begin() + g_spuStream.sources)
++    {
++        if (g_spuStream.sources == kSpuSourceBuffers)
++            last = sources.begin(); // more buffers than expected: reuse a slot (a resend may then pass once)
++        else
++            ++g_spuStream.sources;
++        last->first = madr;
++        last->second.clear();
++    }
++    if (last->second.size() == sizeBytes && std::memcmp(last->second.data(), data, sizeBytes) == 0)
++        return; // a resend: this buffer has not been mixed again yet
++    last->second.assign(data, data + sizeBytes);
+ 
+     const int16_t *in = reinterpret_cast<const int16_t *>(data);
+     uint32_t head = g_spuStream.head.load(std::memory_order_relaxed);
+     const uint32_t tail = g_spuStream.tail.load(std::memory_order_acquire);
+-    if (head - tail + 512u > kSpuRingFrames)
+-        return; // emulation outran playback: drop the block rather than overwrite unread audio
++    if (head - tail + 512u > kSpuMaxQueuedFrames)
++        return; // the mixer ran ahead of playback: drop the block to keep latency low
+     for (uint32_t half = 0u; half < 2u; ++half)
+     {
+         for (uint32_t i = 0; i < 256u; ++i)

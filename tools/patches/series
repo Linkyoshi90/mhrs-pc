@@ -56,3 +56,4 @@ ps2recomp-windows-msvc-port.patch
 ps2recomp-gs-vulkan-cached-vram.patch
 ps2recomp-mingw-cross-build.patch
 ps2recomp-ee-checkpoint-entry-unwind.patch
+ps2recomp-spu-stream-latency.patch
