@@ -52,3 +52,4 @@ ps2recomp-gs-vulkan-sprite-raster.patch
 ps2recomp-gs-vulkan-triangle-raster.patch
 ps2recomp-gs-vulkan-batching.patch
 ps2recomp-present-options.patch
+ps2recomp-windows-msvc-port.patch
