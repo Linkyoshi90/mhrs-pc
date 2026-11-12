@@ -1,0 +1,421 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+index 8ab3363..abf0411 100755
+--- a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+@@ -52,7 +52,8 @@ private:
+     GSCpuBackend m_cpu;
+     // Serializes all GPU use: raster dispatches run on the GS worker thread while Present
+     // runs on the calling thread; both share one command buffer, fence and VRAM buffer.
+-    std::mutex m_gpuMutex;
++    // mutable so const readback methods (ReadVram/SnapshotVram) can flush pending work.
++    mutable std::mutex m_gpuMutex;
+     bool m_gpuOk = false;
+     bool m_gpuPresent = false;
+     bool m_gpuRaster = false;
+@@ -76,6 +77,18 @@ private:
+                            uint32_t groupsX,
+                            uint32_t groupsY,
+                            const char *tag);
++    // Raster batching: dispatches are recorded into one command buffer and only
++    // submitted (+waited) at flush points — Present/Sync/readbacks, CPU fallback
++    // draws, VRAM/CLUT uploads, or when the params ring fills. flushRasterBatch
++    // takes m_gpuMutex; the *Locked variants require it to be held already.
++    // recordRasterDispatchLocked returns the params-slot byte offset used.
++    uint32_t recordRasterDispatchLocked(bool useTrianglePipeline,
++                                        const void *params,
++                                        size_t paramsSize,
++                                        uint32_t groupsX,
++                                        uint32_t groupsY);
++    void flushRasterBatch() const;
++    void flushRasterBatchLocked() const;
+     // Mirrors GSCpuBackend::CopyFrameToHostRgba(useLocalMemoryLayout=true) on the GPU.
+     bool gpuCopyFrame(const GSFrameReg &frame,
+                       uint32_t width,
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index 8eb3203..a4e1cec 100755
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -213,6 +213,12 @@ struct GSVulkanBackend::VkState
+     VkCommandPool commandPool = VK_NULL_HANDLE;
+     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+     VkFence fence = VK_NULL_HANDLE;
++
++    // Raster batching state: dispatches are recorded until a flush point.
++    static constexpr uint32_t kParamsSlotCount = 2048;
++    static constexpr uint32_t kParamsSlotStride = 1024; // >= sizeof(SpriteParams), >= minStorageBufferOffsetAlignment
++    uint32_t batchCount = 0;   // dispatches recorded in the currently open batch
++    bool batchOpen = false;
+ };
+ 
+ namespace
+@@ -364,11 +370,21 @@ bool GSVulkanBackend::initVulkan()
+         std::cerr << "[gs-vulkan] output buffer allocation failed, CPU fallback" << std::endl;
+         return false;
+     }
+-    // CLUT widened to uint (512 entries) and per-primitive raster params.
++    // CLUT widened to uint (512 entries) and per-primitive raster params: a ring of
++    // slots bound via a dynamic-offset descriptor, so a batch of dispatches records
++    // without any per-primitive submit.
++    VkPhysicalDeviceProperties devProps{};
++    vkGetPhysicalDeviceProperties(vk.phys, &devProps);
++    if (devProps.limits.minStorageBufferOffsetAlignment > VkState::kParamsSlotStride)
++    {
++        std::cerr << "[gs-vulkan] storage offset alignment too large, raster on CPU" << std::endl;
++        return false;
++    }
+     if (!createMappedBuffer(vk.device, vk.phys, 512u * 4u,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                             vk.clutBuffer, vk.clutMemory, vk.clutMapped) ||
+-        !createMappedBuffer(vk.device, vk.phys, 1024u,
++        !createMappedBuffer(vk.device, vk.phys,
++                            VkState::kParamsSlotCount * VkState::kParamsSlotStride,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                             vk.paramsBuffer, vk.paramsMemory, vk.paramsMapped))
+     {
+@@ -376,13 +392,14 @@ bool GSVulkanBackend::initVulkan()
+         return false;
+     }
+ 
+-    // Bindings: 0 = VRAM, 1 = present output, 2 = CLUT, 3 = raster params.
++    // Bindings: 0 = VRAM, 1 = present output, 2 = CLUT, 3 = raster params (dynamic offset).
+     // Shaders use subsets of these; the layout and set are shared.
+     VkDescriptorSetLayoutBinding bindings[4]{};
+     for (uint32_t i = 0; i < 4; ++i)
+     {
+         bindings[i].binding = i;
+-        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        bindings[i].descriptorType = (i == 3) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
++                                              : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+         bindings[i].descriptorCount = 1;
+         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+     }
+@@ -392,11 +409,12 @@ bool GSVulkanBackend::initVulkan()
+     if (vkCreateDescriptorSetLayout(vk.device, &layoutInfo, nullptr, &vk.descriptorLayout) != VK_SUCCESS)
+         return false;
+ 
+-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
++    VkDescriptorPoolSize poolSizes[2]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3},
++                                      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1}};
+     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+     poolInfo.maxSets = 1;
+-    poolInfo.poolSizeCount = 1;
+-    poolInfo.pPoolSizes = &poolSize;
++    poolInfo.poolSizeCount = 2;
++    poolInfo.pPoolSizes = poolSizes;
+     if (vkCreateDescriptorPool(vk.device, &poolInfo, nullptr, &vk.descriptorPool) != VK_SUCCESS)
+         return false;
+ 
+@@ -418,7 +436,8 @@ bool GSVulkanBackend::initVulkan()
+         writes[i].dstSet = vk.descriptorSet;
+         writes[i].dstBinding = i;
+         writes[i].descriptorCount = 1;
+-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        writes[i].descriptorType = (i == 3) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
++                                            : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+     }
+     writes[0].pBufferInfo = &vramDesc;
+     writes[1].pBufferInfo = &outDesc;
+@@ -609,7 +628,8 @@ bool GSVulkanBackend::gpuCopyFrame(const GSFrameReg &frame,
+         return false;
+     }
+     vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipeline);
+-    vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 0, nullptr);
++    const uint32_t dynamicOffset = 0; // present never touches binding 3, but the set has one dynamic slot
++    vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 1, &dynamicOffset);
+     vkCmdPushConstants(vk.commandBuffer, vk.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+     vkCmdDispatch(vk.commandBuffer, (kHostFrameWidth * kHostFrameHeight + 63u) / 64u, 1, 1);
+     vkEndCommandBuffer(vk.commandBuffer);
+@@ -865,6 +885,7 @@ namespace
+ 
+ void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
+ {
++    static_assert(sizeof(SpriteParams) <= VkState::kParamsSlotStride, "params ring slot too small");
+     const GSDrawState &state = batch.state;
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+@@ -1061,6 +1082,78 @@ void GSVulkanBackend::submitTriangleGpu(const GSPrimitiveBatch &batch)
+                       "triangle");
+ }
+ 
++void GSVulkanBackend::flushRasterBatchLocked() const
++{
++    VkState &vk = *m_vk;
++    if (!vk.batchOpen)
++        return;
++    // Mirror the current CLUT (widened u16 -> u32) for the indexed fetch path. Flush
++    // points precede every LoadClut, so one mirror per batch sees the right palette.
++    uint32_t *clutDst = static_cast<uint32_t *>(vk.clutMapped);
++    const auto &clut = m_cpu.clutEntries();
++    for (size_t i = 0; i < clut.size(); ++i)
++        clutDst[i] = clut[i];
++
++    vkEndCommandBuffer(vk.commandBuffer);
++    vkResetFences(vk.device, 1, &vk.fence);
++    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    si.commandBufferCount = 1;
++    si.pCommandBuffers = &vk.commandBuffer;
++    if (vkQueueSubmit(vk.queue, 1, &si, vk.fence) != VK_SUCCESS ||
++        vkWaitForFences(vk.device, 1, &vk.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
++        std::cerr << "[gs-vulkan] raster batch submit/wait failed" << std::endl;
++    vk.batchOpen = false;
++    vk.batchCount = 0;
++}
++
++void GSVulkanBackend::flushRasterBatch() const
++{
++    if (!m_gpuOk || !m_vk)
++        return;
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    flushRasterBatchLocked();
++}
++
++uint32_t GSVulkanBackend::recordRasterDispatchLocked(bool useTrianglePipeline,
++                                                     const void *params,
++                                                     size_t paramsSize,
++                                                     uint32_t groupsX,
++                                                     uint32_t groupsY)
++{
++    VkState &vk = *m_vk;
++    if (!vk.batchOpen)
++    {
++        vkResetCommandBuffer(vk.commandBuffer, 0);
++        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        if (vkBeginCommandBuffer(vk.commandBuffer, &bi) != VK_SUCCESS)
++            return UINT32_MAX;
++        vk.batchOpen = true;
++        vk.batchCount = 0;
++    }
++    if (vk.batchCount >= VkState::kParamsSlotCount)
++    {
++        flushRasterBatchLocked();
++        return recordRasterDispatchLocked(useTrianglePipeline, params, paramsSize, groupsX, groupsY);
++    }
++    const uint32_t slotOffset = vk.batchCount * VkState::kParamsSlotStride;
++    std::memcpy(static_cast<uint8_t *>(vk.paramsMapped) + slotOffset, params, paramsSize);
++    vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
++                      useTrianglePipeline ? vk.trianglePipeline : vk.rasterPipeline);
++    vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout,
++                            0, 1, &vk.descriptorSet, 1, &slotOffset);
++    vkCmdDispatch(vk.commandBuffer, groupsX, groupsY, 1);
++    // Serialize against the next dispatch: z-test/blending/texture-fetch read VRAM
++    // written by earlier primitives in the same batch.
++    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++    vkCmdPipelineBarrier(vk.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
++    ++vk.batchCount;
++    return slotOffset;
++}
++
+ void GSVulkanBackend::runRasterDispatch(const GSPrimitiveBatch &batch,
+                                         bool useTrianglePipeline,
+                                         const void *params,
+@@ -1072,12 +1165,30 @@ void GSVulkanBackend::runRasterDispatch(const GSPrimitiveBatch &batch,
+     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+     VkState &vk = *m_vk;
+ 
+-    // Mirror the current CLUT (widened u16 -> u32) for the indexed fetch path.
+-    uint32_t *clutDst = static_cast<uint32_t *>(vk.clutMapped);
+-    const auto &clut = m_cpu.clutEntries();
+-    for (size_t i = 0; i < clut.size(); ++i)
+-        clutDst[i] = clut[i];
++    static uint64_t dbgDispatchIndex = 0;
++    const uint64_t thisDispatch = dbgDispatchIndex++;
++
++    // Triangle debug writeback (PS2X_TRI_DEBUG) forces the immediate path so the
++    // shader's per-pixel writeback is readable right after the dispatch.
++    static const bool triDebug = []()
++    {
++        const char *env = std::getenv("PS2X_TRI_DEBUG");
++        return env != nullptr && *env != '\0';
++    }();
+ 
++    // Fast path: record into the open batch; submitted at the next flush point.
++    if (!m_rasterVerify && !(useTrianglePipeline && triDebug))
++    {
++        if (recordRasterDispatchLocked(useTrianglePipeline, params, paramsSize, groupsX, groupsY) == UINT32_MAX)
++        {
++            flushRasterBatchLocked();
++            m_cpu.Submit(batch);
++        }
++        return;
++    }
++
++    // Verify/debug path: run this one dispatch immediately (submit + wait).
++    flushRasterBatchLocked(); // drain anything pending first
+     std::vector<uint8_t> before;
+     if (m_rasterVerify)
+     {
+@@ -1085,46 +1196,33 @@ void GSVulkanBackend::runRasterDispatch(const GSPrimitiveBatch &batch,
+         std::memcpy(before.data(), vk.vramMapped, before.size());
+     }
+ 
+-    std::memcpy(vk.paramsMapped, params, paramsSize);
+-
+-    // Re-record + submit + wait (used for the first dispatch and for the
+-    // dev-only nondeterminism probe below).
++    // Re-run of this single dispatch (also used by the dev-only nondeterminism
++    // probe below): record into a fresh batch and flush it.
+     auto recordSubmitWait = [&]() -> bool
+     {
+-        vkResetFences(vk.device, 1, &vk.fence);
+-        vkResetCommandBuffer(vk.commandBuffer, 0);
+-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+-        if (vkBeginCommandBuffer(vk.commandBuffer, &bi) != VK_SUCCESS)
++        if (recordRasterDispatchLocked(useTrianglePipeline, params, paramsSize, groupsX, groupsY) == UINT32_MAX)
+             return false;
+-        vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+-                          useTrianglePipeline ? vk.trianglePipeline : vk.rasterPipeline);
+-        vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 0, nullptr);
+-        vkCmdDispatch(vk.commandBuffer, groupsX, groupsY, 1);
+-        vkEndCommandBuffer(vk.commandBuffer);
+-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+-        si.commandBufferCount = 1;
+-        si.pCommandBuffers = &vk.commandBuffer;
+-        return vkQueueSubmit(vk.queue, 1, &si, vk.fence) == VK_SUCCESS &&
+-               vkWaitForFences(vk.device, 1, &vk.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
++        flushRasterBatchLocked();
++        return true; // flush logs submit/wait failures itself
+     };
+ 
+-    if (!recordSubmitWait())
++    const uint32_t slotOffset = recordRasterDispatchLocked(useTrianglePipeline, params, paramsSize, groupsX, groupsY);
++    if (slotOffset == UINT32_MAX)
+     {
+         std::cerr << "[gs-vulkan] " << tag << " dispatch failed, CPU fallback for this primitive" << std::endl;
+         m_cpu.Submit(batch);
+         return;
+     }
++    flushRasterBatchLocked();
+ 
+     // TRI_DEBUG (dev-only): print the shader's per-pixel writeback.
+-    static uint64_t dbgDispatchIndex = 0;
+-    const uint64_t thisDispatch = dbgDispatchIndex++;
+     if (useTrianglePipeline)
+     {
+         const SpriteParams &dp = *static_cast<const SpriteParams *>(params);
+         if (dp.drawX0 == 1)
+         {
+-            const SpriteParams &sp = *static_cast<const SpriteParams *>(vk.paramsMapped);
++            const SpriteParams &sp = *reinterpret_cast<const SpriteParams *>(
++                static_cast<const uint8_t *>(vk.paramsMapped) + slotOffset);
+             std::cerr << "[gpu-tri] d=" << thisDispatch
+                       << " px=(" << dp.unclippedX0 << "," << dp.unclippedY0 << ")"
+                       << std::hexfloat
+@@ -1293,6 +1391,19 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &)
+     return {};
+ }
+ 
++uint32_t GSVulkanBackend::recordRasterDispatchLocked(bool, const void *, size_t, uint32_t, uint32_t)
++{
++    return 0;
++}
++
++void GSVulkanBackend::flushRasterBatchLocked() const
++{
++}
++
++void GSVulkanBackend::flushRasterBatch() const
++{
++}
++
+ #endif // PS2X_HAS_VULKAN
+ 
+ GSVulkanBackend::GSVulkanBackend()
+@@ -1351,11 +1462,13 @@ void GSVulkanBackend::Submit(const GSPrimitiveBatch &batch)
+             return;
+         }
+     }
++    flushRasterBatch(); // CPU fallback draws must see all pending GPU work first
+     m_cpu.Submit(batch);
+ }
+ 
+ void GSVulkanBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
++    flushRasterBatch(); // batched dispatches mirror the CLUT at flush time
+     m_cpu.LoadClut(tex0, texclut);
+ }
+ 
+@@ -1372,6 +1485,7 @@ void GSVulkanBackend::SubmitMany(const GSDrawStep *steps, size_t count)
+     {
+         if (!steps[i].draw)
+         {
++            flushRasterBatch(); // LoadClut must not change the CLUT under a pending batch
+             m_cpu.LoadClut(steps[i].tex0, steps[i].texclut);
+             continue;
+         }
+@@ -1381,7 +1495,10 @@ void GSVulkanBackend::SubmitMany(const GSDrawStep *steps, size_t count)
+         else if (m_gpuTriangles && batch.vertexCount == 3 && batch.state.prim.type == GS_PRIM_TRIANGLE)
+             submitTriangleGpu(batch);
+         else
++        {
++            flushRasterBatch();
+             m_cpu.Submit(batch);
++        }
+     }
+ }
+ 
+@@ -1392,11 +1509,13 @@ void GSVulkanBackend::BeginTransfer(const GSTransferCommand &command)
+ 
+ void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
++    flushRasterBatch(); // the upload must not overwrite VRAM pending GPU draws still sample
+     m_cpu.UploadImage(data, sizeBytes);
+ }
+ 
+ void GSVulkanBackend::Flush()
+ {
++    flushRasterBatch();
+     m_cpu.Flush();
+ }
+ 
+@@ -1407,12 +1526,14 @@ void GSVulkanBackend::TextureFlush()
+ 
+ void GSVulkanBackend::Sync(GSSyncReason reason)
+ {
++    flushRasterBatch();
+     m_cpu.Sync(reason);
+ }
+ 
+ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
+ {
+     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    flushRasterBatchLocked();
+     if (m_gpuOk && m_gpuPresent)
+     {
+ #if defined(PS2X_HAS_VULKAN)
+@@ -1462,26 +1583,31 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
+ 
+ bool GSVulkanBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
++    flushRasterBatch();
+     return m_cpu.ClearFramebuffer(context, rgba);
+ }
+ 
+ uint32_t GSVulkanBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    flushRasterBatch();
+     return m_cpu.ConsumeLocalToHostBytes(dst, maxBytes);
+ }
+ 
+ uint32_t GSVulkanBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
++    flushRasterBatch();
+     return m_cpu.ReadVram(psm, base, bw, x, y);
+ }
+ 
+ void GSVulkanBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
++    flushRasterBatch(); // keep program order between pending GPU draws and host writes
+     m_cpu.WriteVram(psm, base, bw, x, y, value);
+ }
+ 
+ void GSVulkanBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
++    flushRasterBatch();
+     m_cpu.SnapshotVram(out);
+ }
+ 
