@@ -1,0 +1,77 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1247b41..35259ae 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include <cstdlib>
++#include <cstring>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -873,7 +874,18 @@ bool PS2Runtime::initialize(const char *title)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++        // MHRS_WINDOW=WxH overrides the initial window size (e.g. MHRS_WINDOW=1920x1080).
++        int winW = HOST_WINDOW_WIDTH, winH = HOST_WINDOW_HEIGHT;
++        if (const char *env = std::getenv("MHRS_WINDOW"))
++        {
++            int w = 0, h = 0;
++            if (std::sscanf(env, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240)
++            {
++                winW = w;
++                winH = h;
++            }
++        }
++        InitWindow(winW, winH, title);
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+         m_audioBackend.startSpuStream();
+@@ -2595,6 +2607,21 @@ void PS2Runtime::run()
+     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+     Texture2D frameTex = LoadTextureFromImage(blank);
+     UnloadImage(blank);
++    // MHRS_FILTER=point keeps crisp pixels; default is bilinear smoothing when the
++    // window is larger than the native frame.
++    {
++        static const bool pointFilter = []()
++        {
++            const char *env = std::getenv("MHRS_FILTER");
++            return env && std::strcmp(env, "point") == 0;
++        }();
++        SetTextureFilter(frameTex, pointFilter ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
++    }
++    // MHRS_HUD=1 overlays host FPS and emulated vsync rate.
++    static const bool hudEnabled = std::getenv("MHRS_HUD") != nullptr;
++    uint64_t hudLastVsync = 0;
++    double hudLastTime = 0.0;
++    float hudVsyncRate = 0.0f;
+ 
+     std::atomic<bool> gameThreadFinished{false};
+ 
+@@ -2715,6 +2742,24 @@ void PS2Runtime::run()
+             dstWidth,
+             dstHeight};
+         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (hudEnabled)
++        {
++            const uint64_t tick = m_eeScheduler->currentVSyncTick();
++            const double now = GetTime();
++            if (hudLastTime > 0.0 && now > hudLastTime + 0.5)
++            {
++                hudVsyncRate = static_cast<float>(static_cast<double>(tick - hudLastVsync) / (now - hudLastTime));
++                hudLastVsync = tick;
++                hudLastTime = now;
++            }
++            else if (hudLastTime == 0.0)
++            {
++                hudLastVsync = tick;
++                hudLastTime = now;
++            }
++            DrawText(TextFormat("fps=%d vsync/s=%.1f", GetFPS(), static_cast<double>(hudVsyncRate)),
++                     8, 8, 20, LIME);
++        }
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
