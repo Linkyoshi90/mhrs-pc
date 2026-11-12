@@ -54,3 +54,4 @@ ps2recomp-gs-vulkan-batching.patch
 ps2recomp-present-options.patch
 ps2recomp-windows-msvc-port.patch
 ps2recomp-gs-vulkan-cached-vram.patch
+ps2recomp-mingw-cross-build.patch
