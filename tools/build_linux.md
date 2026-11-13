@@ -15,6 +15,10 @@ Plus a Vulkan driver (nvidia-driver / mesa-vulkan-drivers). glslang-tools
 provides `glslangValidator` for the GS compute shaders; without it the Vulkan
 backend builds as CPU passthrough.
 
+Audio needs PulseAudio's client library at run time (`libpulse0`, present on
+desktop installs; miniaudio loads it dynamically). Without it the game runs
+silently ("AUDIO: Failed to initialize playback device"), e.g. in plain WSL.
+
 ## Build
 
 ```sh

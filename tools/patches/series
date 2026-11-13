@@ -58,3 +58,4 @@ ps2recomp-mingw-cross-build.patch
 ps2recomp-ee-checkpoint-entry-unwind.patch
 ps2recomp-spu-stream-latency.patch
 ps2recomp-restore-reverted-perf.patch
+ps2recomp-register-functions-o0.patch
