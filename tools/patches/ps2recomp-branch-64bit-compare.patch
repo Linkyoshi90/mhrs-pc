@@ -1,0 +1,77 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -404,12 +404,14 @@ namespace ps2recomp
+         case OPCODE_BNE:
+         case OPCODE_BNEL:
+             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
++        // The R5900 compares the whole 64-bit register: a value with zero low half and a set sign bit
++        // (e.g. a dsll32 of -1) is negative.
+         case OPCODE_BLEZ:
+         case OPCODE_BLEZL:
+-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
+         case OPCODE_BGTZ:
+         case OPCODE_BGTZL:
+-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
+         case OPCODE_REGIMM:
+             switch (m_branchInst.rt)
+             {
+@@ -417,12 +419,12 @@ namespace ps2recomp
+             case REGIMM_BLTZL:
+             case REGIMM_BLTZAL:
+             case REGIMM_BLTZALL:
+-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
+             case REGIMM_BGEZ:
+             case REGIMM_BGEZL:
+             case REGIMM_BGEZAL:
+             case REGIMM_BGEZALL:
+-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
+             default:
+                 return "false";
+             }
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1719,6 +1719,38 @@ void register_code_generator_tests()
+             t.IsTrue(generated.find("if (branch_taken_0x1200)") != std::string::npos, "should generate branch_taken variable and if for likely branch");
+         });
+ 
++        tc.Run("BGEZ, BLTZ, BLEZ and BGTZ test the whole 64-bit register", [](TestCase &t) {
++            const struct { uint32_t opcode; uint32_t rt; const char *expected; } cases[] = {
++                {OPCODE_REGIMM, REGIMM_BGEZ, "GPR_S64(ctx, 9) >= 0"},
++                {OPCODE_REGIMM, REGIMM_BLTZ, "GPR_S64(ctx, 9) < 0"},
++                {OPCODE_BLEZ, 0u, "GPR_S64(ctx, 9) <= 0"},
++                {OPCODE_BGTZ, 0u, "GPR_S64(ctx, 9) > 0"},
++            };
++            for (const auto &c : cases)
++            {
++                Function func;
++                func.name = "branch64";
++                func.start = 0x1400;
++                func.end = 0x1410;
++                func.isRecompiled = true;
++                func.isStub = false;
++
++                Instruction br{};
++                br.address = 0x1400;
++                br.opcode = c.opcode;
++                br.rs = 9;
++                br.rt = c.rt;
++                br.simmediate = 1;
++                br.isBranch = true;
++                br.hasDelaySlot = true;
++
++                CodeGenerator gen({}, {});
++                const std::string generated = gen.generateFunction(func, {br, makeNop(0x1404), makeNop(0x1408)}, false);
++                t.IsTrue(generated.find(c.expected) != std::string::npos, std::string("expected ") + c.expected);
++                t.IsTrue(generated.find("GPR_S32(ctx, 9)") == std::string::npos, "the branch must not test only the low 32 bits");
++            }
++        });
++
+         tc.Run("JR $31 returns through dynamic target without broad local switch", [](TestCase &t) {
+             Function func;
+             func.name = "jr_ra_return";
