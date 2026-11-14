@@ -1,0 +1,41 @@
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 46123ba..8428e8b 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -778,7 +778,8 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
+ 
+ // Packed Interleave (PINT)
+ #define PS2_PINTH(a, b) _mm_unpacklo_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
+-#define PS2_PINTEH(a, b) _mm_unpackhi_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
++// PINTEH rd, rs, rt: each word of rd = (rs.h[2k] << 16) | rt.h[2k] (the even halfwords, interleaved).
++#define PS2_PINTEH(a, b) _mm_or_si128(_mm_and_si128((__m128i)(b), _mm_set1_epi32(0xFFFF)), _mm_slli_epi32((__m128i)(a), 16))
+ 
+ // Packed Multiply-Add (PMADD)
+ #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
+diff --git a/ps2xTest/src/ps2_float_semantics_tests.cpp b/ps2xTest/src/ps2_float_semantics_tests.cpp
+index 6fc046c..a609c20 100644
+--- a/ps2xTest/src/ps2_float_semantics_tests.cpp
++++ b/ps2xTest/src/ps2_float_semantics_tests.cpp
+@@ -210,6 +210,22 @@ void register_ps2_float_semantics_tests()
+             t.Equals(laneBits(flushed, 3), bitsOf(0.5f), "lane 3: 1 * 0.5 should be 0.5");
+         });
+ 
++        tc.Run("MMI PINTEH interleaves the even halfwords of rs and rt", [](TestCase &t)
++        {
++            // halfwords 7..0
++            const __m128i rs = _mm_set_epi16(0x1717, 0x1616, 0x1515, 0x1414, 0x1313, 0x1212, 0x1111, 0x1010);
++            const __m128i rt = _mm_set_epi16(0x2727, 0x2626, 0x2525, 0x2424, 0x2323, 0x2222, 0x2121, 0x2020);
++            alignas(16) uint32_t w[4];
++            _mm_store_si128(reinterpret_cast<__m128i *>(w), PS2_PINTEH(rs, rt));
++            t.Equals(w[0], 0x10102020u, "word 0 should be rs.h0:rt.h0");
++            t.Equals(w[1], 0x12122222u, "word 1 should be rs.h2:rt.h2");
++            t.Equals(w[2], 0x14142424u, "word 2 should be rs.h4:rt.h4");
++            t.Equals(w[3], 0x16162626u, "word 3 should be rs.h6:rt.h6");
++            // pinteh rd, $zero, rt zero-extends the even halfwords of rt (the ADPCM decoder's use)
++            _mm_store_si128(reinterpret_cast<__m128i *>(w), PS2_PINTEH(_mm_setzero_si128(), rt));
++            t.Equals(w[1], 0x00002222u, "with rs = 0, word 1 should be rt.h2 zero-extended");
++        });
++
+         tc.Run("FPU CVT.W.S truncates toward zero and saturates", [](TestCase &t)
+         {
+             t.Equals(FPU_CVT_W_S(1.75f), 1, "1.75 should truncate to 1");

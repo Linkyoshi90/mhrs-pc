@@ -1,0 +1,54 @@
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0485d50..46123ba 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -305,6 +305,17 @@ inline float ps2_fsqrt(float a)
+     return ps2_fall_normal(a, a, r) ? r : ps2_fsqrt_slow(a);
+ }
+ 
++// The R5900 CVT.W.S ignores the rounding mode and always truncates toward zero (ee-gcc emits it for every
++// (int) cast); |x| >= 2^31 saturates to INT32_MAX / INT32_MIN by sign.
++inline int32_t ps2_cvt_w_s(float a)
++{
++    uint32_t bits;
++    std::memcpy(&bits, &a, sizeof(bits));
++    if ((bits & 0x7F800000u) <= 0x4E800000u)
++        return static_cast<int32_t>(a);
++    return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
++}
++
+ inline float ps2_frsqrt(float a, float b)
+ {
+     const float r = a / std::sqrt(b);
+@@ -853,7 +864,7 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+ #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+ #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
++#define FPU_CVT_W_S(a) ps2_cvt_w_s((float)(a))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+ #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+diff --git a/ps2xTest/src/ps2_float_semantics_tests.cpp b/ps2xTest/src/ps2_float_semantics_tests.cpp
+index 2866d2b..6fc046c 100644
+--- a/ps2xTest/src/ps2_float_semantics_tests.cpp
++++ b/ps2xTest/src/ps2_float_semantics_tests.cpp
+@@ -210,6 +210,18 @@ void register_ps2_float_semantics_tests()
+             t.Equals(laneBits(flushed, 3), bitsOf(0.5f), "lane 3: 1 * 0.5 should be 0.5");
+         });
+ 
++        tc.Run("FPU CVT.W.S truncates toward zero and saturates", [](TestCase &t)
++        {
++            t.Equals(FPU_CVT_W_S(1.75f), 1, "1.75 should truncate to 1");
++            t.Equals(FPU_CVT_W_S(-1.75f), -1, "-1.75 should truncate to -1");
++            t.Equals(FPU_CVT_W_S(0.5f), 0, "0.5 should truncate to 0");
++            t.Equals(FPU_CVT_W_S(2147483520.0f), 2147483520, "the largest float below 2^31 converts exactly");
++            t.Equals(FPU_CVT_W_S(3.0e9f), INT32_MAX, "3e9 should saturate to INT32_MAX");
++            t.Equals(FPU_CVT_W_S(-3.0e9f), INT32_MIN, "-3e9 should saturate to INT32_MIN");
++            t.Equals(FPU_CVT_W_S(floatOf(kPlusMax)), INT32_MAX, "+max should saturate to INT32_MAX");
++            t.Equals(FPU_CVT_W_S(floatOf(kMinusMax)), INT32_MIN, "-max should saturate to INT32_MIN");
++        });
++
+         tc.Run("DIV.S and RSQRT.S translate to the PS2 semantics helpers", [](TestCase &t)
+         {
+             CodeGenerator gen({}, {});

@@ -61,3 +61,7 @@ ps2recomp-restore-reverted-perf.patch
 ps2recomp-register-functions-o0.patch
 ps2recomp-spu-time-stretch.patch
 ps2recomp-branch-64bit-compare.patch
+ps2recomp-fpu-cvt-w-truncate.patch
+ps2recomp-movz-movn-64bit.patch
+ps2recomp-mmi-pinteh.patch
+ps2recomp-fpu-sqrt-ft.patch
