@@ -1,0 +1,670 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_pad_keys.h b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+old mode 100644
+new mode 100755
+index 3028080..dab5481
+--- a/ps2xRuntime/include/runtime/ps2_pad_keys.h
++++ b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+@@ -1,8 +1,12 @@
+ #ifndef PS2_PAD_KEYS_H
+ #define PS2_PAD_KEYS_H
+ 
++#include <array>
+ #include <cstdint>
+ #include <cstdlib>
++#include <string>
++#include <string_view>
++#include <vector>
+ 
+ // Stick byte for a pair of opposing digital keys: full deflection (0x00 / 0xFF), 0x80 when
+ // neither or both are held. Own header so ps2_runtime.h users don't rebuild on changes.
+@@ -12,7 +16,7 @@ inline uint8_t ps2PadKeyAxis(bool negative, bool positive)
+ }
+ 
+ // PS2X_MOUSE_LOOK=<sensitivity> turns on mouse look: stick units per pixel of mouse motion per
+-// host frame (e.g. 8). Unset or 0 = off.
++// 1/60 s (e.g. 8). Unset or 0 = off. The controls file's mouse_look overrides it.
+ inline float ps2PadMouseLookScale()
+ {
+     static const float scale = []
+@@ -23,11 +27,146 @@ inline float ps2PadMouseLookScale()
+     return scale;
+ }
+ 
+-// Stick byte for one frame of mouse motion, clamped to the stick range.
++// Stick byte for mouse motion (pixels per 1/60 s), clamped to the stick range.
+ inline uint8_t ps2PadMouseAxis(float delta, float scale)
+ {
+     const float v = 128.0f + delta * scale;
+     return v <= 0.0f ? 0x00 : (v >= 255.0f ? 0xFF : static_cast<uint8_t>(v + 0.5f));
+ }
+ 
++// ---- Configurable controls ----
++// A controls file (PS2X_CONTROLS=<path>, default "controls.ini" in the working directory) rebinds the pad.
++// One line per target, replacing the default bindings of that target ("#" starts a comment):
++//   <target> = <input>[, <input>...]
++// targets:  up down left right cross circle square triangle l1 r1 l2 r2 l3 r3 start select (buttons),
++//           move_up move_down move_left move_right (left stick), look_up look_down look_left look_right (right stick)
++// inputs:   a key name (W, SPACE, LEFT_SHIFT, F1, KP_0, UP ...), mouse:left|right|middle|side|extra,
++//           pad:<button> (a b x y lb rb lt rt back start ls rs dpad_up dpad_down dpad_left dpad_right),
++//           pad:<axis><+|-> (lx ly rx ry; + is right/down)
++// settings: mouse_look = <stick units per pixel per 1/60 s, 0 = off>, deadzone = <0..0.9>,
++//           sensitivity = <look stick scale>, invert_y = 0|1, gamepad = <index>
++struct PadInput
++{
++    enum Kind : uint8_t
++    {
++        Key,
++        Mouse,
++        PadButton,
++        PadAxis
++    } kind;
++    int code; // raylib key / mouse button / gamepad button / gamepad axis
++    int sign; // PadAxis: +1 or -1
++    bool operator==(const PadInput &) const = default;
++};
++
++enum PadTarget : uint8_t
++{
++    PadUp,
++    PadDown,
++    PadLeft,
++    PadRight,
++    PadCross,
++    PadCircle,
++    PadSquare,
++    PadTriangle,
++    PadL1,
++    PadR1,
++    PadL2,
++    PadR2,
++    PadL3,
++    PadR3,
++    PadStart,
++    PadSelect,
++    PadMoveUp,
++    PadMoveDown,
++    PadMoveLeft,
++    PadMoveRight,
++    PadLookUp,
++    PadLookDown,
++    PadLookLeft,
++    PadLookRight,
++    PadTargetCount
++};
++
++struct PadControls
++{
++    std::array<std::vector<PadInput>, PadTargetCount> bind;
++    float mouseLook = 0.0f;
++    float deadzone = 0.0f;
++    float sensitivity = 1.0f;
++    bool invertY = false;
++    int gamepad = 0;
++};
++
++// The built-in bindings: keyboard, mouse buttons and the first gamepad together; PS2X_MOUSE_LOOK for mouseLook.
++PadControls ps2PadDefaultControls();
++// Applies a controls file's text; returns one message per line it could not use.
++std::vector<std::string> ps2PadParseControls(std::string_view text, PadControls &controls);
++// The defaults with the controls file applied, loaded on first use.
++const PadControls &ps2PadControls();
++
++// Stick byte for a deflection in [-1, 1].
++inline uint8_t ps2PadStickByte(float v)
++{
++    return v <= -1.0f ? 0x00 : (v >= 1.0f ? 0xFF : static_cast<uint8_t>(128.0f + v * 127.0f));
++}
++
++// One analog input: nothing inside the dead zone, the rest rescaled to (0, 1] and scaled by sensitivity.
++inline float ps2PadAxisStrength(float v, float deadzone, float sensitivity)
++{
++    if (v <= deadzone || deadzone >= 1.0f)
++        return 0.0f;
++    const float s = (v - deadzone) / (1.0f - deadzone) * sensitivity;
++    return s > 1.0f ? 1.0f : s;
++}
++
++// Mouse speed in pixels per 1/60 s, averaged over the last kWindow seconds of pad polls: the game may poll
++// far less often than the mouse moves (once per game frame), and motion between polls must not be lost.
++class PadMouseSpeed
++{
++public:
++    static constexpr double kWindow = 0.1;
++
++    // t: seconds (monotonic), x/y: unbounded mouse position at this poll.
++    void poll(double t, float x, float y, float &dx, float &dy)
++    {
++        dx = dy = 0.0f;
++        int from = -1; // the oldest sample inside the window, else the newest one before it
++        for (int i = 0; i < m_count; ++i)
++        {
++            const Sample &s = m_samples[(m_head + i) % kSamples];
++            from = i;
++            if (t - s.t <= kWindow)
++                break;
++        }
++        if (from >= 0)
++        {
++            const Sample &s = m_samples[(m_head + from) % kSamples];
++            const double frames = (t - s.t) * 60.0;
++            if (frames > 0.0)
++            {
++                const double scale = 1.0 / (frames < 1.0 ? 1.0 : frames);
++                dx = static_cast<float>((x - s.x) * scale);
++                dy = static_cast<float>((y - s.y) * scale);
++            }
++        }
++        if (m_count == kSamples)
++        {
++            m_head = (m_head + 1) % kSamples;
++            --m_count;
++        }
++        m_samples[(m_head + m_count++) % kSamples] = {t, x, y};
++    }
++
++private:
++    static constexpr int kSamples = 16;
++    struct Sample
++    {
++        double t;
++        float x, y;
++    };
++    std::array<Sample, kSamples> m_samples{};
++    int m_head = 0, m_count = 0;
++};
++
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index dac820e..c93828a 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,29 +1,234 @@
+ #include "runtime/ps2_pad.h"
+ #include "runtime/ps2_pad_keys.h"
+ #include "ps2_host_backend.h"
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
+ #include <cstring>
++#include <fstream>
++#include <iterator>
+ 
+ namespace
+ {
+     constexpr uint8_t kPadAnalogMarker = 0x73;
+-    constexpr uint8_t kPadStickCenter = 0x80;
+ 
+-    constexpr uint16_t PAD_LEFT = 0x0080u;
+-    constexpr uint16_t PAD_DOWN = 0x0040u;
+-    constexpr uint16_t PAD_RIGHT = 0x0020u;
+-    constexpr uint16_t PAD_UP = 0x0010u;
+-    constexpr uint16_t PAD_START = 0x0008u;
+-    constexpr uint16_t PAD_R3 = 0x0004u;
+-    constexpr uint16_t PAD_L3 = 0x0002u;
+-    constexpr uint16_t PAD_SELECT = 0x0001u;
+-    constexpr uint16_t PAD_SQUARE = 0x8000u;
+-    constexpr uint16_t PAD_CROSS = 0x4000u;
+-    constexpr uint16_t PAD_CIRCLE = 0x2000u;
+-    constexpr uint16_t PAD_TRIANGLE = 0x1000u;
+-    constexpr uint16_t PAD_R1 = 0x0800u;
+-    constexpr uint16_t PAD_L1 = 0x0400u;
+-    constexpr uint16_t PAD_R2 = 0x0200u;
+-    constexpr uint16_t PAD_L2 = 0x0100u;
++    // Button bit of each button target, in PadTarget order (PadUp .. PadSelect).
++    constexpr uint16_t kButtonMask[16] = {
++        0x0010u, 0x0040u, 0x0080u, 0x0020u, // up, down, left, right
++        0x4000u, 0x2000u, 0x8000u, 0x1000u, // cross, circle, square, triangle
++        0x0400u, 0x0800u, 0x0100u, 0x0200u, // l1, r1, l2, r2
++        0x0002u, 0x0004u, 0x0008u, 0x0001u, // l3, r3, start, select
++    };
++
++    constexpr const char *kTargetNames[PadTargetCount] = {
++        "up", "down", "left", "right", "cross", "circle", "square", "triangle",
++        "l1", "r1", "l2", "r2", "l3", "r3", "start", "select",
++        "move_up", "move_down", "move_left", "move_right", "look_up", "look_down", "look_left", "look_right"};
++
++    struct Name
++    {
++        const char *name;
++        int code;
++    };
++    // Letters and digits are their own key code; these are the rest.
++    constexpr Name kKeys[] = {
++        {"SPACE", KEY_SPACE}, {"ESCAPE", KEY_ESCAPE}, {"ENTER", KEY_ENTER}, {"TAB", KEY_TAB},
++        {"BACKSPACE", KEY_BACKSPACE}, {"INSERT", KEY_INSERT}, {"DELETE", KEY_DELETE},
++        {"RIGHT", KEY_RIGHT}, {"LEFT", KEY_LEFT}, {"DOWN", KEY_DOWN}, {"UP", KEY_UP},
++        {"PAGE_UP", KEY_PAGE_UP}, {"PAGE_DOWN", KEY_PAGE_DOWN}, {"HOME", KEY_HOME}, {"END", KEY_END},
++        {"CAPS_LOCK", KEY_CAPS_LOCK}, {"LEFT_SHIFT", KEY_LEFT_SHIFT}, {"LEFT_CONTROL", KEY_LEFT_CONTROL},
++        {"LEFT_ALT", KEY_LEFT_ALT}, {"RIGHT_SHIFT", KEY_RIGHT_SHIFT}, {"RIGHT_CONTROL", KEY_RIGHT_CONTROL},
++        {"RIGHT_ALT", KEY_RIGHT_ALT}, {"APOSTROPHE", KEY_APOSTROPHE}, {"COMMA", KEY_COMMA}, {"MINUS", KEY_MINUS},
++        {"PERIOD", KEY_PERIOD}, {"SLASH", KEY_SLASH}, {"SEMICOLON", KEY_SEMICOLON}, {"EQUAL", KEY_EQUAL},
++        {"LEFT_BRACKET", KEY_LEFT_BRACKET}, {"BACKSLASH", KEY_BACKSLASH}, {"RIGHT_BRACKET", KEY_RIGHT_BRACKET},
++        {"GRAVE", KEY_GRAVE}, {"KP_DECIMAL", KEY_KP_DECIMAL}, {"KP_DIVIDE", KEY_KP_DIVIDE},
++        {"KP_MULTIPLY", KEY_KP_MULTIPLY}, {"KP_SUBTRACT", KEY_KP_SUBTRACT}, {"KP_ADD", KEY_KP_ADD},
++        {"KP_ENTER", KEY_KP_ENTER}};
++    constexpr Name kMouseButtons[] = {
++        {"LEFT", MOUSE_BUTTON_LEFT}, {"RIGHT", MOUSE_BUTTON_RIGHT}, {"MIDDLE", MOUSE_BUTTON_MIDDLE},
++        {"SIDE", MOUSE_BUTTON_SIDE}, {"EXTRA", MOUSE_BUTTON_EXTRA}};
++    constexpr Name kPadButtons[] = {
++        {"A", GAMEPAD_BUTTON_RIGHT_FACE_DOWN}, {"B", GAMEPAD_BUTTON_RIGHT_FACE_RIGHT},
++        {"X", GAMEPAD_BUTTON_RIGHT_FACE_LEFT}, {"Y", GAMEPAD_BUTTON_RIGHT_FACE_UP},
++        {"LB", GAMEPAD_BUTTON_LEFT_TRIGGER_1}, {"RB", GAMEPAD_BUTTON_RIGHT_TRIGGER_1},
++        {"LT", GAMEPAD_BUTTON_LEFT_TRIGGER_2}, {"RT", GAMEPAD_BUTTON_RIGHT_TRIGGER_2},
++        {"BACK", GAMEPAD_BUTTON_MIDDLE_LEFT}, {"START", GAMEPAD_BUTTON_MIDDLE_RIGHT},
++        {"LS", GAMEPAD_BUTTON_LEFT_THUMB}, {"RS", GAMEPAD_BUTTON_RIGHT_THUMB},
++        {"DPAD_UP", GAMEPAD_BUTTON_LEFT_FACE_UP}, {"DPAD_DOWN", GAMEPAD_BUTTON_LEFT_FACE_DOWN},
++        {"DPAD_LEFT", GAMEPAD_BUTTON_LEFT_FACE_LEFT}, {"DPAD_RIGHT", GAMEPAD_BUTTON_LEFT_FACE_RIGHT}};
++    constexpr Name kPadAxes[] = {
++        {"LX", GAMEPAD_AXIS_LEFT_X}, {"LY", GAMEPAD_AXIS_LEFT_Y}, {"RX", GAMEPAD_AXIS_RIGHT_X}, {"RY", GAMEPAD_AXIS_RIGHT_Y}};
++
++    std::string trimUpper(std::string_view text)
++    {
++        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
++            text.remove_prefix(1);
++        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
++            text.remove_suffix(1);
++        std::string out(text);
++        std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
++        return out;
++    }
++
++    template <size_t N>
++    bool lookup(const Name (&table)[N], const std::string &name, int &code)
++    {
++        for (const Name &entry : table)
++            if (name == entry.name)
++            {
++                code = entry.code;
++                return true;
++            }
++        return false;
++    }
++
++    // One input token, already trimmed and upper-cased.
++    bool parseInput(const std::string &token, PadInput &input)
++    {
++        input = {PadInput::Key, 0, 0};
++        if (token.rfind("MOUSE:", 0) == 0)
++        {
++            input.kind = PadInput::Mouse;
++            return lookup(kMouseButtons, token.substr(6), input.code);
++        }
++        if (token.rfind("PAD:", 0) == 0)
++        {
++            const std::string name = token.substr(4);
++            if (!name.empty() && (name.back() == '+' || name.back() == '-'))
++            {
++                input.kind = PadInput::PadAxis;
++                input.sign = name.back() == '+' ? 1 : -1;
++                return lookup(kPadAxes, name.substr(0, name.size() - 1), input.code);
++            }
++            input.kind = PadInput::PadButton;
++            return lookup(kPadButtons, name, input.code);
++        }
++        if (token.size() == 1 && std::isalnum(static_cast<unsigned char>(token[0])))
++        {
++            input.code = token[0]; // KEY_A..KEY_Z and KEY_ZERO..KEY_NINE are the ASCII codes
++            return true;
++        }
++        if (token.size() >= 2 && token[0] == 'F' && std::all_of(token.begin() + 1, token.end(), [](unsigned char c) { return std::isdigit(c); }))
++        {
++            const int n = std::atoi(token.c_str() + 1);
++            input.code = KEY_F1 + n - 1;
++            return n >= 1 && n <= 12;
++        }
++        if (token.size() == 4 && token.rfind("KP_", 0) == 0 && std::isdigit(static_cast<unsigned char>(token[3])))
++        {
++            input.code = KEY_KP_0 + (token[3] - '0');
++            return true;
++        }
++        return lookup(kKeys, token, input.code);
++    }
++}
++
++PadControls ps2PadDefaultControls()
++{
++    PadControls controls;
++    controls.mouseLook = ps2PadMouseLookScale();
++    ps2PadParseControls(
++        "up = I, pad:dpad_up\n" "down = K, pad:dpad_down\n" "left = J, pad:dpad_left\n" "right = L, pad:dpad_right\n"
++        "cross = X, SPACE, pad:a\n" "circle = C, ESCAPE, pad:b\n" "square = Z, KP_0, pad:x\n" "triangle = V, KP_1, pad:y\n"
++        "l1 = Q, mouse:right, pad:lb\n" "r1 = E, mouse:left, pad:rb\n" "l2 = LEFT_SHIFT, pad:lt\n" "r2 = RIGHT_SHIFT, pad:rt\n"
++        "l3 = pad:ls\n" "r3 = pad:rs\n" "start = ENTER, pad:start\n" "select = TAB, pad:back\n"
++        "move_up = W, pad:ly-\n" "move_down = S, pad:ly+\n" "move_left = A, pad:lx-\n" "move_right = D, pad:lx+\n"
++        "look_up = UP, pad:ry-\n" "look_down = DOWN, pad:ry+\n" "look_left = LEFT, pad:rx-\n" "look_right = RIGHT, pad:rx+\n",
++        controls);
++    return controls;
++}
++
++std::vector<std::string> ps2PadParseControls(std::string_view text, PadControls &controls)
++{
++    std::vector<std::string> errors;
++    int lineNumber = 0;
++    while (!text.empty())
++    {
++        const size_t eol = text.find('\n');
++        std::string_view line = text.substr(0, eol);
++        text.remove_prefix(eol == std::string_view::npos ? text.size() : eol + 1);
++        ++lineNumber;
++        line = line.substr(0, line.find('#'));
++        const size_t eq = line.find('=');
++        const std::string key = trimUpper(line.substr(0, eq));
++        if (key.empty() && eq == std::string_view::npos)
++            continue;
++        const auto fail = [&](const std::string &what) { errors.push_back("line " + std::to_string(lineNumber) + ": " + what); };
++        if (eq == std::string_view::npos)
++        {
++            fail("expected <name> = <value>");
++            continue;
++        }
++        const std::string_view value = line.substr(eq + 1);
++        const std::string number = trimUpper(value);
++        if (key == "MOUSE_LOOK")
++            controls.mouseLook = std::strtof(number.c_str(), nullptr);
++        else if (key == "DEADZONE")
++            controls.deadzone = std::clamp(std::strtof(number.c_str(), nullptr), 0.0f, 0.9f);
++        else if (key == "SENSITIVITY")
++            controls.sensitivity = std::strtof(number.c_str(), nullptr);
++        else if (key == "INVERT_Y")
++            controls.invertY = std::atoi(number.c_str()) != 0;
++        else if (key == "GAMEPAD")
++            controls.gamepad = std::atoi(number.c_str());
++        else
++        {
++            size_t target = 0;
++            while (target < PadTargetCount && key != trimUpper(kTargetNames[target]))
++                ++target;
++            if (target == PadTargetCount)
++            {
++                fail("unknown name " + key);
++                continue;
++            }
++            std::vector<PadInput> inputs;
++            bool ok = true;
++            for (std::string_view rest = value; ok;)
++            {
++                const size_t comma = rest.find(',');
++                const std::string token = trimUpper(rest.substr(0, comma));
++                PadInput input;
++                if (!token.empty())
++                {
++                    if (parseInput(token, input))
++                        inputs.push_back(input);
++                    else
++                    {
++                        fail("unknown input " + token);
++                        ok = false;
++                    }
++                }
++                if (comma == std::string_view::npos)
++                    break;
++                rest.remove_prefix(comma + 1);
++            }
++            if (ok)
++                controls.bind[target] = std::move(inputs);
++        }
++    }
++    return errors;
++}
++
++const PadControls &ps2PadControls()
++{
++    static const PadControls controls = []
++    {
++        PadControls c = ps2PadDefaultControls();
++        const char *env = std::getenv("PS2X_CONTROLS");
++        const char *path = env ? env : "controls.ini";
++        std::ifstream file(path);
++        if (file)
++        {
++            const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++            for (const std::string &error : ps2PadParseControls(text, c))
++                std::fprintf(stderr, "[controls] %s: %s\n", path, error.c_str());
++            std::fprintf(stderr, "[controls] loaded %s\n", path);
++        }
++        else if (env)
++            std::fprintf(stderr, "[controls] cannot open %s\n", path);
++        return c;
++    }();
++    return controls;
+ }
+ 
+ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+@@ -34,106 +239,58 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     std::memset(data, 0, 32);
+     data[0] = 0x01;
+     data[1] = kPadAnalogMarker;
+-    data[2] = 0xFF;
+-    data[3] = 0xFF;
+-    data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+-
+-    uint16_t btns = 0xFFFFu;
+-    constexpr int kGamepad = 0;
+-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+-    auto clearBit = [&btns](uint16_t mask)
+-    { btns &= ~mask; };
+ 
+-    if (useGamepad)
++    const PadControls &controls = ps2PadControls();
++    const bool gamepad = IsGamepadAvailable(controls.gamepad);
++    // How far a target is pressed, 0..1: the strongest of its inputs.
++    const auto strength = [&](PadTarget target, float sensitivity)
+     {
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+-            clearBit(PAD_UP);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+-            clearBit(PAD_DOWN);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+-            clearBit(PAD_LEFT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+-            clearBit(PAD_RIGHT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+-            clearBit(PAD_CROSS);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+-            clearBit(PAD_CIRCLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+-            clearBit(PAD_SQUARE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+-            clearBit(PAD_L1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+-            clearBit(PAD_R1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+-            clearBit(PAD_L2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+-            clearBit(PAD_R2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+-            clearBit(PAD_START);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+-            clearBit(PAD_SELECT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+-            clearBit(PAD_L3);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+-            clearBit(PAD_R3);
+-
+-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
+-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-        data[6] = static_cast<uint8_t>(128 + lx * 127);
+-        data[7] = static_cast<uint8_t>(128 + ly * 127);
+-        data[4] = static_cast<uint8_t>(128 + rx * 127);
+-        data[5] = static_cast<uint8_t>(128 + ry * 127);
+-    }
+-    else
+-    {
+-        // WASD = left stick (move), arrows (or mouse, PS2X_MOUSE_LOOK) = right stick (look), IJKL = D-pad.
+-        data[6] = ps2PadKeyAxis(IsKeyDown(KEY_A), IsKeyDown(KEY_D));
+-        data[7] = ps2PadKeyAxis(IsKeyDown(KEY_W), IsKeyDown(KEY_S));
+-        data[4] = ps2PadKeyAxis(IsKeyDown(KEY_LEFT), IsKeyDown(KEY_RIGHT));
+-        data[5] = ps2PadKeyAxis(IsKeyDown(KEY_UP), IsKeyDown(KEY_DOWN));
+-        if (const float mouseLook = ps2PadMouseLookScale(); mouseLook > 0.0f && data[4] == 0x80 && data[5] == 0x80)
++        float best = 0.0f;
++        for (const PadInput &input : controls.bind[target])
+         {
+-            // ponytail: samples only the last host frame's motion; if the game polls slower than
+-            // the host frame rate, motion in between is lost. Accumulate between polls if that bites.
+-            const Vector2 delta = GetMouseDelta(); // arrows win while held
+-            data[4] = ps2PadMouseAxis(delta.x, mouseLook);
+-            data[5] = ps2PadMouseAxis(delta.y, mouseLook);
++            float v = 0.0f;
++            switch (input.kind)
++            {
++            case PadInput::Key: v = IsKeyDown(input.code) ? 1.0f : 0.0f; break;
++            case PadInput::Mouse: v = IsMouseButtonDown(input.code) ? 1.0f : 0.0f; break;
++            case PadInput::PadButton: v = gamepad && IsGamepadButtonDown(controls.gamepad, input.code) ? 1.0f : 0.0f; break;
++            case PadInput::PadAxis:
++                if (gamepad)
++                    v = ps2PadAxisStrength(GetGamepadAxisMovement(controls.gamepad, input.code) * static_cast<float>(input.sign),
++                                           controls.deadzone, sensitivity);
++                break;
++            }
++            best = std::max(best, v);
+         }
+-        if (IsKeyDown(KEY_I))
+-            clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_K))
+-            clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_J))
+-            clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_L))
+-            clearBit(PAD_RIGHT);
+-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+-            clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+-            clearBit(PAD_CIRCLE);
+-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+-            clearBit(PAD_SQUARE);
+-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsKeyDown(KEY_Q))
+-            clearBit(PAD_L1);
+-        if (IsKeyDown(KEY_E))
+-            clearBit(PAD_R1);
+-        if (IsKeyDown(KEY_LEFT_SHIFT))
+-            clearBit(PAD_L2);
+-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+-            clearBit(PAD_R2);
+-        if (IsKeyDown(KEY_ENTER))
+-            clearBit(PAD_START);
+-        if (IsKeyDown(KEY_TAB))
+-            clearBit(PAD_SELECT);
+-    }
++        return best;
++    };
+ 
++    uint16_t btns = 0xFFFFu;
++    for (size_t button = 0; button < 16u; ++button)
++        if (strength(static_cast<PadTarget>(button), 1.0f) > 0.5f)
++            btns &= static_cast<uint16_t>(~kButtonMask[button]);
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
++
++    data[6] = ps2PadStickByte(strength(PadMoveRight, 1.0f) - strength(PadMoveLeft, 1.0f));
++    data[7] = ps2PadStickByte(strength(PadMoveDown, 1.0f) - strength(PadMoveUp, 1.0f));
++    const float invert = controls.invertY ? -1.0f : 1.0f;
++    const float lookX = strength(PadLookRight, controls.sensitivity) - strength(PadLookLeft, controls.sensitivity);
++    const float lookY = (strength(PadLookDown, controls.sensitivity) - strength(PadLookUp, controls.sensitivity)) * invert;
++    data[4] = ps2PadStickByte(lookX);
++    data[5] = ps2PadStickByte(lookY);
++    if (controls.mouseLook > 0.0f)
++    {
++        // Polled every time so the speed window stays current; keys and the stick win while held.
++        static PadMouseSpeed mouse;
++        const Vector2 position = GetMousePosition(); // unbounded: the cursor is captured (DisableCursor)
++        float dx = 0.0f, dy = 0.0f;
++        mouse.poll(GetTime(), position.x, position.y, dx, dy);
++        if (lookX == 0.0f && lookY == 0.0f)
++        {
++            data[4] = ps2PadMouseAxis(dx, controls.mouseLook);
++            data[5] = ps2PadMouseAxis(dy * invert, controls.mouseLook);
++        }
++    }
+     return true;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f6d5d1e..04e3cf3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -929,7 +929,7 @@ bool PS2Runtime::initialize(const char *title)
+ #endif
+         SetTargetFPS(60);
+         SetExitKey(KEY_NULL); // Esc is the keyboard Circle button, not quit (close the window instead)
+-        if (ps2PadMouseLookScale() > 0.0f)
++        if (ps2PadControls().mouseLook > 0.0f)
+             DisableCursor(); // capture the mouse so look motion never runs into the screen edge
+         if (m_debugUiInitCallback)
+         {
+diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
+index 789b550..22f34c1 100644
+--- a/ps2xTest/src/pad_input_tests.cpp
++++ b/ps2xTest/src/pad_input_tests.cpp
+@@ -547,5 +547,67 @@ void register_pad_input_tests()
+             t.Equals(ps2PadMouseAxis(100.0f, 8.0f), static_cast<uint8_t>(0xFF), "fast motion clamps high");
+             t.Equals(ps2PadMouseAxis(-100.0f, 8.0f), static_cast<uint8_t>(0x00), "fast motion clamps low");
+         });
++
++        tc.Run("controls file rebinds targets and keeps the other defaults", [](TestCase &t)
++               {
++            PadControls c = ps2PadDefaultControls();
++            const std::vector<PadInput> defaultCross = c.bind[PadCross];
++            const auto errors = ps2PadParseControls(
++                "# comment\n"
++                "r1 = mouse:left, f, pad:rt   # fire\n"
++                "look_down = pad:ry+\n"
++                "start =\n"
++                "mouse_look = 6.5\ndeadzone = 0.2\nsensitivity = 2\ninvert_y = 1\ngamepad = 1\n",
++                c);
++            t.Equals(errors.size(), static_cast<size_t>(0), "a valid file has no errors");
++            t.Equals(c.bind[PadR1].size(), static_cast<size_t>(3), "r1 takes the three listed inputs");
++            t.IsTrue(c.bind[PadR1][0] == PadInput{PadInput::Mouse, 0, 0}, "mouse:left is mouse button 0");
++            t.IsTrue(c.bind[PadR1][1] == PadInput{PadInput::Key, 'F', 0}, "letters are case-insensitive key codes");
++            t.IsTrue(c.bind[PadR1][2] == PadInput{PadInput::PadButton, 12, 0}, "pad:rt is the right trigger button");
++            t.IsTrue(c.bind[PadLookDown].size() == 1u && c.bind[PadLookDown][0] == PadInput{PadInput::PadAxis, 3, 1},
++                     "pad:ry+ is the right stick Y axis, positive side");
++            t.IsTrue(c.bind[PadStart].empty(), "an empty value unbinds the target");
++            t.IsTrue(c.bind[PadCross] == defaultCross, "targets the file does not name keep their defaults");
++            t.Equals(c.mouseLook, 6.5f, "mouse_look is read");
++            t.Equals(c.deadzone, 0.2f, "deadzone is read");
++            t.Equals(c.sensitivity, 2.0f, "sensitivity is read");
++            t.IsTrue(c.invertY, "invert_y is read");
++            t.Equals(c.gamepad, 1, "gamepad is read");
++        });
++
++        tc.Run("controls file reports lines it cannot use and leaves those bindings alone", [](TestCase &t)
++               {
++            PadControls c = ps2PadDefaultControls();
++            const std::vector<PadInput> defaultR1 = c.bind[PadR1];
++            const auto errors = ps2PadParseControls("r1 = NOSUCHKEY\nfly = W\njust words\ncross = KP_5, F12\n", c);
++            t.Equals(errors.size(), static_cast<size_t>(3), "three bad lines are reported");
++            t.IsTrue(c.bind[PadR1] == defaultR1, "a line with an unknown input changes nothing");
++            t.Equals(c.bind[PadCross].size(), static_cast<size_t>(2), "the good line after them still applies");
++        });
++
++        tc.Run("analog inputs honour dead zone and sensitivity", [](TestCase &t)
++               {
++            t.Equals(ps2PadAxisStrength(0.125f, 0.25f, 1.0f), 0.0f, "inside the dead zone is nothing");
++            t.Equals(ps2PadAxisStrength(0.625f, 0.25f, 1.0f), 0.5f, "the rest is rescaled to 0..1");
++            t.Equals(ps2PadAxisStrength(0.625f, 0.25f, 4.0f), 1.0f, "sensitivity scales and clamps");
++            t.Equals(ps2PadStickByte(0.0f), static_cast<uint8_t>(0x80), "no deflection centres the stick");
++            t.Equals(ps2PadStickByte(-1.0f), static_cast<uint8_t>(0x00), "full negative deflection");
++            t.Equals(ps2PadStickByte(1.0f), static_cast<uint8_t>(0xFF), "full positive deflection");
++        });
++
++        tc.Run("mouse speed keeps the motion between slow pad polls", [](TestCase &t)
++               {
++            PadMouseSpeed mouse;
++            float dx = 1.0f, dy = 1.0f;
++            mouse.poll(0.0, 0.0f, 0.0f, dx, dy);
++            t.Equals(dx, 0.0f, "the first poll has no motion");
++            mouse.poll(0.05, 30.0f, -15.0f, dx, dy); // 3 frames of 1/60 s later
++            t.Equals(dx, 10.0f, "30 px over 3 frames is 10 px per frame");
++            t.Equals(dy, -5.0f, "and -15 px is -5 px per frame");
++            mouse.poll(1.0, 30.0f, -15.0f, dx, dy);
++            t.Equals(dx, 0.0f, "a still mouse reads zero after a long gap");
++            mouse.poll(1.001, 34.0f, -15.0f, dx, dy);
++            t.Equals(dx, 4.0f, "polls closer than a frame are not scaled up");
++        });
+     });
+ }

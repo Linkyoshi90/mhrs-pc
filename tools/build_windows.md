@@ -41,8 +41,12 @@ set PS2X_VK_PRESENT=1
 ps2EntryRunner.exe extracted\MOH3RDVD.ELF "ISO\Medal of Honor - Rising Sun.iso"
 ```
 
-Env vars: `PS2X_VK_RASTER=1` (GPU raster, slower than the CPU raster for now), `MHRS_HUD=1`,
+Env vars: `PS2X_SKIP_MOVIES=60` (end every movie after 60 pictures; Esc/Backspace skips one by hand),
+`PS2X_VBLANK_CLOCK=cycles` (old guest-cycle vblank clock: slow-motion gameplay), `PS2X_VK_RASTER=1` (GPU raster, slower than the CPU raster for now), `MHRS_HUD=1`,
 `MHRS_WINDOW=1920x1080`, `MHRS_FILTER=point`.
+
+Controls: copy `tools/controls.example.ini` to `controls.ini` in the folder you start from (or set `PS2X_CONTROLS`)
+to rebind keys, mouse buttons and gamepad buttons/axes, and to set mouse look, dead zone, sensitivity and invert-Y.
 
 `tools/windows/pack_mingw.sh <tree> <dest>` copies the exe plus every DLL it imports from the build tree
 (ffmpeg and its codec libs); everything else is a Windows system DLL or the driver's `vulkan-1.dll`.
