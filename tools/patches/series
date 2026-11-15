@@ -71,3 +71,4 @@ ps2recomp-worker-handoff.patch
 ps2recomp-controls-config.patch
 ps2recomp-movie-skip.patch
 ps2recomp-gs-row-threads.patch
+ps2recomp-gs-vulkan-batch.patch

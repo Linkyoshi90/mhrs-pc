@@ -38,11 +38,13 @@ Run from the mhrs-pc repo root (paths are relative), with the ffmpeg DLLs next t
 ```bat
 set PS2X_GS_BACKEND=vulkan
 set PS2X_VK_PRESENT=1
+set PS2X_VK_RASTER=1
 ps2EntryRunner.exe extracted\MOH3RDVD.ELF "ISO\Medal of Honor - Rising Sun.iso"
 ```
 
 Env vars: `PS2X_SKIP_MOVIES=60` (end every movie after 60 pictures; Esc/Backspace skips one by hand),
-`PS2X_VBLANK_CLOCK=cycles` (old guest-cycle vblank clock: slow-motion gameplay), `PS2X_VK_RASTER=1` (GPU raster, slower than the CPU raster for now), `MHRS_HUD=1`,
+`PS2X_VBLANK_CLOCK=cycles` (old guest-cycle vblank clock: slow-motion gameplay), `PS2X_VK_RASTER=1` (sprites and triangles rasterized on the GPU; without it the Vulkan backend draws on the CPU),
+`PS2X_VK_STATS=<n>` (batch/readback counters every n presents), `MHRS_HUD=1`,
 `MHRS_WINDOW=1920x1080`, `MHRS_FILTER=point`.
 
 Controls: copy `tools/controls.example.ini` to `controls.ini` in the folder you start from (or set `PS2X_CONTROLS`)
@@ -51,7 +53,8 @@ to rebind keys, mouse buttons and gamepad buttons/axes, and to set mouse look, d
 `tools/windows/pack_mingw.sh <tree> <dest>` copies the exe plus every DLL it imports from the build tree
 (ffmpeg and its codec libs); everything else is a Windows system DLL or the driver's `vulkan-1.dll`.
 
-Gameplay (RTX 4070 SUPER, i9-9900K): CPU backend ~17.8 flips/s, Vulkan present ~17.6, Vulkan GPU raster ~8.
+Gameplay, first scene (RTX 4070 SUPER, i9-9900K, 2026-11-15): CPU backend ~25.4 flips/s, Vulkan GPU raster ~35.8
+(with or without `PS2X_VK_PRESENT`); a later, heavier scene: ~12.1 against ~14.3.
 
 ## MSVC (not supported)
 
