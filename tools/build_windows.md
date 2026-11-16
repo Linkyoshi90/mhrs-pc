@@ -53,8 +53,13 @@ to rebind keys, mouse buttons and gamepad buttons/axes, and to set mouse look, d
 `tools/windows/pack_mingw.sh <tree> <dest>` copies the exe plus every DLL it imports from the build tree
 (ffmpeg and its codec libs); everything else is a Windows system DLL or the driver's `vulkan-1.dll`.
 
-Gameplay, first scene (RTX 4070 SUPER, i9-9900K, 2026-11-15): CPU backend ~25.4 flips/s, Vulkan GPU raster ~35.8
-(with or without `PS2X_VK_PRESENT`); a later, heavier scene: ~12.1 against ~14.3.
+`tools\windows\play_mingw.bat` starts `build\mingw_play` with the GPU renderer and records the VU1 microprograms
+the game uploads (`PS2_VU1_DUMP_DIR`), which is how slow scenes get fast code: see `tools/frame_rate.md`.
+`PS2X_FAST_FORWARD=1` holds the `fast_forward` input down (default key F: the game runs several times faster
+without 3D drawing, to get through in-engine cutscenes).
+
+Frame rate (RTX 4070 SUPER, i9-9900K, Vulkan GPU raster, 2026-11-16; 60 flips/s = the game's 30 fps): mission-1
+intro 48 to 56 flips/s, first room of mission 1 51 to 59. Details and the way to 60 fps: `tools/frame_rate.md`.
 
 ## MSVC (not supported)
 

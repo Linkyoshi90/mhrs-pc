@@ -1454,4 +1454,8 @@ instructions = [
   { address = "0x00135604", value = "0x3C050001" }, # _start SetupHeap: lui   $a1, 0x1    (was lui $a1, 0x0)
   { address = "0x0013560C", value = "0x24A50000" }, # _start SetupHeap: addiu $a1, $a1, 0 (was -1 = rest of RAM)
   { address = "0x002BDB90", value = "0x3C110052" }, # main heap base:   lui   $s1, 0x52   (was 0x51)
+  # func_002CB720 waits for the frame's VIF1 DMA to end in a counted busy loop (200 per turn, limit D_00379BA0);
+  # past the limit the game prints "Frame draw stalled" and halts in a loop of its own (0x2CAF10). On the host
+  # a turn takes nanoseconds, so a slow frame (the fire in mission 1) ran out the count. The count stays 0 now.
+  { address = "0x002CBA6C", value = "0x24A50000" }, # draw watchdog: addiu $a1, $a1, 0 (was 0xC8)
 ]

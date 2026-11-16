@@ -72,3 +72,8 @@ ps2recomp-controls-config.patch
 ps2recomp-movie-skip.patch
 ps2recomp-gs-row-threads.patch
 ps2recomp-gs-vulkan-batch.patch
+ps2recomp-pacing-wait-stall.patch
+ps2recomp-vu1-lean-values-only.patch
+ps2recomp-worker-queue-spin.patch
+ps2recomp-fast-forward.patch
+ps2recomp-vu1-dump-uncovered.patch

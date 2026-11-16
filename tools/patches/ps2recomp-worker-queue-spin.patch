@@ -1,0 +1,55 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ordered_worker.h b/ps2xRuntime/include/runtime/ps2_ordered_worker.h
+index 4a6eac0..6c382ee 100644
+--- a/ps2xRuntime/include/runtime/ps2_ordered_worker.h
++++ b/ps2xRuntime/include/runtime/ps2_ordered_worker.h
+@@ -97,7 +97,7 @@ public:
+         }
+         bool sleeping;
+         {
+-            std::lock_guard<std::mutex> lock(m_mutex);
++            const QueueLock lock(m_mutex);
+             m_jobs.push_back(std::move(job));
+             std::atomic_ref<uint64_t>(m_posted).fetch_add(1u, std::memory_order_relaxed);
+             sleeping = m_sleeping;
+@@ -119,6 +119,21 @@ public:
+     }
+ 
+ private:
++    // The queue lock is only ever held for a push, a swap or a counter update, so the poster and the thread spin for
++    // it. Sleeping on it (a contended std::mutex is a kernel wait and wake-up on Windows) cost the GIF/VU worker a
++    // tenth of its time: it posts a job per GIF packet while the GS stage takes them off as fast.
++    struct QueueLock
++    {
++        explicit QueueLock(std::mutex &mutex) : m_mutex(mutex)
++        {
++            while (!m_mutex.try_lock())
++                std::this_thread::yield();
++        }
++        ~QueueLock() { m_mutex.unlock(); }
++        QueueLock(const QueueLock &) = delete;
++        std::mutex &m_mutex;
++    };
++
+     void loop()
+     {
+         std::vector<std::function<void()>> batch;
+@@ -132,7 +147,9 @@ private:
+                    std::chrono::steady_clock::now() < pollEnd)
+                 std::this_thread::yield();
+             {
+-                std::unique_lock<std::mutex> lock(m_mutex);
++                std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
++                while (!lock.owns_lock() && !lock.try_lock()) // as QueueLock
++                    std::this_thread::yield();
+                 m_sleeping = true;
+                 m_wake.wait(lock, [&] { return !m_jobs.empty() || m_stopping; });
+                 m_sleeping = false;
+@@ -157,7 +174,7 @@ private:
+                 }
+             }
+             {
+-                std::lock_guard<std::mutex> lock(m_mutex);
++                const QueueLock lock(m_mutex);
+                 m_done += batch.size();
+             }
+             batch.clear();

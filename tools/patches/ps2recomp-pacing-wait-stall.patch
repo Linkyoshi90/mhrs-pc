@@ -1,0 +1,71 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 0751796..c65e70c 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -35,6 +35,7 @@ namespace
+     constexpr uint32_t WEF_CLEAR = 0x10u;
+     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
++    constexpr auto kPacingSlack = std::chrono::microseconds(200); // a deadline this close counts as due
+     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+     constexpr auto kVBlankMaxLag = std::chrono::milliseconds(500);
+     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+@@ -219,9 +220,16 @@ std::string mhrsDebugEePcHist()
+ 
+ static std::string mhrsLastDispatch; // TEMP-DEBUG(mhrs)
+ 
++#ifdef _WIN32
++extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int); // winmm; windows.h clashes with ps2_runtime.h
++#endif
++
+ void EeScheduler::run()
+ {
+     assertExecutor();
++#ifdef _WIN32
++    timeBeginPeriod(1u); // pacing waits are a few ms; the default 15.6 ms timer tick would stretch each one
++#endif
+     m_running.store(true, std::memory_order_release);
+ 
+     while (!m_stopRequested.load(std::memory_order_acquire))
+@@ -493,6 +501,21 @@ void EeScheduler::catchUpToHostVBlank() noexcept
+     if (hostVBlankDue())
+     {
+         accountCycles(static_cast<uint32_t>(m_nextVBlankCycle - m_eeCycle)); // at most one vblank period
++        // The jump puts the guest clock back on host time. A deadline set while it lagged (an alarm) is now
++        // due on the guest clock ahead of its host time, and the pacing wait in processDueDeadlines would
++        // block the whole EE for it: threads that could run starve and the clock lags again.
++        std::lock_guard lock(m_eventMutex);
++        const auto now = std::chrono::steady_clock::now();
++        for (ScheduledEvent &item : m_deadlines)
++        {
++            if (item.hostDeadline > now)
++            {
++                const auto ahead = std::chrono::duration_cast<std::chrono::microseconds>(item.hostDeadline - now);
++                item.deadlineCycle = std::max(item.deadlineCycle,
++                                              m_eeCycle + microsecondsToEeCycles(static_cast<uint64_t>(ahead.count())));
++            }
++        }
++        updateNextDeadline();
+     }
+ }
+ 
+@@ -1920,7 +1943,9 @@ void EeScheduler::processDueDeadlines()
+                 return;
+             }
+ 
+-            if (now < pacingDeadline)
++            // A wait far below the host timer resolution still sleeps a whole timer tick (15.6 ms by default on
++            // Windows): an alarm due in 20 us each vblank put the EE to sleep for nearly all of the time.
++            if (now + kPacingSlack < pacingDeadline)
+             {
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                      { return !m_events.empty() ||
+@@ -1936,7 +1961,7 @@ void EeScheduler::processDueDeadlines()
+             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
+                                               [this, pacedNow](const ScheduledEvent &item)
+                                               { return item.deadlineCycle <= m_eeCycle &&
+-                                                       item.hostDeadline <= pacedNow; });
++                                                       item.hostDeadline <= pacedNow + kPacingSlack; });
+             due.insert(due.end(),
+                        std::make_move_iterator(m_deadlines.begin()),
+                        std::make_move_iterator(firstFuture));

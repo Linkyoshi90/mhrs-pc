@@ -1,0 +1,656 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 5aba063..980cb7b 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -323,7 +323,7 @@ private:
+         bool hasLeanPrograms = false;
+         std::array<LeanNodeFn, kMaxDecodedPairs> leanPrograms{}; // by entry pair index
+     };
+-    static constexpr size_t kMaxDecodedImages = 16u;
++    static constexpr size_t kMaxDecodedImages = 64u;
+     std::vector<std::unique_ptr<DecodedImage>> m_decodedImages;
+     DecodedImage *m_image = nullptr; // the cached code's, valid with m_decodedCodeCacheValid
+     uint64_t m_imageUses = 0;
+@@ -384,7 +384,7 @@ private:
+ 
+     template <bool kCompiled, StaticPairTiming kTiming = StaticPairTiming{}>
+     PairResult stepPair(const DecodedInstructionPair &decoded, uint32_t codeSize, uint64_t budgetEnd);
+-    template <bool kCompiled>
++    template <bool kCompiled, bool kElideFlags = false>
+     void execPairOps(const DecodedInstructionPair &decoded);
+ 
+     static constexpr InstructionUsage decodeUpperUsage(uint32_t upper);
+@@ -405,7 +405,7 @@ private:
+     void execUpper(uint32_t instr);
+     void execUpperInline(uint32_t instr);
+     void execFmac(const DecodedInstructionPair &decoded);
+-    template <bool kFastFlags = true>
++    template <bool kFastFlags = true, bool kElideFlags = false>
+     void execFmacInline(const DecodedInstructionPair &decoded);
+     void execFmacExact(const DecodedInstructionPair &decoded, const float (&operands)[3][4]);
+     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+@@ -416,7 +416,8 @@ private:
+     FlagPipelineEntry *allocFlagEntry(bool upper, uint32_t errorCode);
+     template <typename F>
+     void forFlagEntriesIssuedNow(F &&f);
+-    void syncFlags();
++    void syncFlags(); // lands the flag entries due by now
++    void syncFlagsDue();
+     void queueFsset(uint16_t immediate);
+     void queueClip(uint32_t clip);
+     void queueFcset(uint32_t clip);
+@@ -459,6 +460,7 @@ private:
+     void advanceTo(uint64_t targetCycle);
+     void flushPipelines();
+     void progressXgkick();
++    void progressXgkickTo(uint64_t cycle);
+     void finishXgkick();
+     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
+     void markPairWrites(const DecodedInstructionPair &decoded);
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.h b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+index 7ce9d21..aa536b5 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+@@ -51,6 +51,32 @@ namespace ps2_vu1_simd
+         return _mm_castsi128_ps(out);
+     }
+ 
++    // normalizeOperands for host arithmetic done with denormals-are-zero set (VU1Interpreter::run sets it): the
++    // host reads a denormal as the signed zero normalizeOperands makes of it, so only Inf/NaN are left to clamp.
++    inline __m128 clampOperands(__m128 value)
++    {
++#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
++        const __m128i positive = _mm_min_epi32(_mm_castps_si128(value), _mm_set1_epi32(0x7F7FFFFF));
++        return _mm_castsi128_ps(_mm_min_epu32(positive, _mm_set1_epi32(static_cast<int32_t>(0xFF7FFFFFu))));
++#else
++        return normalizeOperands(value); // no denormals-are-zero mode set on this host
++#endif
++    }
++
++    // IEEE denormals for an op that computes in several host steps (its intermediate results can be denormal):
++    // VU1Interpreter::run sets denormals-are-zero for everything else.
++    struct IeeeDenormals
++    {
++#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
++        const unsigned csr = _mm_getcsr();
++        IeeeDenormals() { _mm_setcsr(csr & ~0x0040u); }
++        ~IeeeDenormals() { _mm_setcsr(csr); }
++#else
++        IeeeDenormals() {} // no denormals-are-zero mode set on this host
++#endif
++        IeeeDenormals(const IeeeDenormals &) = delete;
++    };
++
+     // Lane sets below use bit c for component c (x = bit 0); MAC and dest masks use x = bit 3.
+     inline constexpr uint8_t reverseLanes[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+                                                  0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+@@ -62,6 +88,16 @@ namespace ps2_vu1_simd
+                                               -static_cast<int32_t>((dest >> 2) & 1u), -static_cast<int32_t>((dest >> 3) & 1u)));
+     }
+ 
++    // Writes the dest lanes of value as one 16-byte store: a 16-byte load of the register right after forwards
++    // from it, where four lane stores would stall that load.
++    inline void storeDest(float *dst, __m128 value, uint8_t dest)
++    {
++        if (dest == 0xFu)
++            _mm_storeu_ps(dst, value);
++        else
++            _mm_storeu_ps(dst, _mm_blendv_ps(_mm_loadu_ps(dst), value, destLaneMask(dest)));
++    }
++
+     // Lanes (of four doubles held as two halves) whose sign bit is set.
+     inline uint32_t laneBits(__m128d lo, __m128d hi)
+     {
+@@ -97,6 +133,12 @@ VU1_ALWAYS_INLINE float VU1Interpreter::normalizeResult(float value, uint32_t &l
+     return value;
+ }
+ 
++VU1_ALWAYS_INLINE void VU1Interpreter::syncFlags()
++{
++    if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
++        syncFlagsDue();
++}
++
+ VU1_ALWAYS_INLINE uint32_t VU1Interpreter::microAddressMask() const
+ {
+     return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu;
+@@ -771,7 +813,7 @@ VU1_ALWAYS_INLINE VU1Interpreter::FlagPipelineEntry *VU1Interpreter::allocFlagEn
+ // A float product is exact in double and the sum is rounded once, so a double result that is zero, or in
+ // [2^-125, 2^127), classifies like the exact one (same zero-ness and sign, no overflow or underflow) in any
+ // rounding mode; only the rest needs long double. Packed float/double ops round exactly like scalar ones.
+-template <bool kFastFlags>
++template <bool kFastFlags, bool kElideFlags>
+ VU1_ALWAYS_INLINE void VU1Interpreter::execFmacInline(const DecodedInstructionPair &decoded)
+ {
+     const uint32_t instr = decoded.upper;
+@@ -813,6 +855,47 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execFmacInline(const DecodedInstructionPa
+         default: b = _mm_loadu_ps(m_state.vf[ft]); break;
+         }
+     }
++    if constexpr (kElideFlags)
++    {
++        // Nothing observes this op's MAC/status entry (the lean generator checks every flag read, leave and exit),
++        // so only the value is computed: no entry, and no sticky status bits. That is a deliberate deviation: the
++        // sticky bits (status 0xFC0) stay as they were, which only FSSET, FSAND/FSEQ/FSOR with those bits or the
++        // end state could show; the generator elides nothing once a program it compiles has such an op.
++        // The value is the exact path's: the float result of the normalized operands, where a result below
++        // FLT_MIN is a signed zero. The VU rounds toward zero, so an overflowing sum or product is +-FLT_MAX as
++        // there; only a MADD/MSUB whose product overflowed (the exact path clamps the exact sum) or is denormal
++        // (the sum there reads it as it is; here, with denormals-are-zero, as zero) takes the exact path.
++        if (source != FmacCross)
++        {
++            const bool fused = form == FmacMulAdd || form == FmacMulSub;
++            const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
++            const __m128 ea = ps2_vu1_simd::clampOperands(a), eb = ps2_vu1_simd::clampOperands(b);
++            __m128 product = _mm_setzero_ps();
++            __m128 value;
++            switch (form)
++            {
++            case FmacAdd: value = _mm_add_ps(ea, eb); break;
++            case FmacSub: value = _mm_sub_ps(ea, eb); break;
++            case FmacMulAdd: product = _mm_mul_ps(ea, eb), value = _mm_add_ps(ps2_vu1_simd::clampOperands(_mm_loadu_ps(m_state.acc)), product); break;
++            case FmacMulSub: product = _mm_mul_ps(ea, eb), value = _mm_sub_ps(ps2_vu1_simd::clampOperands(_mm_loadu_ps(m_state.acc)), product); break;
++            default: value = _mm_mul_ps(ea, eb); break;
++            }
++            const uint32_t lanes = ps2_vu1_simd::reverseLanes[dest];
++            const __m128i productMagnitude = _mm_and_si128(_mm_castps_si128(product), magnitudeMask);
++            const __m128i productDenormal = _mm_and_si128(_mm_cmpgt_epi32(productMagnitude, _mm_setzero_si128()),
++                                                          _mm_cmplt_epi32(productMagnitude, _mm_set1_epi32(0x00800000)));
++            const __m128i productExact = _mm_or_si128(_mm_cmpeq_epi32(productMagnitude, _mm_set1_epi32(0x7F7FFFFF)), productDenormal);
++            if (!fused || (static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(productExact))) & lanes) == 0u)
++            {
++                const __m128i bits = _mm_castps_si128(value);
++                const __m128i tiny = _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
++                ps2_vu1_simd::storeDest(decoded.fmacToAcc ? m_state.acc : m_state.vf[VFD(instr)],
++                                        _mm_castsi128_ps(_mm_andnot_si128(_mm_and_si128(tiny, magnitudeMask), bits)), dest);
++                return;
++            }
++        }
++    }
++
+     a = ps2_vu1_simd::normalizeOperands(a);
+     b = ps2_vu1_simd::normalizeOperands(b);
+     const __m128 acc = ps2_vu1_simd::normalizeOperands(_mm_loadu_ps(m_state.acc));
+@@ -873,19 +956,19 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execFmacInline(const DecodedInstructionPa
+             {
+                 const uint32_t macSign = static_cast<uint32_t>(_mm_movemask_ps(fast)) & fastDest;
+                 const uint32_t macZero = static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpeq_ps(fast, zeroPs))) & fastDest;
++                const uint32_t status = (macZero != 0u ? 0x1u : 0u) | (macSign != 0u ? 0x2u : 0u);
++                const uint32_t extraSticky = fused ? ((static_cast<uint32_t>(_mm_movemask_ps(product)) & fastDest) != 0u ? 0x2u : 0u) |
++                                                         ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(productZero))) & fastDest) != 0u ? 0x1u : 0u)
++                                                   : 0u;
+                 if (FlagPipelineEntry *entry = allocFlagEntry(true, 0xFFFFFFFFu))
+                 {
+                     entry->mac = static_cast<uint32_t>(ps2_vu1_simd::reverseLanes[macZero]) | (static_cast<uint32_t>(ps2_vu1_simd::reverseLanes[macSign]) << 4);
+-                    entry->status = (macZero != 0u ? 0x1u : 0u) | (macSign != 0u ? 0x2u : 0u);
+-                    entry->extraSticky = fused ? ((static_cast<uint32_t>(_mm_movemask_ps(product)) & fastDest) != 0u ? 0x2u : 0u) |
+-                                                     ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(productZero))) & fastDest) != 0u ? 0x1u : 0u)
+-                                               : 0u;
++                    entry->status = status;
++                    entry->extraSticky = extraSticky;
+                     entry->writesMac = true;
+                     entry->writesStatus = true;
+                 }
+-                alignas(16) float result[4];
+-                _mm_store_ps(result, fast);
+-                applyDest(decoded.fmacToAcc ? m_state.acc : m_state.vf[VFD(instr)], result, dest);
++                ps2_vu1_simd::storeDest(decoded.fmacToAcc ? m_state.acc : m_state.vf[VFD(instr)], fast, dest);
+                 return;
+             }
+         }
+@@ -903,6 +986,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execFmacInline(const DecodedInstructionPa
+ // in any rounding mode; only the rest needs long double). Out of line: compiled code rarely needs it.
+ VU1_NOINLINE inline void VU1Interpreter::execFmacExact(const DecodedInstructionPair &decoded, const float (&operands)[3][4])
+ {
++    const ps2_vu1_simd::IeeeDenormals ieee; // a MADD/MSUB sum reads a denormal product as it is
+     const uint32_t instr = decoded.upper;
+     const uint8_t dest = DEST(instr);
+     const FmacForm form = decoded.fmacForm;
+@@ -1119,7 +1203,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPa
+ 
+ // The pair's upper and lower ops (I immediate, upper-to-lower VF shadowing), without any timing: shared by
+ // stepPair and lean programs.
+-template <bool kCompiled>
++template <bool kCompiled, bool kElideFlags>
+ VU1_ALWAYS_INLINE void VU1Interpreter::execPairOps(const DecodedInstructionPair &decoded)
+ {
+     const auto execUpperOf = [this](const DecodedInstructionPair &pair) VU1_LAMBDA_ALWAYS_INLINE
+@@ -1129,7 +1213,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execPairOps(const DecodedInstructionPair
+             if (pair.fmacForm == FmacNone)
+                 execUpperInline(pair.upper);
+             else
+-                execFmacInline(pair);
++                execFmacInline<true, kElideFlags>(pair);
+         }
+         else if (pair.fmacForm == FmacNone)
+             execUpper(pair.upper);
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_lean.h b/ps2xRuntime/include/runtime/ps2_vu1_lean.h
+index 4e3f5cc..6b79678 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_lean.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_lean.h
+@@ -51,14 +51,7 @@ struct VU1Interpreter::LeanAccess
+     }
+ 
+     // PATH1 copies through cycle (the interpreter copies one qword every second cycle as it steps).
+-    static VU1_NOINLINE void kickTo(VU1Interpreter &vu, uint64_t cycle)
+-    {
+-        while (vu.m_xgkick.active && vu.m_xgkick.progressedCycle < cycle)
+-        {
+-            ++vu.m_xgkick.progressedCycle;
+-            vu.progressXgkick();
+-        }
+-    }
++    static VU1_ALWAYS_INLINE void kickTo(VU1Interpreter &vu, uint64_t cycle) { vu.progressXgkickTo(cycle); }
+ 
+     // Before a store issued at cycle: PATH1 has read VU memory up to then.
+     static VU1_ALWAYS_INLINE void beforeStore(VU1Interpreter &vu, uint64_t cycle)
+@@ -94,7 +87,8 @@ struct VU1Interpreter::LeanAccess
+     // whose old value must be kept as the start of an in-flight write chain (the run may go back to the
+     // interpreter while the write is in flight); kViPending: the VI it writes has a write in flight;
+     // kSaveVi: keep the VI's old value as its chain start.
+-    template <uint32_t Lower, uint32_t Upper, uint8_t kSaveUpper, uint8_t kSaveLower, bool kViPending, bool kSaveVi>
++    template <uint32_t Lower, uint32_t Upper, uint8_t kSaveUpper, uint8_t kSaveLower, bool kViPending, bool kSaveVi,
++              bool kElideFlags = false>
+     static VU1_ALWAYS_INLINE void pair(VU1Interpreter &vu)
+     {
+         static constexpr DecodedInstructionPair kPair = decodePair(Lower, Upper, Unit::VU1);
+@@ -116,7 +110,7 @@ struct VU1Interpreter::LeanAccess
+         if constexpr (kSaveLower != 0u)
+             save(kPair.lowerUsage.vfWrite.reg, kSaveLower);
+ 
+-        vu.execPairOps<true>(kPair);
++        vu.execPairOps<true, kElideFlags>(kPair);
+ 
+         vu.m_viBranchBackupValid = false;
+         if constexpr (writtenVi != 0u)
+@@ -346,6 +340,22 @@ struct VU1Interpreter::LeanAccess
+         const uint32_t w = p.lowerUsage.viWrite & 0xFFFEu;
+         return w != 0u ? static_cast<uint8_t>(std::countr_zero(w)) : 0u;
+     }
++    // An FMAC that queues a MAC/status flag entry; lower ops that read MAC or status (FSEQ/FSAND/FSOR, FMEQ/FMAND/FMOR),
++    // and the ops that set or test the sticky status bits (FSSET; FSEQ/FSAND/FSOR with bits of 0xFC0): elided
++    // FMACs leave those bits alone, so the generator elides nothing once a program has one.
++    static bool queuesMacFlags(const DecodedInstructionPair &p) { return p.fmacForm != FmacNone && DEST(p.upper) != 0u; }
++    static bool readsMacFlags(const DecodedInstructionPair &p)
++    {
++        const uint32_t op = p.lower >> 25;
++        return !p.iBit && (op == 0x14u || op == 0x16u || op == 0x17u || op == 0x18u || op == 0x1Au || op == 0x1Bu);
++    }
++    static bool touchesStickyStatus(const DecodedInstructionPair &p)
++    {
++        const uint32_t op = p.lower >> 25;
++        const uint32_t imm = ((p.lower >> 10) & 0x800u) | (p.lower & 0x7FFu);
++        return !p.iBit && (op == 0x15u || ((op == 0x14u || op == 0x16u || op == 0x17u) && (imm & 0xFC0u) != 0u));
++    }
++    static constexpr uint32_t kFlagLatency = kFmacLatency;
+     static bool recordsBranchBackup(const DecodedInstructionPair &p) { return viWrite(p) != 0u && p.lowerUsage.delaysNextBranchRead; }
+ };
+ 
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_lower.inl b/ps2xRuntime/include/runtime/ps2_vu1_lower.inl
+index 4d021c6..77e2258 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_lower.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_lower.inl
+@@ -664,6 +664,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+                 return;
+             case 0x70: // ESADD
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const float x = normalizeOperand(m_state.vf[vfS][0]);
+                 const float y = normalizeOperand(m_state.vf[vfS][1]);
+                 const float z = normalizeOperand(m_state.vf[vfS][2]);
+@@ -672,6 +673,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+             }
+             case 0x71: // ERSADD
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const float x = normalizeOperand(m_state.vf[vfS][0]);
+                 const float y = normalizeOperand(m_state.vf[vfS][1]);
+                 const float z = normalizeOperand(m_state.vf[vfS][2]);
+@@ -681,6 +683,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+             }
+             case 0x72: // ELENG
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const float x = normalizeOperand(m_state.vf[vfS][0]);
+                 const float y = normalizeOperand(m_state.vf[vfS][1]);
+                 const float z = normalizeOperand(m_state.vf[vfS][2]);
+@@ -689,6 +692,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+             }
+             case 0x73: // ERLENG
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const float x = normalizeOperand(m_state.vf[vfS][0]);
+                 const float y = normalizeOperand(m_state.vf[vfS][1]);
+                 const float z = normalizeOperand(m_state.vf[vfS][2]);
+@@ -698,6 +702,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+             }
+             case 0x74: // EATANxy
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const float x = normalizeOperand(m_state.vf[vfS][0]);
+                 const float y = normalizeOperand(m_state.vf[vfS][1]);
+                 queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
+@@ -705,6 +710,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+             }
+             case 0x75: // EATANxz
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const float x = normalizeOperand(m_state.vf[vfS][0]);
+                 const float z = normalizeOperand(m_state.vf[vfS][2]);
+                 queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
+@@ -712,6 +718,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+             }
+             case 0x76: // ESUM
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 float sum = 0.0f;
+                 for (uint32_t component = 0; component < 4u; ++component)
+                     sum += normalizeOperand(m_state.vf[vfS][component]);
+@@ -720,6 +727,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+             }
+             case 0x77: // ERSQRT
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const uint32_t component = (instr >> 21) & 3u;
+                 const float value = normalizeOperand(m_state.vf[vfS][component]);
+                 float result = value;
+@@ -741,6 +749,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+             }
+             case 0x79: // ESIN
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const uint32_t component = (instr >> 21) & 3u;
+                 const float value = normalizeOperand(m_state.vf[vfS][component]);
+                 queueP(vuEsin(value), 29u);
+@@ -757,12 +766,14 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execLowerInline(uint32_t instr, uint8_t *
+                 return;
+             case 0x7C: // EATAN
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const uint32_t component = (instr >> 21) & 3u;
+                 queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
+                 return;
+             }
+             case 0x7D: // EEXP
+             {
++                const ps2_vu1_simd::IeeeDenormals ieee;
+                 const uint32_t component = (instr >> 21) & 3u;
+                 queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
+                 return;
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_upper.inl b/ps2xRuntime/include/runtime/ps2_vu1_upper.inl
+index 1238dc5..d1454a8 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_upper.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_upper.inl
+@@ -34,13 +34,10 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
+     }
+ 
+     float *vd = m_state.vf[fd];
+-    float normalizedVs[4];
+-    float normalizedVt[4];
+-    for (uint32_t component = 0; component < 4u; ++component)
+-    {
+-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
+-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
+-    }
++    alignas(16) float normalizedVs[4];
++    alignas(16) float normalizedVt[4];
++    _mm_store_ps(normalizedVs, ps2_vu1_simd::normalizeOperands(_mm_loadu_ps(m_state.vf[fs])));
++    _mm_store_ps(normalizedVt, ps2_vu1_simd::normalizeOperands(_mm_loadu_ps(m_state.vf[ft])));
+     const float *vs = normalizedVs;
+     const float *vt = normalizedVt;
+     const float i = normalizeOperand(m_state.i);
+@@ -54,7 +51,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
+     case 0x12:
+     case 0x13: // MAXbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vt[op & 3]; // normalized above
+         for (int c = 0; c < 4; c++)
+             result[c] = (vs[c] > bc) ? vs[c] : bc;
+         applyDest(vd, result, dest);
+@@ -65,7 +62,7 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
+     case 0x16:
+     case 0x17: // MINIbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vt[op & 3]; // normalized above
+         for (int c = 0; c < 4; c++)
+             result[c] = (vs[c] < bc) ? vs[c] : bc;
+         applyDest(vd, result, dest);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 04f7377..bbe695c 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -110,27 +110,33 @@ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
+     return flags;
+ }
+ 
+-void VU1Interpreter::syncFlags()
++void VU1Interpreter::syncFlagsDue()
+ {
+-    for (; m_flagCount != 0u; m_flagHead = (m_flagHead + 1u) % kMaxFlagEntries, --m_flagCount)
++    // Locals: the entries live in this object too, so stores to m_state would make every entry load wait.
++    uint32_t head = m_flagHead, count = m_flagCount;
++    uint32_t mac = m_state.mac, status = m_state.status, clip = m_state.clip;
++    for (; count != 0u; head = (head + 1u) % kMaxFlagEntries, --count)
+     {
+-        const FlagPipelineEntry &entry = m_flagPipeline[m_flagHead];
++        const FlagPipelineEntry &entry = m_flagPipeline[head];
+         if (entry.readyCycle > m_cycle)
+             break;
+         if (entry.writesMac)
+-            m_state.mac = entry.mac;
++            mac = entry.mac;
+         if (entry.writesStatus)
+         {
+             const uint32_t current = entry.status & 0xFu;
+-            m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
++            status = (status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+         }
+         if (entry.writesSticky)
+-        {
+-            m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
+-        }
++            status = (status & 0x03Fu) | (entry.status & 0xFC0u);
+         if (entry.writesClip)
+-            m_state.clip = entry.clip;
++            clip = entry.clip;
+     }
++    m_state.mac = mac;
++    m_state.status = status;
++    m_state.clip = clip;
++    m_flagHead = head;
++    m_flagCount = count;
+ }
+ 
+ // Entries issued this cycle (an upper op paired with FSSET/FCSET) are the newest ones.
+@@ -447,6 +453,33 @@ void VU1Interpreter::progressXgkick()
+     }
+ }
+ 
++// progressXgkick for every cycle through cycle (the lean engine's lazy PATH1). Inside a GIF tag's data the per-cycle
++// step only copies a qword every second cycle, so those qwords are copied in one go, up to the tag's last one:
++// that one, the tags themselves and a wrap around VU memory go through the per-cycle step.
++void VU1Interpreter::progressXgkickTo(uint64_t cycle)
++{
++    while (m_xgkick.active && m_xgkick.progressedCycle < cycle)
++    {
++        if (m_activeVuData && m_activeVuDataSize != 0u && m_xgkick.currentTagEnd > m_xgkick.copiedBytes + 16u)
++        {
++            const uint64_t byCredit = (m_xgkick.cycleCredit + (cycle - m_xgkick.progressedCycle)) / 2u;
++            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++            const uint64_t qwords = std::min<uint64_t>({byCredit, (m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u - 1u,
++                                                        (m_activeVuDataSize - source) / 16u});
++            if (qwords != 0u)
++            {
++                std::memcpy(m_xgkickPacket.data() + m_xgkick.copiedBytes, m_activeVuData + source, qwords * 16u);
++                m_xgkick.copiedBytes += static_cast<uint32_t>(qwords * 16u);
++                m_xgkick.progressedCycle += qwords * 2u - m_xgkick.cycleCredit; // the cycle the last of them is copied in
++                m_xgkick.cycleCredit = 0u;
++                continue;
++            }
++        }
++        ++m_xgkick.progressedCycle;
++        progressXgkick();
++    }
++}
++
+ void VU1Interpreter::finishXgkick()
+ {
+     if (!m_xgkick.active)
+@@ -804,6 +837,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+     const int previousRoundingMode = std::fegetround();
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
++#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
++    // Denormals-are-zero for the run: the VU has no denormals, and every op here normalizes them to signed zeros
++    // before host arithmetic anyway. With the mode set the host does that itself (ps2_vu1_simd::clampOperands).
++    constexpr unsigned kDenormalsAreZero = 0x0040u;
++    const unsigned previousCsr = _mm_getcsr();
++    _mm_setcsr(previousCsr | kDenormalsAreZero);
++#endif
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     const bool codeCached = prepareDecodedCodeCache(vuCode, codeSize, memory);
+     if (codeCached && m_unit == Unit::VU1 && vu1DumpDir() != nullptr)
+@@ -894,6 +934,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     }
+     syncFlags();
+     m_state.cycles = m_cycle;
++#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
++    _mm_setcsr((_mm_getcsr() & ~kDenormalsAreZero) | (previousCsr & kDenormalsAreZero));
++#endif
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
+ }
+diff --git a/ps2xRuntime/tools/vu1_lean_gen.cpp b/ps2xRuntime/tools/vu1_lean_gen.cpp
+index 89b872d..36cca95 100644
+--- a/ps2xRuntime/tools/vu1_lean_gen.cpp
++++ b/ps2xRuntime/tools/vu1_lean_gen.cpp
+@@ -100,6 +100,8 @@ namespace
+         uint8_t saveUpper = 0, saveLower = 0;
+         bool viPending = false, saveVi = false;
+         bool store = false, kick = false, branch = false;
++        bool fmacFlags = false, readsFlags = false; // queues a MAC/status entry; reads MAC or status
++        bool elide = false;                        // its entry is never observed: only its value is computed
+         Timing before{};           // kick: the timing state at from, for leaving there
+         uint32_t settle = 0;       // kick: from this cycle on (relative) a wait has landed everything in flight
+         int settled = -1;          // kick: the node at this pc after such a wait
+@@ -236,6 +238,8 @@ namespace
+             code_.upper = upper;
+             code_.from = fromRel;
+             code_.store = L::storesVuData(pair);
++            code_.fmacFlags = L::queuesMacFlags(pair);
++            code_.readsFlags = L::readsMacFlags(pair);
+             code_.kick = L::isXgkick(pair);
+             code_.branch = op != 0u;
+             if (code_.kick)
+@@ -354,6 +358,83 @@ namespace
+         }
+     };
+ 
++    // MAC/status entries nothing observes are not computed (PairCode::elide). Points that can observe them:
++    // a MAC/status read at its issue, an XGKICK at from (it may leave or wait), and the node's exit when it ends the
++    // program, leaves, or goes to an unknown node. An exit to known nodes observes nothing itself: what counts is the
++    // first point on any path after it, so loops that never read the flags queue no entries at all. At each point
++    // the entries still in flight and the latest landed one are kept; a later point on the same path can only need
++    // those or newer ones, also when a kick wait in between gave the entries more time to land.
++    void elideFlags(Program &program)
++    {
++        constexpr uint32_t kNever = 1u << 30;
++        const size_t count = program.nodes.size();
++        const auto ownPoints = [](const Node &node)
++        {
++            std::vector<uint32_t> points;
++            for (const PairCode &p : node.pairs)
++            {
++                if (p.readsFlags)
++                    points.push_back(p.issue);
++                if (p.kick)
++                    points.push_back(p.from);
++            }
++            return points;
++        };
++        // first[i]: cycles from node i's start to the first point on any path (kNever: none).
++        std::vector<uint32_t> first(count, kNever);
++        const auto exitPoint = [&](const Node &node)
++        {
++            const Exit &e = node.exit;
++            if (e.kind == Exit::End || e.kind == Exit::Leave || e.targets.empty())
++                return e.rel;
++            uint32_t next = kNever;
++            for (int target : e.targets)
++                next = std::min(next, target < 0 ? 0u : first[static_cast<size_t>(target)]);
++            return next >= kNever ? kNever : e.rel + next;
++        };
++        for (bool changed = true; changed;)
++        {
++            changed = false;
++            for (size_t i = 0; i < count; ++i)
++            {
++                uint32_t value = exitPoint(program.nodes[i]);
++                for (uint32_t t : ownPoints(program.nodes[i]))
++                    value = std::min(value, t);
++                if (value < first[i])
++                {
++                    first[i] = value;
++                    changed = true;
++                }
++            }
++        }
++        for (Node &node : program.nodes)
++        {
++            std::vector<uint32_t> points = ownPoints(node);
++            if (const uint32_t t = exitPoint(node); t < kNever)
++                points.push_back(t);
++            for (PairCode &p : node.pairs)
++                p.elide = p.fmacFlags;
++            for (uint32_t t : points)
++            {
++                int latest = -1;
++                for (size_t i = 0; i < node.pairs.size(); ++i)
++                {
++                    PairCode &p = node.pairs[i];
++                    if (!p.fmacFlags || p.issue > t)
++                        continue;
++                    if (p.issue + L::kFlagLatency > t)
++                        p.elide = false; // in flight
++                    else if (latest < 0 || p.issue >= node.pairs[latest].issue)
++                        latest = static_cast<int>(i);
++                }
++                if (latest >= 0)
++                    node.pairs[latest].elide = false;
++            }
++        }
++    }
++
++    bool g_stickyStatusUsed = false; // a compiled program sets or tests sticky status bits
++
+     Program compileProgram(const std::vector<uint8_t> &code, uint32_t entry)
+     {
+         Program program;
+@@ -397,6 +478,7 @@ namespace
+                 for (uint32_t c : e.candidates)
+                     e.targets.push_back(idOf(c, succ));
+         }
++        elideFlags(program);
+         return program;
+     }
+ 
+@@ -473,7 +555,7 @@ namespace
+                     os << "    vu.state().pc = " << hex(p.pc) << ";\n";
+                 os << "    L::pair<" << hex(p.lower) << ", " << hex(p.upper) << ", " << unsigned(p.saveUpper) << ", "
+                    << unsigned(p.saveLower) << ", " << (p.viPending ? "true" : "false") << ", " << (p.saveVi ? "true" : "false")
+-                   << ">(vu);\n";
++                   << (p.elide && !g_stickyStatusUsed ? ", true" : "") << ">(vu);\n";
+                 if (p.branch)
+                     os << "    const bool taken = L::taken(vu);\n    const uint32_t target = L::target(vu);\n    (void)taken, (void)target;\n";
+             }
+@@ -606,6 +688,8 @@ int main(int argc, char **argv)
+             if (program.pairCount() == 0u)
+                 continue; // it leaves before its first pair: the interpreter runs it
+             std::string key = std::to_string(entry);
++            for (const auto &[pc, words] : program.covered)
++                g_stickyStatusUsed |= L::touchesStickyStatus(L::decode(words.first, words.second));
+             for (const auto &[pc, words] : program.covered)
+                 key += "," + std::to_string(pc) + ":" + std::to_string(words.first) + ":" + std::to_string(words.second);
+             programs.emplace(std::move(key), std::move(program));

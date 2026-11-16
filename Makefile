@@ -59,12 +59,14 @@ RECOMP_BIN := $(PS2RECOMP)/out/linux
 # stays interpreted. Both are game code, so they live in build/.
 VU1_DUMPS := build/vu1/dumps
 VU1_OUT   := build/vu1/src
+# About 3 MB of lean source per file keeps one compile near 2 GB of memory (1131 programs: 36 files).
+VU1_LEAN_FILES ?= 36
 vu1:
 	@mkdir -p $(VU1_DUMPS)
 	python3 tools/vu1_compile.py $(VU1_OUT) $(VU1_DUMPS)
 	test -f $(RECOMP_BIN)/build.ninja -o -f $(RECOMP_BIN)/Makefile || cmake -S $(PS2RECOMP) -B $(RECOMP_BIN)
 	cmake --build $(RECOMP_BIN) --target ps2x_vu1_lean_gen
-	$(RECOMP_BIN)/ps2xRuntime/ps2x_vu1_lean_gen $(VU1_OUT) $(VU1_DUMPS)
+	$(RECOMP_BIN)/ps2xRuntime/ps2x_vu1_lean_gen --files $(VU1_LEAN_FILES) $(VU1_OUT) $(VU1_DUMPS)
 
 # Function boundaries from splat, SDK names from the recomp config.
 build/functions.csv: asm/main/000000.s $(RECOMP_CFG) tools/funcs_csv.py
