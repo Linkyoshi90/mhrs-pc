@@ -1,0 +1,22 @@
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 421a76c..bfb55f6 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -616,7 +616,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+         : FAST_READ64(_addr); }())
+ 
+ #define READ128(addr) ([&]() -> __m128i {                     \
+-    uint32_t _addr = (uint32_t)(addr);                        \
++    uint32_t _addr = (uint32_t)(addr) & ~0xFu;                        \
+     return PS2Runtime::isSpecialAddress(_addr)                \
+         ? runtime->Load128(rdram, ctx, _addr)                 \
+         : FAST_READ128(_addr); }())
+@@ -676,7 +676,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+ #define WRITE128(addr, val)                                                          \
+     do                                                                               \
+     {                                                                                \
+-        uint32_t _addr = (addr);                                                     \
++        uint32_t _addr = (uint32_t)(addr) & ~0xFu; /* LQ/SQ ignore the low 4 bits */                                                     \
+         __m128i _value = (val);                                                      \
+         if (PS2Runtime::isSpecialAddress(_addr))                                     \
+             runtime->Store128(rdram, ctx, _addr, _value);                            \

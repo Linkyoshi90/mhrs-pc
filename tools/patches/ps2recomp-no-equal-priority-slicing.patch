@@ -1,0 +1,16 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 3943e39..ba119fd 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -485,7 +485,10 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     }
+ 
+     const GuestThread *running = currentThread();
+-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
++    // The EE kernel never round-robins equal priorities (only RotateThreadReadyQueue or blocking does);
++    // slicing them broke the game's unlocked list updates. Only a missed higher-priority wake switches here.
++    if (running != nullptr && running->currentPriority > 0 &&
++        hasReadyAtOrAbovePriority(running->currentPriority - 1))
+     {
+         m_rescheduleRequested = true;
+         m_timeSliceExpired = true;

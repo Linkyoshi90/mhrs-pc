@@ -1,0 +1,23 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 5cc61eb..c8cda3a 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1421,7 +1421,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // One tag per quadword of RAM: only a cyclic chain is longer. (4096 cut off long display lists.)
++                    const int kMaxChainTags = PS2_RAM_SIZE / 16;
+                     std::vector<uint8_t> chainBuf;
+                     // Chains of a channel tend to be alike in size: start from the last one's.
+                     static size_t lastChainBytes[3] = {0u, 0u, 0u};
+@@ -1606,6 +1607,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         if (endChain)
+                             break;
+                     }
++                    if (tagsProcessed >= kMaxChainTags)
++                        std::cerr << "[dma] chain at 0x" << std::hex << channelBase << " cut off after " << std::dec << tagsProcessed << " tags" << std::endl;
+ 
+                     if (channelBase == 0x10009000u) // TEMP-DEBUG(mhrs): VIF1 chain carrying UNPACK V4-32 num=4 addr=4 with zero data
+                     {

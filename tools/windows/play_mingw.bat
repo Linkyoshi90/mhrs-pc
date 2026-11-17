@@ -6,6 +6,8 @@ cd /d %~dp0..\..
 set PS2X_GS_BACKEND=vulkan
 set PS2X_VK_RASTER=1
 set PS2_VU1_DUMP_DIR=build\vu1\dumps
+rem TEMP-DEBUG(mhrs): sound-chip register trace into build\play.log (~30 MB per hour) to find missing sound effects
+set MHRS_SPU2_LOG=1
 set EXEDIR=%~1
 if "%EXEDIR%"=="" set EXEDIR=build\mingw_play
 "%EXEDIR%\ps2EntryRunner.exe" extracted\MOH3RDVD.ELF "ISO\Medal of Honor - Rising Sun.iso" > build\play.log 2>&1

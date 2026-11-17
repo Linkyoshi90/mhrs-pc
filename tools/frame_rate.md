@@ -23,6 +23,11 @@ Played by hand, mission 1 held 30 fps up to the fire-extinguishing part. There t
 watchdog (`func_002CB720`, a counted busy loop) ran out during a slow frame. The count is patched to stand
 still (`recomp/moh3rdvd.toml`), and the 465 microprograms that play session recorded are compiled in now.
 
+The cutscene on arriving on deck then froze: the runtime walked at most 4096 tags of a DMA chain, and that
+scene's VIF1 display list is longer, so its end and the VIF1 interrupt the game waits for were never processed
+(`ps2recomp-dma-chain-length` lifts the limit). A cut-off chain leaves D1_CHCR with STR clear and a tag id
+other than 7.
+
 What changed on 2026-11-16 (new VU1 captures, PS2Recomp patches `ps2recomp-vu1-lean-values-only` and
 `ps2recomp-worker-queue-spin`):
 

@@ -77,3 +77,9 @@ ps2recomp-vu1-lean-values-only.patch
 ps2recomp-worker-queue-spin.patch
 ps2recomp-fast-forward.patch
 ps2recomp-vu1-dump-uncovered.patch
+ps2recomp-dma-chain-length.patch
+ps2recomp-spu2-voices.patch
+ps2recomp-fpu-compare-no-nan.patch
+ps2recomp-no-equal-priority-slicing.patch
+ps2recomp-lq-sq-align.patch
+ps2recomp-runtime-pools-kernel-area.patch
