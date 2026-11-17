@@ -1,0 +1,96 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 2e928b1..1d5e3c5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2557,6 +2557,37 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+     m_transferState.direction = command.direction;
+     m_transferState.localToHostPendingBytes = 0u;
+ 
++    { // TEMP-DEBUG(mhrs): MHRS_UPLOAD_LOG=1 logs every transfer begin
++        static const bool logUl = std::getenv("MHRS_UPLOAD_LOG") != nullptr;
++        if (logUl)
++            std::fprintf(stderr, "[ul] B dir=%u dpsm=%u dbp=%u dbw=%u dst=(%u,%u) rrw=%u rrh=%u\n",
++                         command.direction, command.bitbltbuf.dpsm, command.bitbltbuf.dbp, command.bitbltbuf.dbw,
++                         command.trxpos.dsax, command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh);
++    }
++    { // TEMP-DEBUG(mhrs) gsrec: MHRS_GSREC_ON_STRIP=1 arms the recorder on the first 16x224 FMV strip upload
++        static const bool armStrip = std::getenv("MHRS_GSREC_ON_STRIP") != nullptr;
++        if (armStrip && g_gsrecLeft < 0 && command.direction == 0u &&
++            command.trxreg.rrw == 16u && command.trxreg.rrh == 224u)
++        {
++            const char *n = std::getenv("MHRS_GSREC_N");
++            g_gsrecLeft = n ? std::atoi(n) : 40;
++            const std::string path = std::string(std::getenv("HOME")) + "/mhrs-gstrace/trace.bin";
++            g_gsrec = std::fopen(path.c_str(), "wb");
++            g_gsrecOwner = this;
++            if (g_gsrec)
++            {
++                const uint32_t hdr[4] = {0x52545347u, 1u, static_cast<uint32_t>(sizeof(GSPrimitiveBatch)), m_vramSize};
++                std::fwrite(hdr, 1, sizeof(hdr), g_gsrec);
++                std::fwrite(m_vram, 1, m_vramSize, g_gsrec);
++                std::fwrite(m_clut.data(), 1, sizeof(m_clut), g_gsrec);
++                std::fwrite(m_clutCbp.data(), 1, sizeof(m_clutCbp), g_gsrec);
++                std::fwrite(&m_transfer, 1, sizeof(m_transfer), g_gsrec);
++                std::fwrite(&m_transferState, 1, sizeof(m_transferState), g_gsrec);
++                std::cerr << "[gsrec] strip-armed start" << std::endl;
++            }
++        }
++    }
++
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+     else if (command.direction == 1u)
+@@ -2567,6 +2598,20 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (data) { gsrec(this, 'U', &sizeBytes, 4); if (g_gsrec && this == g_gsrecOwner) std::fwrite(data, 1, sizeBytes, g_gsrec); } // TEMP-DEBUG(mhrs) gsrec
++    { // TEMP-DEBUG(mhrs): MHRS_UPLOAD_DUMP=1 dumps each upload payload + shape
++        static const bool dumpUl = std::getenv("MHRS_UPLOAD_DUMP") != nullptr;
++        if (dumpUl && data && sizeBytes)
++        {
++            static uint32_t s_ulSeq = 0;
++            char path[96];
++            std::snprintf(path, sizeof(path), "build/ul_%04u_dbp%u_bw%u_psm%u_%ux%u_at%u,%u.bin",
++                          s_ulSeq, m_transfer.bitbltbuf.dbp, m_transfer.bitbltbuf.dbw, m_transfer.bitbltbuf.dpsm,
++                          m_transfer.trxreg.rrw, m_transfer.trxreg.rrh, m_transfer.trxpos.dsax, m_transfer.trxpos.dsay);
++            if (FILE *f = std::fopen(path, "wb")) { std::fwrite(data, 1, sizeBytes, f); std::fclose(f); }
++            std::fprintf(stderr, "[ul] U #%u %u bytes -> %s\n", s_ulSeq, sizeBytes, path);
++            ++s_ulSeq;
++        }
++    }
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+@@ -2953,8 +2998,10 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+     g_mhrsPresents.fetch_add(1, std::memory_order_relaxed); // TEMP-DEBUG(mhrs)
+     { // TEMP-DEBUG(mhrs) gsrec: start/stop the backend call recorder
+         static const char *at = std::getenv("MHRS_GSREC");
+-        static uint64_t busy = 0; // TEMP-DEBUG(mhrs) gsrec: MHRS_GSREC counts busy presents (>= 50k prims), not presents
+-        if (at && g_gsrecLeft < 0 && g_mhrsFramePrims.load() >= 50000u && ++busy >= std::strtoull(at, nullptr, 10))
++        static const char *primMinEnv = std::getenv("MHRS_GSREC_PRIMS"); // TEMP-DEBUG(mhrs) gsrec: override prim threshold (e.g. 0 for FMV)
++        static const uint64_t primMin = primMinEnv ? std::strtoull(primMinEnv, nullptr, 10) : 50000ull; // TEMP-DEBUG(mhrs) gsrec
++        static uint64_t busy = 0; // TEMP-DEBUG(mhrs) gsrec: MHRS_GSREC counts busy presents (>= primMin prims), not presents
++        if (at && g_gsrecLeft < 0 && g_mhrsFramePrims.load() >= primMin && ++busy >= std::strtoull(at, nullptr, 10))
+         {
+             std::lock_guard<std::mutex> l(m_mutex);
+             const char *n = std::getenv("MHRS_GSREC_N");
+@@ -3015,6 +3062,19 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+                         std::fwrite(frame.pixels.data() + (y * 640u + x) * 4u, 1, 3, f);
+                 std::fclose(f);
+             }
++            if (std::getenv("MHRS_DUMP_ASM")) // TEMP-DEBUG(mhrs): raw VRAM of the assembled FMV texture (fbp=140, CT32 640x512)
++            {
++                char apath[64];
++                std::snprintf(apath, sizeof(apath), "build/asm_%03llu.bin", static_cast<unsigned long long>(written - 1));
++                if (FILE *af = std::fopen(apath, "wb"))
++                {
++                    const size_t base = 140ull * 2048ull * 4ull;
++                    const size_t len = 640ull * 512ull * 4ull;
++                    if (snapshot.size() >= base + len)
++                        std::fwrite(snapshot.data() + base, 1, len, af);
++                    std::fclose(af);
++                }
++            }
+             std::ostringstream os; // TEMP-DEBUG(mhrs): display regs, draw targets and non-black 640x448 PSMCT32 buffers
+             os << "[mhrs-frame] #" << (written - 1) << std::hex << " pmode=0x" << request.pmode << " smode2=0x" << request.smode2
+                << " dispfb1=0x" << request.dispfb1 << " display1=0x" << request.display1 << " dispfb2=0x" << request.dispfb2

@@ -1,0 +1,21 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 72930bc..754e994 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1739,9 +1739,15 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+     batch.state.textureWidth = static_cast<uint16_t>(1u << std::min<uint32_t>(batch.state.context.tex0.tw, 10u));
+     batch.state.textureHeight = static_cast<uint16_t>(1u << std::min<uint32_t>(batch.state.context.tex0.th, 10u));
+     const uint64_t tex1 = batch.state.context.tex1;
++    const uint8_t mxl = static_cast<uint8_t>((tex1 >> 2u) & 0x7u);
+     const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
+     const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
+-    batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
++    // Real GS: with MXL==0 the LOD is forced to 0 (magnification), so only MMAG selects
++    // the filter and MMIN is ignored. Honoring MMIN here made mipless nearest draws
++    // (e.g. FMV strip blits with MMIN=4) sample bilinearly, wrapping REPEAT textures
++    // across the right edge and leaving visible vertical seam lines.
++    batch.state.linearFilter = (mxl == 0u) ? (mmag != 0u)
++                                           : (mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u);
+     return batch;
+ }
+ 

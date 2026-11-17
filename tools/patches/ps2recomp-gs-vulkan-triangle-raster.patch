@@ -1,0 +1,2488 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 832bef1..bae132b 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -551,7 +551,7 @@ find_program(PS2X_GLSLANG_VALIDATOR
+ )
+ if(Vulkan_FOUND AND PS2X_GLSLANG_VALIDATOR AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+     set(PS2X_VK_SHADER_HEADERS "")
+-    foreach(PS2X_VK_SHADER IN ITEMS "present_deswizzle:kPresentDeswizzleSpv" "raster_sprite:kRasterSpriteSpv")
++    foreach(PS2X_VK_SHADER IN ITEMS "present_deswizzle:kPresentDeswizzleSpv" "raster_sprite:kRasterSpriteSpv" "raster_triangle:kRasterTriangleSpv")
+         string(REGEX MATCH "^([^:]+):(.+)$" _ "${PS2X_VK_SHADER}")
+         set(PS2X_VK_SHADER_NAME "${CMAKE_MATCH_1}")
+         set(PS2X_VK_SHADER_VAR "${CMAKE_MATCH_2}")
+@@ -560,8 +560,8 @@ if(Vulkan_FOUND AND PS2X_GLSLANG_VALIDATOR AND NOT PS2X_IS_VITA AND NOT PS2X_IS_
+         add_custom_command(
+             OUTPUT "${PS2X_VK_SHADER_HEADER}"
+             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+-            COMMAND "${PS2X_GLSLANG_VALIDATOR}" -V --vn "${PS2X_VK_SHADER_VAR}" "${PS2X_VK_SHADER_SOURCE}" -o "${PS2X_VK_SHADER_HEADER}"
+-            DEPENDS "${PS2X_VK_SHADER_SOURCE}"
++            COMMAND "${PS2X_GLSLANG_VALIDATOR}" -V -I"${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/shaders" --vn "${PS2X_VK_SHADER_VAR}" "${PS2X_VK_SHADER_SOURCE}" -o "${PS2X_VK_SHADER_HEADER}"
++            DEPENDS "${PS2X_VK_SHADER_SOURCE}" "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/shaders/gs_raster_common.glsl"
+             VERBATIM
+         )
+         list(APPEND PS2X_VK_SHADER_HEADERS "${PS2X_VK_SHADER_HEADER}")
+diff --git a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+index b9720ee..8ab3363 100755
+--- a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+@@ -56,14 +56,26 @@ private:
+     bool m_gpuOk = false;
+     bool m_gpuPresent = false;
+     bool m_gpuRaster = false;
++    bool m_gpuTriangles = false;
+     bool m_rasterVerify = false;
+ 
+     bool initVulkan();
+     void shutdownVulkan();
+     PresentationFrame presentGpu(const GSPresentationRequest &request);
+     // Compute-shader sprite rasterization (PS2X_VK_RASTER=1); PS2X_VK_RASTER_VERIFY=1
+-    // replays each sprite through the CPU backend on the same VRAM and diffs 4MB.
++    // replays each primitive through the CPU backend on the same VRAM and diffs 4MB.
+     void submitSpriteGpu(const GSPrimitiveBatch &batch);
++    // Compute-shader triangle rasterization (same flags); needs shaderFloat64 for Z.
++    void submitTriangleGpu(const GSPrimitiveBatch &batch);
++    // Shared tail of the two raster paths: CLUT mirror, params upload, dispatch, fence
++    // wait and the verify replay. useTrianglePipeline keeps VkPipeline out of this header.
++    void runRasterDispatch(const GSPrimitiveBatch &batch,
++                           bool useTrianglePipeline,
++                           const void *params,
++                           size_t paramsSize,
++                           uint32_t groupsX,
++                           uint32_t groupsY,
++                           const char *tag);
+     // Mirrors GSCpuBackend::CopyFrameToHostRgba(useLocalMemoryLayout=true) on the GPU.
+     bool gpuCopyFrame(const GSFrameReg &frame,
+                       uint32_t width,
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 1d5e3c5..4ff1c24 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1888,6 +1888,23 @@ GSCpuBackend::PaletteCache *GSCpuBackend::PaletteFor(const TexSampler &sampler)
+ // FetchTexel for a TexSampler: the same read through the cache, palette entries looked up once per thread.
+ uint32_t GSCpuBackend::FetchTexelFast(GSMem::TexturePageCache &cache, const TexSampler &sampler, PaletteCache *palette, int u, int v)
+ {
++    // TRI_DEBUG (dev-only, TRI_DEBUG_STRIP): trace the cached read for PS2X_TRI_DEBUG_UV.
++    static int dbgU = -2, dbgV = -2;
++    if (dbgU == -2)
++    {
++        dbgU = -1;
++        if (const char *env = std::getenv("PS2X_TRI_DEBUG_UV"))
++            std::sscanf(env, "%d,%d", &dbgU, &dbgV);
++    }
++    if (dbgU >= 0 && u == dbgU && v == dbgV)
++    {
++        const uint32_t direct = GSMem::ReadPixel(m_vram, sampler.psm, sampler.tbp0, sampler.tbw,
++                                                 static_cast<uint32_t>(u), static_cast<uint32_t>(v));
++        const uint32_t cached = GSMem::ReadPixel(m_vram, sampler.psm, sampler.tbp0, sampler.tbw,
++                                                 static_cast<uint32_t>(u), static_cast<uint32_t>(v), &cache);
++        std::fprintf(stderr, "[cpu-fetch] (%d,%d) direct=0x%08x cached=0x%08x pageBase=0x%x\n",
++                     u, v, direct, cached, cache.PageBase());
++    }
+     const uint32_t out = GSMem::ReadPixel(m_vram, sampler.psm, sampler.tbp0, sampler.tbw, static_cast<uint32_t>(u), static_cast<uint32_t>(v), &cache);
+     switch (sampler.kind)
+     {
+@@ -1931,10 +1948,30 @@ uint32_t GSCpuBackend::SampleTextureFast(TexelSource &texels, const TexSampler &
+         texVf = t * invQ * static_cast<float>(texH);
+     }
+ 
++    // TRI_DEBUG (dev-only, TRI_DEBUG_STRIP): trace the tap for PS2X_TRI_DEBUG_UV=u,v.
++    static int dbgU = -2, dbgV = -2;
++    if (dbgU == -2)
++    {
++        dbgU = -1;
++        if (const char *env = std::getenv("PS2X_TRI_DEBUG_UV"))
++            std::sscanf(env, "%d,%d", &dbgU, &dbgV);
++    }
++    const bool dbgTap = dbgU >= 0 && u == static_cast<uint16_t>(dbgU) && v == static_cast<uint16_t>(dbgV);
++
+     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+     {
+         sampleU = wrapTextureCoordinate(sampleU, texW, sampler.wrapU, sampler.minU, sampler.maxU);
+         sampleV = wrapTextureCoordinate(sampleV, texH, sampler.wrapV, sampler.minV, sampler.maxV);
++        if (dbgTap)
++        {
++            const uint32_t raw = GSMem::ReadPixel(m_vram, sampler.psm, sampler.tbp0, sampler.tbw,
++                                                  static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV));
++            std::fprintf(stderr, "[cpu-tap] texW=%d texH=%d wrap=%u/%u minmaxU=%u-%u minmaxV=%u-%u wrapped=(%d,%d) decoded=%d raw=0x%08x ta0=%u ta1=%u aem=%u psm=%u\n",
++                         texW, texH, sampler.wrapU, sampler.wrapV, sampler.minU, sampler.maxU,
++                         sampler.minV, sampler.maxV, sampleU, sampleV, texels.decoded != nullptr,
++                         raw, sampler.state->texa.ta0, sampler.state->texa.ta1,
++                         sampler.state->texa.aem ? 1 : 0, sampler.psm);
++        }
+         if (texels.decoded)
+         {
+             texels.lastU = sampleU;
+@@ -2253,9 +2290,21 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+             _mm_store_ps(fogs, interp(vFog));
+             for (int lane = 0; lane < lanes; ++lane)
+             {
++                const int x = xb + lane;
++                // TRI_DEBUG (dev-only, TRI_DEBUG_STRIP): PS2X_TRI_DEBUG=x,y prints intermediates.
++                static int dbgX = -2, dbgY = -2;
++                if (dbgX == -2)
++                {
++                    dbgX = -1;
++                    if (const char *env = std::getenv("PS2X_TRI_DEBUG"))
++                        std::sscanf(env, "%d,%d", &dbgX, &dbgY);
++                }
++                const bool dbgPix = x == dbgX && y == dbgY;
++                if (dbgPix)
++                    std::fprintf(stderr, "[cpu-tri] px=(%d,%d) w0=%a w1=%a w2=%a outside=%d\n",
++                                 x, y, w0s[lane], w1s[lane], w2s[lane], (outside >> lane) & 1);
+                 if (outside & (1 << lane))
+                     continue;
+-                const int x = xb + lane;
+                 const float w0 = w0s[lane];
+                 const float w1 = w1s[lane];
+                 const float w2 = w2s[lane];
+@@ -2314,12 +2363,43 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+                         }
+                         if (zfail)
+                         {
++                            if (dbgPix)
++                                std::fprintf(stderr, "[cpu-tri]   pretest zfail: zValue=0x%08x (skip)\n", zValue);
+                             SkipTexels(texels, sampler, is, it, iq, iu, iv);
+                             continue;
+                         }
+                     }
+                     uint32_t texel = SampleTextureFast(texels, sampler, palette, is, it, iq, iu, iv);
+ 
++                    if (dbgPix)
++                    {
++                        // TRI_DEBUG: replicate the nearest/base tap to expose wrapped coords + raw fetch.
++                        float dUf, dVf;
++                        if (state.prim.fst)
++                        {
++                            dUf = static_cast<float>(iu) / 16.0f;
++                            dVf = static_cast<float>(iv) / 16.0f;
++                        }
++                        else
++                        {
++                            const float invQ = 1.0f / fabsQ(iq);
++                            dUf = is * invQ * static_cast<float>(sampler.texW);
++                            dVf = it * invQ * static_cast<float>(sampler.texH);
++                        }
++                        int su = static_cast<int>(dUf), sv = static_cast<int>(dVf);
++                        if (sampler.linear)
++                        {
++                            su = static_cast<int>(std::floor(dUf - 0.5f));
++                            sv = static_cast<int>(std::floor(dVf - 0.5f));
++                        }
++                        su = wrapTextureCoordinate(su, sampler.texW, sampler.wrapU, sampler.minU, sampler.maxU);
++                        sv = wrapTextureCoordinate(sv, sampler.texH, sampler.wrapV, sampler.minV, sampler.maxV);
++                        const uint32_t raw = GSMem::ReadPixel(m_vram, sampler.psm, sampler.tbp0, sampler.tbw,
++                                                              static_cast<uint32_t>(su), static_cast<uint32_t>(sv));
++                        std::fprintf(stderr, "[cpu-tri]   iu=%u iv=%u ss=%a ts=%a is=%a it=%a iq=%a wrapped=(%d,%d) raw=0x%08x texel=0x%08x\n",
++                                     iu, iv, ss[lane], ts[lane], is, it, iq, su, sv, raw, texel);
++                    }
++
+                     uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+                     uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+                     uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
+@@ -2339,6 +2419,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+                 }
+ 
+                 const uint8_t fog = clampU8(static_cast<int>(fogs[lane]));
++                if (dbgPix)
++                    std::fprintf(stderr, "[cpu-tri]   rgba=(%u,%u,%u,%u) fog=%u z=%.17g zValue=0x%08x\n",
++                                 r, g, b, a, fog, z, static_cast<u32>(z + 0.5));
+                 WritePixelFast(pipe, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+             }
+         }
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index caf978a..8eb3203 100755
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -1,9 +1,11 @@
+ #include "runtime/gs/gs_vulkan_backend.h"
+ 
+ #include "runtime/gs/ps2_gs_common.h"
++#include "runtime/gs/ps2_gs_memory.h"
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstddef>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -14,6 +16,7 @@
+ #include <vulkan/vulkan.h>
+ #include "present_deswizzle.h" // generated by glslangValidator --vn kPresentDeswizzleSpv
+ #include "raster_sprite.h"     // generated by glslangValidator --vn kRasterSpriteSpv
++#include "raster_triangle.h"   // generated by glslangValidator --vn kRasterTriangleSpv
+ #endif
+ 
+ namespace
+@@ -199,6 +202,8 @@ struct GSVulkanBackend::VkState
+     void *paramsMapped = nullptr;
+ 
+     VkPipeline rasterPipeline = VK_NULL_HANDLE;
++    VkPipeline trianglePipeline = VK_NULL_HANDLE;
++    bool shaderFloat64 = false;
+ 
+     VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
+     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+@@ -324,9 +329,17 @@ bool GSVulkanBackend::initVulkan()
+     queueInfo.queueFamilyIndex = vk.queueFamily;
+     queueInfo.queueCount = 1;
+     queueInfo.pQueuePriorities = &priority;
++    // The triangle rasterizer needs float64 for Z (like the CPU); sprites and present
++    // don't. Enable it when supported, otherwise triangles stay on the CPU backend.
++    VkPhysicalDeviceFeatures supportedFeatures{};
++    vkGetPhysicalDeviceFeatures(vk.phys, &supportedFeatures);
++    vk.shaderFloat64 = supportedFeatures.shaderFloat64 == VK_TRUE;
++    VkPhysicalDeviceFeatures enabledFeatures{};
++    enabledFeatures.shaderFloat64 = supportedFeatures.shaderFloat64;
+     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+     deviceInfo.queueCreateInfoCount = 1;
+     deviceInfo.pQueueCreateInfos = &queueInfo;
++    deviceInfo.pEnabledFeatures = &enabledFeatures;
+     if (vkCreateDevice(vk.phys, &deviceInfo, nullptr, &vk.device) != VK_SUCCESS)
+     {
+         std::cerr << "[gs-vulkan] vkCreateDevice failed, CPU fallback" << std::endl;
+@@ -464,6 +477,28 @@ bool GSVulkanBackend::initVulkan()
+     if (rasterResult != VK_SUCCESS)
+         return false;
+ 
++    // Triangle rasterizer pipeline (same layout; needs shaderFloat64 for Z). When the
++    // device lacks float64 this stays null and triangles run on the CPU backend.
++    if (vk.shaderFloat64)
++    {
++        VkShaderModuleCreateInfo triShaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++        triShaderInfo.codeSize = sizeof(kRasterTriangleSpv);
++        triShaderInfo.pCode = kRasterTriangleSpv;
++        VkShaderModule triShaderModule = VK_NULL_HANDLE;
++        VkComputePipelineCreateInfo triPipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++        triPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++        triPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++        triPipelineInfo.stage.pName = "main";
++        triPipelineInfo.layout = vk.pipelineLayout;
++        if (vkCreateShaderModule(vk.device, &triShaderInfo, nullptr, &triShaderModule) == VK_SUCCESS)
++        {
++            triPipelineInfo.stage.module = triShaderModule;
++            if (vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &triPipelineInfo, nullptr, &vk.trianglePipeline) != VK_SUCCESS)
++                std::cerr << "[gs-vulkan] triangle pipeline creation failed, triangles on CPU" << std::endl;
++            vkDestroyShaderModule(vk.device, triShaderModule, nullptr);
++        }
++    }
++
+     VkCommandPoolCreateInfo commandPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+     commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+     commandPoolInfo.queueFamilyIndex = vk.queueFamily;
+@@ -503,6 +538,8 @@ void GSVulkanBackend::shutdownVulkan()
+             vkDestroyPipeline(vk.device, vk.pipeline, nullptr);
+         if (vk.rasterPipeline)
+             vkDestroyPipeline(vk.device, vk.rasterPipeline, nullptr);
++        if (vk.trianglePipeline)
++            vkDestroyPipeline(vk.device, vk.trianglePipeline, nullptr);
+         if (vk.pipelineLayout)
+             vkDestroyPipelineLayout(vk.device, vk.pipelineLayout, nullptr);
+         if (vk.descriptorPool)
+@@ -718,7 +755,8 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+ 
+ namespace
+ {
+-    // Matches the std430 Params block in raster_sprite.comp exactly (all 4-byte fields).
++    // Matches the std430 Params block in gs_raster_common.glsl exactly (the shared
++    // include of raster_sprite.comp and raster_triangle.comp).
+     struct SpriteParams
+     {
+         int32_t drawX0, drawY0, drawX1, drawY1;
+@@ -741,19 +779,92 @@ namespace
+         uint32_t tcc, tfx;
+         uint32_t ta0, ta1, aem;
+         uint32_t cpsm, csm, csa;
++        // Triangle extension (raster_triangle.comp only; matches DrawTriangle).
++        float fx0, fy0, fx1, fy1, fx2, fy2;
++        float winding, invAbsDenom;
++        float edgeA0, edgeA1; // fy1 - fy2, fy2 - fy0
++        int32_t triMinX, triMinY, triMaxX, triMaxY;
++        float attrR0, attrR1, attrR2;
++        float attrG0, attrG1, attrG2;
++        float attrB0, attrB1, attrB2;
++        float attrA0, attrA1, attrA2;
++        float attrS0, attrS1, attrS2; // FST: u as float; STQ: s
++        float attrT0, attrT1, attrT2;
++        float attrQ0, attrQ1, attrQ2;
++        float attrFog0, attrFog1, attrFog2;
++        uint32_t iip, pad0; // pad0 keeps the doubles 8-byte aligned (std430)
++        double triZ0, triZ1, triZ2;
+     };
+     static_assert(sizeof(SpriteParams) <= 1024u);
++    static_assert(offsetof(SpriteParams, triZ0) % 8 == 0);
+ 
+     float spriteFabsQ(float q)
+     {
+         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
+     }
++
++    // MakePixelPipe + MakeTexSampler + combine state; shared by the sprite and triangle
++    // raster paths.
++    void fillPipeParams(SpriteParams &p, const GSDrawState &state)
++    {
++        const GSContext &ctx = state.context;
++
++        // MakePixelPipe equivalents.
++        p.sx0 = ctx.scissor.x0;
++        p.sx1 = ctx.scissor.x1;
++        p.sy0 = ctx.scissor.y0;
++        p.sy1 = ctx.scissor.y1;
++        p.fge = state.prim.fge ? 1u : 0u;
++        p.fogR = state.fogR;
++        p.fogG = state.fogG;
++        p.fogB = state.fogB;
++        p.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
++        p.fbw = std::max(ctx.frame.fbw, 1u);
++        p.fpsm = ctx.frame.psm;
++        p.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
++        p.zpsm = ctx.zbuf.psm;
++        p.testLo = static_cast<uint32_t>(ctx.test);
++        p.testHi = static_cast<uint32_t>(ctx.test >> 32);
++        p.abe = state.prim.abe ? 1u : 0u;
++        p.pabe = state.pabe ? 1u : 0u;
++        p.asel = ctx.alpha & 3u;
++        p.bsel = (ctx.alpha >> 2u) & 3u;
++        p.csel = (ctx.alpha >> 4u) & 3u;
++        p.dsel = (ctx.alpha >> 6u) & 3u;
++        p.fixv = static_cast<uint32_t>((ctx.alpha >> 32u) & 0xFFu);
++        p.fbaOn = ((ctx.fba & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24) ? 1u : 0u;
++        p.fbmsk = ctx.frame.fbmsk;
++        p.zmask = ctx.zbuf.zmask ? 1u : 0u;
++        p.frame16 = GSInternal::bitsPerPixel(ctx.frame.psm) == 16u ? 1u : 0u;
++
++        // MakeTexSampler + combine state.
++        p.tme = state.prim.tme ? 1u : 0u;
++        p.fst = state.prim.fst ? 1u : 0u;
++        p.linear = state.linearFilter ? 1u : 0u;
++        p.texW = state.textureWidth;
++        p.texH = state.textureHeight;
++        p.wrapU = static_cast<uint32_t>(ctx.clamp & 0x3u);
++        p.wrapV = static_cast<uint32_t>((ctx.clamp >> 2u) & 0x3u);
++        p.minU = static_cast<uint32_t>((ctx.clamp >> 4u) & 0x3FFu);
++        p.maxU = static_cast<uint32_t>((ctx.clamp >> 14u) & 0x3FFu);
++        p.minV = static_cast<uint32_t>((ctx.clamp >> 24u) & 0x3FFu);
++        p.maxV = static_cast<uint32_t>((ctx.clamp >> 34u) & 0x3FFu);
++        p.texPsm = ctx.tex0.psm;
++        p.tbp0 = ctx.tex0.tbp0;
++        p.tbw = ctx.tex0.tbw;
++        p.tcc = ctx.tex0.tcc;
++        p.tfx = ctx.tex0.tfx;
++        p.ta0 = state.texa.ta0;
++        p.ta1 = state.texa.ta1;
++        p.aem = state.texa.aem ? 1u : 0u;
++        p.cpsm = ctx.tex0.cpsm;
++        p.csm = ctx.tex0.csm;
++        p.csa = ctx.tex0.csa;
++    }
+ }
+ 
+ void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
+ {
+-    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+-    VkState &vk = *m_vk;
+     const GSDrawState &state = batch.state;
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+@@ -816,57 +927,150 @@ void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
+     p.vertFog = v1.fog;
+     p.z1 = static_cast<uint32_t>(v1.z);
+ 
+-    // MakePixelPipe equivalents.
+-    p.sx0 = ctx.scissor.x0;
+-    p.sx1 = ctx.scissor.x1;
+-    p.sy0 = ctx.scissor.y0;
+-    p.sy1 = ctx.scissor.y1;
+-    p.fge = state.prim.fge ? 1u : 0u;
+-    p.fogR = state.fogR;
+-    p.fogG = state.fogG;
+-    p.fogB = state.fogB;
+-    p.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+-    p.fbw = std::max(ctx.frame.fbw, 1u);
+-    p.fpsm = ctx.frame.psm;
+-    p.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+-    p.zpsm = ctx.zbuf.psm;
+-    p.testLo = static_cast<uint32_t>(ctx.test);
+-    p.testHi = static_cast<uint32_t>(ctx.test >> 32);
+-    p.abe = state.prim.abe ? 1u : 0u;
+-    p.pabe = state.pabe ? 1u : 0u;
+-    p.asel = ctx.alpha & 3u;
+-    p.bsel = (ctx.alpha >> 2u) & 3u;
+-    p.csel = (ctx.alpha >> 4u) & 3u;
+-    p.dsel = (ctx.alpha >> 6u) & 3u;
+-    p.fixv = static_cast<uint32_t>((ctx.alpha >> 32u) & 0xFFu);
+-    p.fbaOn = ((ctx.fba & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24) ? 1u : 0u;
+-    p.fbmsk = ctx.frame.fbmsk;
+-    p.zmask = ctx.zbuf.zmask ? 1u : 0u;
+-    p.frame16 = GSInternal::bitsPerPixel(ctx.frame.psm) == 16u ? 1u : 0u;
+-
+-    // MakeTexSampler + combine state.
+-    p.tme = state.prim.tme ? 1u : 0u;
+-    p.fst = state.prim.fst ? 1u : 0u;
+-    p.linear = state.linearFilter ? 1u : 0u;
+-    p.texW = texW;
+-    p.texH = texH;
+-    p.wrapU = static_cast<uint32_t>(ctx.clamp & 0x3u);
+-    p.wrapV = static_cast<uint32_t>((ctx.clamp >> 2u) & 0x3u);
+-    p.minU = static_cast<uint32_t>((ctx.clamp >> 4u) & 0x3FFu);
+-    p.maxU = static_cast<uint32_t>((ctx.clamp >> 14u) & 0x3FFu);
+-    p.minV = static_cast<uint32_t>((ctx.clamp >> 24u) & 0x3FFu);
+-    p.maxV = static_cast<uint32_t>((ctx.clamp >> 34u) & 0x3FFu);
+-    p.texPsm = ctx.tex0.psm;
+-    p.tbp0 = ctx.tex0.tbp0;
+-    p.tbw = ctx.tex0.tbw;
+-    p.tcc = ctx.tex0.tcc;
+-    p.tfx = ctx.tex0.tfx;
+-    p.ta0 = state.texa.ta0;
+-    p.ta1 = state.texa.ta1;
+-    p.aem = state.texa.aem ? 1u : 0u;
+-    p.cpsm = ctx.tex0.cpsm;
+-    p.csm = ctx.tex0.csm;
+-    p.csa = ctx.tex0.csa;
++    fillPipeParams(p, state);
++
++    runRasterDispatch(batch, false, &p, sizeof(p),
++                      static_cast<uint32_t>((p.drawX1 - p.drawX0) / 8 + 1),
++                      static_cast<uint32_t>((p.drawY1 - p.drawY0) / 8 + 1),
++                      "sprite");
++}
++
++void GSVulkanBackend::submitTriangleGpu(const GSPrimitiveBatch &batch)
++{
++    const GSDrawState &state = batch.state;
++    const GSVertex &v0 = batch.vertices[0];
++    const GSVertex &v1 = batch.vertices[1];
++    const GSVertex &v2 = batch.vertices[2];
++    const GSContext &ctx = state.context;
++
++    // DrawTriangle's coordinate setup with identical rounding.
++    const int ofx = ctx.xyoffset.ofx >> 4;
++    const int ofy = ctx.xyoffset.ofy >> 4;
++    const float fx0 = v0.x - static_cast<float>(ofx);
++    const float fy0 = v0.y - static_cast<float>(ofy);
++    const float fx1 = v1.x - static_cast<float>(ofx);
++    const float fy1 = v1.y - static_cast<float>(ofy);
++    const float fx2 = v2.x - static_cast<float>(ofx);
++    const float fy2 = v2.y - static_cast<float>(ofy);
++
++    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
++    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
++    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
++    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
++    minX = GSInternal::clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
++    maxX = GSInternal::clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
++    minY = GSInternal::clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
++    maxY = GSInternal::clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
++
++    const float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
++    if (std::fabs(denom) < 0.001f)
++        return; // degenerate: the CPU draws nothing
++    if (minX > maxX || minY > maxY)
++        return; // fully clipped: the CPU's loops run zero iterations
++
++    SpriteParams p{};
++    fillPipeParams(p, state);
++
++    // TRI_DEBUG (dev-only): PS2X_TRI_DEBUG=x,y makes the shader write per-pixel
++    // intermediates back into sprite-only params slots for that pixel.
++    {
++        static int dbgX = -1, dbgY = -1;
++        static bool dbgParsed = false;
++        if (!dbgParsed)
++        {
++            dbgParsed = true;
++            if (const char *env = std::getenv("PS2X_TRI_DEBUG"))
++                std::sscanf(env, "%d,%d", &dbgX, &dbgY);
++        }
++        if (dbgX >= 0)
++        {
++            p.drawX0 = 1; // debug flag (sprite-only field)
++            p.unclippedX0 = dbgX;
++            p.unclippedY0 = dbgY;
++            p.u0f = p.v0f = p.u1f = p.v1f = p.spriteW = p.spriteH = -777.0f;
++            p.vertR = 0xDEAD0001u;
++            p.vertG = 0xDEAD0002u;
++            p.vertB = 0xDEAD0003u;
++            p.vertA = 0xDEAD0004u;
++            p.vertFog = 0xDEAD0005u;
++            p.z1 = 0xDEADBEEFu;
++            p.drawY1 = 0;
++        }
++    }
++
++    p.fx0 = fx0;
++    p.fy0 = fy0;
++    p.fx1 = fx1;
++    p.fy1 = fy1;
++    p.fx2 = fx2;
++    p.fy2 = fy2;
++    p.winding = (denom < 0.0f) ? -1.0f : 1.0f;
++    p.invAbsDenom = 1.0f / std::fabs(denom);
++    p.edgeA0 = fy1 - fy2;
++    p.edgeA1 = fy2 - fy0;
++    p.triMinX = minX;
++    p.triMinY = minY;
++    p.triMaxX = maxX;
++    p.triMaxY = maxY;
++
++    p.attrR0 = static_cast<float>(v0.r);
++    p.attrR1 = static_cast<float>(v1.r);
++    p.attrR2 = static_cast<float>(v2.r);
++    p.attrG0 = static_cast<float>(v0.g);
++    p.attrG1 = static_cast<float>(v1.g);
++    p.attrG2 = static_cast<float>(v2.g);
++    p.attrB0 = static_cast<float>(v0.b);
++    p.attrB1 = static_cast<float>(v1.b);
++    p.attrB2 = static_cast<float>(v2.b);
++    p.attrA0 = static_cast<float>(v0.a);
++    p.attrA1 = static_cast<float>(v1.a);
++    p.attrA2 = static_cast<float>(v2.a);
++    if (state.prim.fst)
++    {
++        // FST interpolates the raw 4.12 fixed-point UVs (u16 widened to float).
++        p.attrS0 = static_cast<float>(v0.u);
++        p.attrS1 = static_cast<float>(v1.u);
++        p.attrS2 = static_cast<float>(v2.u);
++        p.attrT0 = static_cast<float>(v0.v);
++        p.attrT1 = static_cast<float>(v1.v);
++        p.attrT2 = static_cast<float>(v2.v);
++    }
++    else
++    {
++        p.attrS0 = v0.s;
++        p.attrS1 = v1.s;
++        p.attrS2 = v2.s;
++        p.attrT0 = v0.t;
++        p.attrT1 = v1.t;
++        p.attrT2 = v2.t;
++        p.attrQ0 = v0.q;
++        p.attrQ1 = v1.q;
++        p.attrQ2 = v2.q;
++    }
++    p.attrFog0 = static_cast<float>(v0.fog);
++    p.attrFog1 = static_cast<float>(v1.fog);
++    p.attrFog2 = static_cast<float>(v2.fog);
++    p.iip = state.prim.iip ? 1u : 0u;
++    p.triZ0 = v0.z;
++    p.triZ1 = v1.z;
++    p.triZ2 = v2.z;
++
++    runRasterDispatch(batch, true, &p, sizeof(p),
++                      static_cast<uint32_t>((maxX - minX) / 8 + 1),
++                      static_cast<uint32_t>((maxY - minY) / 8 + 1),
++                      "triangle");
++}
++
++void GSVulkanBackend::runRasterDispatch(const GSPrimitiveBatch &batch,
++                                        bool useTrianglePipeline,
++                                        const void *params,
++                                        size_t paramsSize,
++                                        uint32_t groupsX,
++                                        uint32_t groupsY,
++                                        const char *tag)
++{
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    VkState &vk = *m_vk;
+ 
+     // Mirror the current CLUT (widened u16 -> u32) for the indexed fetch path.
+     uint32_t *clutDst = static_cast<uint32_t *>(vk.clutMapped);
+@@ -881,34 +1085,61 @@ void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
+         std::memcpy(before.data(), vk.vramMapped, before.size());
+     }
+ 
+-    std::memcpy(vk.paramsMapped, &p, sizeof(p));
++    std::memcpy(vk.paramsMapped, params, paramsSize);
+ 
+-    vkResetFences(vk.device, 1, &vk.fence);
+-    vkResetCommandBuffer(vk.commandBuffer, 0);
+-    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+-    if (vkBeginCommandBuffer(vk.commandBuffer, &beginInfo) != VK_SUCCESS)
++    // Re-record + submit + wait (used for the first dispatch and for the
++    // dev-only nondeterminism probe below).
++    auto recordSubmitWait = [&]() -> bool
++    {
++        vkResetFences(vk.device, 1, &vk.fence);
++        vkResetCommandBuffer(vk.commandBuffer, 0);
++        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        if (vkBeginCommandBuffer(vk.commandBuffer, &bi) != VK_SUCCESS)
++            return false;
++        vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
++                          useTrianglePipeline ? vk.trianglePipeline : vk.rasterPipeline);
++        vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 0, nullptr);
++        vkCmdDispatch(vk.commandBuffer, groupsX, groupsY, 1);
++        vkEndCommandBuffer(vk.commandBuffer);
++        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++        si.commandBufferCount = 1;
++        si.pCommandBuffers = &vk.commandBuffer;
++        return vkQueueSubmit(vk.queue, 1, &si, vk.fence) == VK_SUCCESS &&
++               vkWaitForFences(vk.device, 1, &vk.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
++    };
++
++    if (!recordSubmitWait())
+     {
++        std::cerr << "[gs-vulkan] " << tag << " dispatch failed, CPU fallback for this primitive" << std::endl;
+         m_cpu.Submit(batch);
+         return;
+     }
+-    vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.rasterPipeline);
+-    vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 0, nullptr);
+-    vkCmdDispatch(vk.commandBuffer,
+-                  static_cast<uint32_t>((p.drawX1 - p.drawX0) / 8 + 1),
+-                  static_cast<uint32_t>((p.drawY1 - p.drawY0) / 8 + 1),
+-                  1);
+-    vkEndCommandBuffer(vk.commandBuffer);
+ 
+-    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+-    submitInfo.commandBufferCount = 1;
+-    submitInfo.pCommandBuffers = &vk.commandBuffer;
+-    if (vkQueueSubmit(vk.queue, 1, &submitInfo, vk.fence) != VK_SUCCESS ||
+-        vkWaitForFences(vk.device, 1, &vk.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
++    // TRI_DEBUG (dev-only): print the shader's per-pixel writeback.
++    static uint64_t dbgDispatchIndex = 0;
++    const uint64_t thisDispatch = dbgDispatchIndex++;
++    if (useTrianglePipeline)
+     {
+-        std::cerr << "[gs-vulkan] sprite dispatch failed, CPU fallback for this primitive" << std::endl;
+-        m_cpu.Submit(batch);
+-        return;
++        const SpriteParams &dp = *static_cast<const SpriteParams *>(params);
++        if (dp.drawX0 == 1)
++        {
++            const SpriteParams &sp = *static_cast<const SpriteParams *>(vk.paramsMapped);
++            std::cerr << "[gpu-tri] d=" << thisDispatch
++                      << " px=(" << dp.unclippedX0 << "," << dp.unclippedY0 << ")"
++                      << std::hexfloat
++                      << " w0=" << sp.u0f << " w1=" << sp.v0f << " w2=" << sp.u1f
++                      << " st=" << sp.spriteW << "," << sp.spriteH << " q=" << sp.v1f
++                      << std::defaultfloat
++                      << " iu=" << sp.vertG << " iv=" << sp.vertB
++                      << " wrapped=(" << (sp.drawX1 & 0xFFFF) << "," << ((sp.drawX1 >> 16) & 0xFFFF) << ")"
++                      << " raw=0x" << std::hex << static_cast<uint32_t>(sp.drawY0) << std::dec
++                      << " texel=0x" << std::hex << sp.vertR << std::dec
++                      << " a=" << sp.vertA << " fog=" << sp.vertFog
++                      << " z=0x" << std::hex << sp.z1 << std::dec
++                      << " marks=" << std::hex << sp.vertG << "/" << sp.drawY1 << std::dec
++                      << std::endl;
++        }
+     }
+ 
+     if (m_rasterVerify)
+@@ -926,41 +1157,101 @@ void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
+                 if (firstDiff == UINT64_MAX)
+                     firstDiff = i;
+             }
+-        static uint64_t checks = 0, mismatches = 0;
++        static uint64_t checks = 0, mismatches = 0, triChecks = 0;
+         ++checks;
++        if (tag[0] == 't')
++            ++triChecks;
+         if (diffBytes != 0)
+         {
+             ++mismatches;
+-            std::cerr << "[gs-vulkan-raster-verify] MISMATCH #" << mismatches << "/" << checks
++            const SpriteParams &p = *static_cast<const SpriteParams *>(params);
++            std::cerr << "[gs-vulkan-raster-verify] MISMATCH " << tag << " #" << mismatches << "/" << checks
++                      << " d=" << thisDispatch
+                       << " diffBytes=" << diffBytes << " first=0x" << std::hex << firstDiff << std::dec
+-                      << " fbp=0x" << std::hex << p.fbp << " fpsm=" << p.fpsm << " tme=" << p.tme
+-                      << " texPsm=" << p.texPsm << " fst=" << p.fst << " linear=" << p.linear
+-                      << " rect=(" << std::dec << p.drawX0 << "," << p.drawY0 << ")-(" << p.drawX1 << "," << p.drawY1 << ")"
++                      << " fbp=0x" << std::hex << p.fbp << " fpsm=" << p.fpsm << " zpsm=" << p.zpsm
++                      << " tme=" << p.tme << " texPsm=" << p.texPsm << " fst=" << p.fst
++                      << " linear=" << p.linear << " testLo=0x" << std::hex << p.testLo << std::dec
++                      << " abe=" << p.abe << " fge=" << p.fge
+                       << std::endl;
++            if (tag[0] == 't')
++            {
++                std::cerr << "   [tri] f=(" << p.fx0 << "," << p.fy0 << ")-(" << p.fx1 << "," << p.fy1
++                          << ")-(" << p.fx2 << "," << p.fy2 << ") winding=" << p.winding
++                          << " invAbsDenom=" << p.invAbsDenom << " iip=" << p.iip
++                          << " bbox=(" << p.triMinX << "," << p.triMinY << ")-(" << p.triMaxX << "," << p.triMaxY << ")"
++                          << " texW=" << p.texW << " texH=" << p.texH << " tbp0=0x" << std::hex << p.tbp0
++                          << " tbw=" << std::dec << p.tbw << " wrap=" << p.wrapU << "/" << p.wrapV
++                          << " minmaxU=" << p.minU << "-" << p.maxU << " minmaxV=" << p.minV << "-" << p.maxV
++                          << " tfx=" << p.tfx << " tcc=" << p.tcc << " cpsm=" << p.cpsm
++                          << std::endl;
++                std::cerr << "   [tri] S=(" << p.attrS0 << "," << p.attrS1 << "," << p.attrS2 << ")"
++                          << " T=(" << p.attrT0 << "," << p.attrT1 << "," << p.attrT2 << ")"
++                          << " Q=(" << p.attrQ0 << "," << p.attrQ1 << "," << p.attrQ2 << ")"
++                          << " RGB0=(" << p.attrR0 << "," << p.attrG0 << "," << p.attrB0 << "," << p.attrA0 << ")"
++                          << " RGB2=(" << p.attrR2 << "," << p.attrG2 << "," << p.attrB2 << "," << p.attrA2 << ")"
++                          << " Z=(" << double(p.triZ0) << "," << double(p.triZ1) << "," << double(p.triZ2) << ")"
++                          << std::endl;
++            }
+             if (mismatches <= 3)
+             {
+-                // byte-level detail plus the full sampler state for offline reproduction
++                // pixel-level detail: scan frame and z buffers with the PS2 swizzled layout
++                const uint32_t scanW = std::min(p.fbw * 64u, 2048u);
+                 uint32_t shown = 0;
+-                for (size_t i = 0; i < gpuResult.size() && shown < 8; ++i)
+-                    if (gpuResult[i] != cpuResult[i])
++                for (uint32_t y = 0; y < 512 && shown < 8; ++y)
++                    for (uint32_t x = 0; x < scanW && shown < 8; ++x)
+                     {
+-                        std::cerr << "   [diff] off=0x" << std::hex << i << " gpu=0x" << unsigned(gpuResult[i])
+-                                  << " cpu=0x" << unsigned(cpuResult[i]) << std::dec << std::endl;
+-                        ++shown;
++                        const uint32_t gp = GSMem::ReadPixel(gpuResult.data(), p.fpsm, p.fbp, p.fbw, x, y);
++                        const uint32_t cp = GSMem::ReadPixel(cpuResult, p.fpsm, p.fbp, p.fbw, x, y);
++                        if (gp != cp)
++                        {
++                            std::cerr << "   [fdiff] frame (" << x << "," << y << ") gpu=0x" << std::hex << gp
++                                      << " cpu=0x" << cp << std::dec << std::endl;
++                            ++shown;
++                        }
++                    }
++                shown = 0;
++                for (uint32_t y = 0; y < 512 && shown < 4; ++y)
++                    for (uint32_t x = 0; x < scanW && shown < 4; ++x)
++                    {
++                        const uint32_t gp = GSMem::ReadPixel(gpuResult.data(), p.zpsm, p.zbp, p.fbw, x, y);
++                        const uint32_t cp = GSMem::ReadPixel(cpuResult, p.zpsm, p.zbp, p.fbw, x, y);
++                        if (gp != cp)
++                        {
++                            std::cerr << "   [fdiff] zbuf (" << x << "," << y << ") gpu=0x" << std::hex << gp
++                                      << " cpu=0x" << cp << std::dec << std::endl;
++                            ++shown;
++                        }
+                     }
+-                std::cerr << "   [case] u=(" << p.u0f << "," << p.v0f << ")->(" << p.u1f << "," << p.v1f << ")"
+-                          << " unclipped=(" << p.unclippedX0 << "," << p.unclippedY0 << ") span=(" << p.spriteW << "," << p.spriteH << ")"
+-                          << " tex=(" << p.texW << "x" << p.texH << " tbp0=0x" << std::hex << p.tbp0 << " tbw=" << std::dec << p.tbw
+-                          << " cpsm=" << p.cpsm << " csm=" << p.csm << " csa=" << p.csa << ")"
+-                          << " wrap=(" << p.wrapU << "," << p.wrapV << ") min=(" << p.minU << "," << p.minV << ") max=(" << p.maxU << "," << p.maxV << ")"
+-                          << " testLo=0x" << std::hex << p.testLo << " alpha=0x" << (p.asel | (p.bsel << 2) | (p.csel << 4) | (p.dsel << 6))
+-                          << " abe=" << std::dec << p.abe << " fge=" << p.fge << " vertA=" << p.vertA << " ta0=" << p.ta0 << " ta1=" << p.ta1 << " aem=" << p.aem
+-                          << std::endl;
++            }
++            if (mismatches <= 5)
++            {
++                // Nondeterminism probe: re-run BOTH sides from the same 'before'
++                // state and check whether either one flips its own result.
++                const size_t sz = static_cast<size_t>(vk.vramBufferSize);
++                std::vector<uint8_t> cpu1(cpuResult, cpuResult + sz);
++                std::vector<uint8_t> gpu2(sz), cpu2(sz);
++                std::memcpy(vk.vramMapped, before.data(), sz);
++                if (recordSubmitWait())
++                    std::memcpy(gpu2.data(), vk.vramMapped, sz);
++                std::memcpy(vk.vramMapped, before.data(), sz);
++                m_cpu.Submit(batch);
++                std::memcpy(cpu2.data(), vk.vramMapped, sz);
++                std::memcpy(vk.vramMapped, cpu1.data(), sz); // leave VRAM at CPU result
++                uint64_t gpuFlip = 0, cpuFlip = 0, gpu2VsCpu = 0;
++                for (size_t i = 0; i < sz; ++i)
++                {
++                    if (gpuResult[i] != gpu2[i]) ++gpuFlip;
++                    if (cpu1[i] != cpu2[i]) ++cpuFlip;
++                    if (gpu2[i] != cpu2[i]) ++gpu2VsCpu;
++                }
++                std::cerr << "   [nondet] gpuRerunDiff=" << gpuFlip
++                          << " cpuRerunDiff=" << cpuFlip
++                          << " gpu2VsCpu2=" << gpu2VsCpu << std::endl;
+             }
+         }
+         else if (checks % 500 == 0)
+         {
+-            std::cerr << "[gs-vulkan-raster-verify] " << checks << " sprites, all identical so far" << std::endl;
++            std::cerr << "[gs-vulkan-raster-verify] " << checks << " dispatches (" << triChecks << " triangles), all identical so far" << std::endl;
+         }
+         // VRAM now holds the CPU result (authoritative during verify).
+     }
+@@ -992,6 +1283,11 @@ void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
+     m_cpu.Submit(batch);
+ }
+ 
++void GSVulkanBackend::submitTriangleGpu(const GSPrimitiveBatch &batch)
++{
++    m_cpu.Submit(batch);
++}
++
+ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &)
+ {
+     return {};
+@@ -1007,6 +1303,9 @@ GSVulkanBackend::GSVulkanBackend()
+     m_gpuOk = initVulkan();
+     if (!m_gpuOk)
+         shutdownVulkan();
++#if defined(PS2X_HAS_VULKAN)
++    m_gpuTriangles = m_gpuOk && m_vk && m_vk->trianglePipeline != VK_NULL_HANDLE;
++#endif
+ }
+ 
+ GSVulkanBackend::~GSVulkanBackend()
+@@ -1039,10 +1338,18 @@ void GSVulkanBackend::Reset()
+ 
+ void GSVulkanBackend::Submit(const GSPrimitiveBatch &batch)
+ {
+-    if (m_gpuOk && m_gpuRaster && batch.vertexCount == 2 && batch.state.prim.type == GS_PRIM_SPRITE)
++    if (m_gpuOk && m_gpuRaster)
+     {
+-        submitSpriteGpu(batch);
+-        return;
++        if (batch.vertexCount == 2 && batch.state.prim.type == GS_PRIM_SPRITE)
++        {
++            submitSpriteGpu(batch);
++            return;
++        }
++        if (m_gpuTriangles && batch.vertexCount == 3 && batch.state.prim.type == GS_PRIM_TRIANGLE)
++        {
++            submitTriangleGpu(batch);
++            return;
++        }
+     }
+     m_cpu.Submit(batch);
+ }
+@@ -1071,6 +1378,8 @@ void GSVulkanBackend::SubmitMany(const GSDrawStep *steps, size_t count)
+         const GSPrimitiveBatch &batch = *steps[i].draw;
+         if (batch.vertexCount == 2 && batch.state.prim.type == GS_PRIM_SPRITE)
+             submitSpriteGpu(batch);
++        else if (m_gpuTriangles && batch.vertexCount == 3 && batch.state.prim.type == GS_PRIM_TRIANGLE)
++            submitTriangleGpu(batch);
+         else
+             m_cpu.Submit(batch);
+     }
+diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_raster_common.glsl b/ps2xRuntime/src/lib/gs/shaders/gs_raster_common.glsl
+new file mode 100755
+index 0000000..6e5e6c3
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/gs_raster_common.glsl
+@@ -0,0 +1,762 @@
++// Shared rasterizer core for the Vulkan GS backend (included by raster_sprite.comp and
++// raster_triangle.comp): swizzled GS VRAM access, texture sampling, texture combine and
++// the WritePixelFast pixel pipeline, ported from gs_cpu_backend.cpp. Invocations within a
++// dispatch never touch the same pixel, and dispatches are serialized, so plain
++// loads/stores are sufficient. Requires `#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable`
++// in the including shader (triangle Z interpolation is double precision, like the CPU).
++
++layout(set = 0, binding = 0, std430) buffer Vram
++{
++    uint vram[];
++};
++
++// CPU backend's 512-entry u16 CLUT, widened to uint per entry.
++layout(set = 0, binding = 2, std430) readonly buffer Clut
++{
++    uint clut[];
++};
++
++layout(set = 0, binding = 3, std430) buffer Params
++{
++    // sprite geometry (CPU-precomputed, matches DrawSprite)
++    int drawX0;
++    int drawY0;
++    int drawX1;
++    int drawY1;
++    int unclippedX0;
++    int unclippedY0;
++    float spriteW;
++    float spriteH;
++    float u0f;
++    float v0f;
++    float u1f;
++    float v1f;
++    uint vertR;
++    uint vertG;
++    uint vertB;
++    uint vertA;
++    uint vertFog;
++    uint z1;
++    // pixel pipe (matches MakePixelPipe)
++    int sx0;
++    int sx1;
++    int sy0;
++    int sy1;
++    uint fge;
++    uint fogR;
++    uint fogG;
++    uint fogB;
++    uint fbp;   // blocks (framePageBaseToBlock applied)
++    uint fbw;
++    uint fpsm;
++    uint zbp;   // blocks
++    uint zpsm;
++    uint testLo;
++    uint testHi;
++    uint abe;
++    uint pabe;
++    uint asel;
++    uint bsel;
++    uint csel;
++    uint dsel;
++    uint fixv;
++    uint fbaOn;
++    uint fbmsk;
++    uint zmask;
++    uint frame16;
++    // sampler (matches MakeTexSampler + combine state)
++    uint tme;
++    uint fst;
++    uint linear;
++    int texW;
++    int texH;
++    uint wrapU;
++    uint wrapV;
++    uint minU;
++    uint maxU;
++    uint minV;
++    uint maxV;
++    uint texPsm;
++    uint tbp0;  // blocks
++    uint tbw;
++    uint tcc;
++    uint tfx;
++    uint ta0;
++    uint ta1;
++    uint aem;
++    uint cpsm;
++    uint csm;
++    uint csa;
++    // triangle extension (raster_triangle.comp only; matches DrawTriangle)
++    float fx0;
++    float fy0;
++    float fx1;
++    float fy1;
++    float fx2;
++    float fy2;
++    float winding;
++    float invAbsDenom;
++    float edgeA0; // fy1 - fy2
++    float edgeA1; // fy2 - fy0
++    int triMinX;
++    int triMinY;
++    int triMaxX;
++    int triMaxY;
++    float attrR0;
++    float attrR1;
++    float attrR2;
++    float attrG0;
++    float attrG1;
++    float attrG2;
++    float attrB0;
++    float attrB1;
++    float attrB2;
++    float attrA0;
++    float attrA1;
++    float attrA2;
++    float attrS0; // FST: U/16 values as float (v.u), STQ: s
++    float attrS1;
++    float attrS2;
++    float attrT0;
++    float attrT1;
++    float attrT2;
++    float attrQ0;
++    float attrQ1;
++    float attrQ2;
++    float attrFog0;
++    float attrFog1;
++    float attrFog2;
++    uint iip;
++    uint pad0; // keep the doubles below 8-byte aligned in std430
++    float64_t triZ0;
++    float64_t triZ1;
++    float64_t triZ2;
++} pr;
++
++const uint WORD_MASK = 0xFFFFFu;   // (4MB / 4) - 1
++
++// ---------------------------------------------------------------------------
++// GS swizzled memory access (mirrors PixelStorageTraits + ps2_gs_memory tables)
++// ---------------------------------------------------------------------------
++
++const uint BlockTableC32[32] = uint[](
++    0u, 1u, 4u, 5u, 16u, 17u, 20u, 21u,
++    2u, 3u, 6u, 7u, 18u, 19u, 22u, 23u,
++    8u, 9u, 12u, 13u, 24u, 25u, 28u, 29u,
++    10u, 11u, 14u, 15u, 26u, 27u, 30u, 31u);
++
++const uint BlockTableZ32[32] = uint[](
++    24u, 25u, 28u, 29u, 8u, 9u, 12u, 13u,
++    26u, 27u, 30u, 31u, 10u, 11u, 14u, 15u,
++    16u, 17u, 20u, 21u, 0u, 1u, 4u, 5u,
++    18u, 19u, 22u, 23u, 2u, 3u, 6u, 7u);
++
++const uint ColumnTable32[64] = uint[](
++    0u, 1u, 4u, 5u, 8u, 9u, 12u, 13u,
++    2u, 3u, 6u, 7u, 10u, 11u, 14u, 15u,
++    16u, 17u, 20u, 21u, 24u, 25u, 28u, 29u,
++    18u, 19u, 22u, 23u, 26u, 27u, 30u, 31u,
++    32u, 33u, 36u, 37u, 40u, 41u, 44u, 45u,
++    34u, 35u, 38u, 39u, 42u, 43u, 46u, 47u,
++    48u, 49u, 52u, 53u, 56u, 57u, 60u, 61u,
++    50u, 51u, 54u, 55u, 58u, 59u, 62u, 63u);
++
++const uint BlockTableC16[32] = uint[](
++    0u, 2u, 8u, 10u,
++    1u, 3u, 9u, 11u,
++    4u, 6u, 12u, 14u,
++    5u, 7u, 13u, 15u,
++    16u, 18u, 24u, 26u,
++    17u, 19u, 25u, 27u,
++    20u, 22u, 28u, 30u,
++    21u, 23u, 29u, 31u);
++
++const uint BlockTableC16S[32] = uint[](
++    0u, 2u, 16u, 18u,
++    1u, 3u, 17u, 19u,
++    8u, 10u, 24u, 26u,
++    9u, 11u, 25u, 27u,
++    4u, 6u, 20u, 22u,
++    5u, 7u, 21u, 23u,
++    12u, 14u, 28u, 30u,
++    13u, 15u, 29u, 31u);
++
++const uint BlockTableZ16[32] = uint[](
++    24u, 26u, 16u, 18u,
++    25u, 27u, 17u, 19u,
++    28u, 30u, 20u, 22u,
++    29u, 31u, 21u, 23u,
++    8u, 10u, 0u, 2u,
++    9u, 11u, 1u, 3u,
++    12u, 14u, 4u, 6u,
++    13u, 15u, 5u, 7u);
++
++const uint BlockTableZ16S[32] = uint[](
++    24u, 26u, 8u, 10u,
++    25u, 27u, 9u, 11u,
++    16u, 18u, 0u, 2u,
++    17u, 19u, 1u, 3u,
++    28u, 30u, 12u, 14u,
++    29u, 31u, 13u, 15u,
++    20u, 22u, 4u, 6u,
++    21u, 23u, 5u, 7u);
++
++const uint ColumnTable16[128] = uint[](
++    0u, 2u, 8u, 10u, 16u, 18u, 24u, 26u, 1u, 3u, 9u, 11u, 17u, 19u, 25u, 27u,
++    4u, 6u, 12u, 14u, 20u, 22u, 28u, 30u, 5u, 7u, 13u, 15u, 21u, 23u, 29u, 31u,
++    32u, 34u, 40u, 42u, 48u, 50u, 56u, 58u, 33u, 35u, 41u, 43u, 49u, 51u, 57u, 59u,
++    36u, 38u, 44u, 46u, 52u, 54u, 60u, 62u, 37u, 39u, 45u, 47u, 53u, 55u, 61u, 63u,
++    64u, 66u, 72u, 74u, 80u, 82u, 88u, 90u, 65u, 67u, 73u, 75u, 81u, 83u, 89u, 91u,
++    68u, 70u, 76u, 78u, 84u, 86u, 92u, 94u, 69u, 71u, 77u, 79u, 85u, 87u, 93u, 95u,
++    96u, 98u, 104u, 106u, 112u, 114u, 120u, 122u, 97u, 99u, 105u, 107u, 113u, 115u, 121u, 123u,
++    100u, 102u, 108u, 110u, 116u, 118u, 124u, 126u, 101u, 103u, 109u, 111u, 117u, 119u, 125u, 127u);
++
++// T8 shares the C32 block table; T4 shares the C16 block table.
++const uint ColumnTable8[256] = uint[](
++    0u, 4u, 16u, 20u, 32u, 36u, 48u, 52u, 2u, 6u, 18u, 22u, 34u, 38u, 50u, 54u,
++    8u, 12u, 24u, 28u, 40u, 44u, 56u, 60u, 10u, 14u, 26u, 30u, 42u, 46u, 58u, 62u,
++    33u, 37u, 49u, 53u, 1u, 5u, 17u, 21u, 35u, 39u, 51u, 55u, 3u, 7u, 19u, 23u,
++    41u, 45u, 57u, 61u, 9u, 13u, 25u, 29u, 43u, 47u, 59u, 63u, 11u, 15u, 27u, 31u,
++    96u, 100u, 112u, 116u, 64u, 68u, 80u, 84u, 98u, 102u, 114u, 118u, 66u, 70u, 82u, 86u,
++    104u, 108u, 120u, 124u, 72u, 76u, 88u, 92u, 106u, 110u, 122u, 126u, 74u, 78u, 90u, 94u,
++    65u, 69u, 81u, 85u, 97u, 101u, 113u, 117u, 67u, 71u, 83u, 87u, 99u, 103u, 115u, 119u,
++    73u, 77u, 89u, 93u, 105u, 109u, 121u, 125u, 75u, 79u, 91u, 95u, 107u, 111u, 123u, 127u,
++    128u, 132u, 144u, 148u, 160u, 164u, 176u, 180u, 130u, 134u, 146u, 150u, 162u, 166u, 178u, 182u,
++    136u, 140u, 152u, 156u, 168u, 172u, 184u, 188u, 138u, 142u, 154u, 158u, 170u, 174u, 186u, 190u,
++    161u, 165u, 177u, 181u, 129u, 133u, 145u, 149u, 163u, 167u, 179u, 183u, 131u, 135u, 147u, 151u,
++    169u, 173u, 185u, 189u, 137u, 141u, 153u, 157u, 171u, 175u, 187u, 191u, 139u, 143u, 155u, 159u,
++    224u, 228u, 240u, 244u, 192u, 196u, 208u, 212u, 226u, 230u, 242u, 246u, 194u, 198u, 210u, 214u,
++    232u, 236u, 248u, 252u, 200u, 204u, 216u, 220u, 234u, 238u, 250u, 254u, 202u, 206u, 218u, 222u,
++    193u, 197u, 209u, 213u, 225u, 229u, 241u, 245u, 195u, 199u, 211u, 215u, 227u, 231u, 243u, 247u,
++    201u, 205u, 217u, 221u, 233u, 237u, 249u, 253u, 203u, 207u, 219u, 223u, 235u, 239u, 251u, 255u);
++
++const uint ColumnTable4[512] = uint[](
++    0u, 8u, 32u, 40u, 64u, 72u, 96u, 104u, 2u, 10u, 34u, 42u, 66u, 74u, 98u, 106u, 4u, 12u, 36u, 44u, 68u, 76u, 100u, 108u, 6u, 14u, 38u, 46u, 70u, 78u, 102u, 110u,
++    16u, 24u, 48u, 56u, 80u, 88u, 112u, 120u, 18u, 26u, 50u, 58u, 82u, 90u, 114u, 122u, 20u, 28u, 52u, 60u, 84u, 92u, 116u, 124u, 22u, 30u, 54u, 62u, 86u, 94u, 118u, 126u,
++    65u, 73u, 97u, 105u, 1u, 9u, 33u, 41u, 67u, 75u, 99u, 107u, 3u, 11u, 35u, 43u, 69u, 77u, 101u, 109u, 5u, 13u, 37u, 45u, 71u, 79u, 103u, 111u, 7u, 15u, 39u, 47u,
++    81u, 89u, 113u, 121u, 17u, 25u, 49u, 57u, 83u, 91u, 115u, 123u, 19u, 27u, 51u, 59u, 85u, 93u, 117u, 125u, 21u, 29u, 53u, 61u, 87u, 95u, 119u, 127u, 23u, 31u, 55u, 63u,
++    192u, 200u, 224u, 232u, 128u, 136u, 160u, 168u, 194u, 202u, 226u, 234u, 130u, 138u, 162u, 170u, 196u, 204u, 228u, 236u, 132u, 140u, 164u, 172u, 198u, 206u, 230u, 238u, 134u, 142u, 166u, 174u,
++    208u, 216u, 240u, 248u, 144u, 152u, 176u, 184u, 210u, 218u, 242u, 250u, 146u, 154u, 178u, 186u, 212u, 220u, 244u, 252u, 148u, 156u, 180u, 188u, 214u, 222u, 246u, 254u, 150u, 158u, 182u, 190u,
++    129u, 137u, 161u, 169u, 193u, 201u, 225u, 233u, 131u, 139u, 163u, 171u, 195u, 203u, 227u, 235u, 133u, 141u, 165u, 173u, 197u, 205u, 229u, 237u, 135u, 143u, 167u, 175u, 199u, 207u, 231u, 239u,
++    145u, 153u, 177u, 185u, 209u, 217u, 241u, 249u, 147u, 155u, 179u, 187u, 211u, 219u, 243u, 251u, 149u, 157u, 181u, 189u, 213u, 221u, 245u, 253u, 151u, 159u, 183u, 191u, 215u, 223u, 247u, 255u,
++    256u, 264u, 288u, 296u, 320u, 328u, 352u, 360u, 258u, 266u, 290u, 298u, 322u, 330u, 354u, 362u, 260u, 268u, 292u, 300u, 324u, 332u, 356u, 364u, 262u, 270u, 294u, 302u, 326u, 334u, 358u, 366u,
++    272u, 280u, 304u, 312u, 336u, 344u, 368u, 376u, 274u, 282u, 306u, 314u, 338u, 346u, 370u, 378u, 276u, 284u, 308u, 316u, 340u, 348u, 372u, 380u, 278u, 286u, 310u, 318u, 342u, 350u, 374u, 382u,
++    321u, 329u, 353u, 361u, 257u, 265u, 289u, 297u, 323u, 331u, 355u, 363u, 259u, 267u, 291u, 299u, 325u, 333u, 357u, 365u, 261u, 269u, 293u, 301u, 327u, 335u, 359u, 367u, 263u, 271u, 295u, 303u,
++    337u, 345u, 369u, 377u, 273u, 281u, 305u, 313u, 339u, 347u, 371u, 379u, 275u, 283u, 307u, 315u, 341u, 349u, 373u, 381u, 277u, 285u, 309u, 317u, 343u, 351u, 375u, 383u, 279u, 287u, 311u, 319u,
++    448u, 456u, 480u, 488u, 384u, 392u, 416u, 424u, 450u, 458u, 482u, 490u, 386u, 394u, 418u, 426u, 452u, 460u, 484u, 492u, 388u, 396u, 420u, 428u, 454u, 462u, 486u, 494u, 390u, 398u, 422u, 430u,
++    464u, 472u, 496u, 504u, 400u, 408u, 432u, 440u, 466u, 474u, 498u, 506u, 402u, 410u, 434u, 442u, 468u, 476u, 500u, 508u, 404u, 412u, 436u, 444u, 470u, 478u, 502u, 510u, 406u, 414u, 438u, 446u,
++    385u, 393u, 417u, 425u, 449u, 457u, 481u, 489u, 387u, 395u, 419u, 427u, 451u, 459u, 483u, 491u, 389u, 397u, 421u, 429u, 453u, 461u, 485u, 493u, 391u, 399u, 423u, 431u, 455u, 463u, 487u, 495u,
++    401u, 409u, 433u, 441u, 465u, 473u, 497u, 505u, 403u, 411u, 435u, 443u, 467u, 475u, 499u, 507u, 405u, 413u, 437u, 445u, 469u, 477u, 501u, 509u, 407u, 415u, 439u, 447u, 471u, 479u, 503u, 511u);
++
++// PSM ids (gs_types.h GSPsm)
++const uint PSM_CT32 = 0u;
++const uint PSM_CT24 = 1u;
++const uint PSM_CT16 = 2u;
++const uint PSM_CT16S = 10u;
++const uint PSM_T8 = 19u;
++const uint PSM_T4 = 20u;
++const uint PSM_T8H = 27u;
++const uint PSM_T4HL = 36u;
++const uint PSM_T4HH = 44u;
++const uint PSM_Z32 = 48u;
++const uint PSM_Z24 = 49u;
++const uint PSM_Z16 = 50u;
++const uint PSM_Z16S = 58u;
++
++bool is32Family(uint psm) { return psm == PSM_CT32 || psm == PSM_CT24 || psm == PSM_Z32 || psm == PSM_Z24; }
++bool is16Family(uint psm) { return psm == PSM_CT16 || psm == PSM_CT16S || psm == PSM_Z16 || psm == PSM_Z16S; }
++bool isZFamily(uint psm) { return psm == PSM_Z32 || psm == PSM_Z24 || psm == PSM_Z16 || psm == PSM_Z16S; }
++
++uint readVram8(uint byteAddr)
++{
++    return (vram[byteAddr >> 2u] >> ((byteAddr & 3u) * 8u)) & 0xFFu;
++}
++
++uint readVram16(uint byteAddr)
++{
++    return (vram[byteAddr >> 2u] >> ((byteAddr & 2u) * 8u)) & 0xFFFFu;
++}
++
++void writeVram16(uint byteAddr, uint value)
++{
++    const uint shift = (byteAddr & 2u) * 8u;
++    const uint wordAddr = byteAddr >> 2u;
++    // Two adjacent 16-bit pixels share a 32-bit VRAM word and are written by
++    // different compute invocations, so the RMW must be atomic. atomicAnd +
++    // atomicOr on bit-disjoint masks is order-independent.
++    atomicAnd(vram[wordAddr], ~(0xFFFFu << shift));
++    atomicOr(vram[wordAddr], (value & 0xFFFFu) << shift);
++}
++
++void writeVram8(uint byteAddr, uint value)
++{
++    const uint shift = (byteAddr & 3u) * 8u;
++    const uint wordAddr = byteAddr >> 2u;
++    atomicAnd(vram[wordAddr], ~(0xFFu << shift));
++    atomicOr(vram[wordAddr], (value & 0xFFu) << shift);
++}
++
++// Generic swizzled read, mirroring PixelStorageTraits<>::Read for the storage modes the
++// rasterizer can meet as frame/z/texture formats. Returns the raw stored value.
++uint readPixel(uint psm, uint base, uint bw, uint x, uint y)
++{
++    if (psm == PSM_CT32 || psm == PSM_CT24 || psm == PSM_Z32 || psm == PSM_Z24 ||
++        psm == PSM_T8H || psm == PSM_T4HL || psm == PSM_T4HH)
++    {
++        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
++        const bool ztab = psm == PSM_Z32 || psm == PSM_Z24;
++        const uint block = (ztab ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
++        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
++        const uint pixel = page * 2048u + ((base & 31u) + block) * 64u + column;
++        const uint word = vram[pixel & WORD_MASK];
++        if (psm == PSM_CT24 || psm == PSM_Z24)
++            return word & 0x00FFFFFFu;
++        if (psm == PSM_T8H)
++            return (word >> 24u) & 0xFFu;
++        if (psm == PSM_T4HL)
++            return (word >> 24u) & 0x0Fu;
++        if (psm == PSM_T4HH)
++            return (word >> 28u) & 0x0Fu;
++        return word;
++    }
++    if (is16Family(psm))
++    {
++        const uint page = (base >> 5u) + (y >> 6u) * bw + (x >> 6u);
++        uint block;
++        if (psm == PSM_CT16)
++            block = BlockTableC16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else if (psm == PSM_CT16S)
++            block = BlockTableC16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else if (psm == PSM_Z16)
++            block = BlockTableZ16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else
++            block = BlockTableZ16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        const uint column = ColumnTable16[(y & 7u) * 16u + (x & 15u)];
++        const uint pixel = page * 4096u + ((base & 31u) + block) * 128u + column;
++        return readVram16((pixel * 2u) & 0x3FFFFEu);
++    }
++    if (psm == PSM_T8)
++    {
++        // page 128x64, blocks 8x4 of 16x16, block table shared with C32
++        const uint page = (base >> 5u) + (y >> 6u) * ((bw * 64u) / 128u) + (x >> 7u);
++        const uint block = BlockTableC32[((y >> 4u) & 3u) * 8u + ((x >> 4u) & 7u)];
++        const uint column = ColumnTable8[(y & 15u) * 16u + (x & 15u)];
++        const uint pixel = page * 8192u + ((base & 31u) + block) * 256u + column;
++        return readVram8(pixel & 0x3FFFFFu);
++    }
++    if (psm == PSM_T4)
++    {
++        // page 128x128, blocks 4x8 of 32x16, block table shared with C16
++        const uint page = (base >> 5u) + (y >> 7u) * ((bw * 64u) / 128u) + (x >> 7u);
++        const uint block = BlockTableC16[((y >> 4u) & 7u) * 4u + ((x >> 5u) & 3u)];
++        const uint column = ColumnTable4[(y & 15u) * 32u + (x & 31u)];
++        const uint pixel = page * 16384u + ((base & 31u) + block) * 512u + column;
++        const uint bits = pixel * 4u;
++        return (readVram8((bits >> 3u) & 0x3FFFFFu) >> (bits & 7u)) & 0x0Fu;
++    }
++    return 0xFFFF00FFu;
++}
++
++// Swizzled write for frame/z formats (mirrors PixelStorageTraits<>::Write).
++void writePixel(uint psm, uint base, uint bw, uint x, uint y, uint value)
++{
++    if (psm == PSM_CT32 || psm == PSM_Z32)
++    {
++        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
++        const uint block = (psm == PSM_Z32 ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
++        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
++        vram[(page * 2048u + ((base & 31u) + block) * 64u + column) & WORD_MASK] = value;
++        return;
++    }
++    if (psm == PSM_CT24 || psm == PSM_Z24)
++    {
++        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
++        const uint block = (psm == PSM_Z24 ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
++        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
++        const uint addr = (page * 2048u + ((base & 31u) + block) * 64u + column) & WORD_MASK;
++        // Preserve the top byte; RMW must be atomic for the same reason as
++        // writeVram16 (frame/z words can alias across adjacent pixels).
++        atomicAnd(vram[addr], 0xFF000000u);
++        atomicOr(vram[addr], value & 0x00FFFFFFu);
++        return;
++    }
++    if (is16Family(psm))
++    {
++        const uint page = (base >> 5u) + (y >> 6u) * bw + (x >> 6u);
++        uint block;
++        if (psm == PSM_CT16)
++            block = BlockTableC16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else if (psm == PSM_CT16S)
++            block = BlockTableC16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else if (psm == PSM_Z16)
++            block = BlockTableZ16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        else
++            block = BlockTableZ16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
++        const uint column = ColumnTable16[(y & 7u) * 16u + (x & 15u)];
++        const uint pixel = page * 4096u + ((base & 31u) + block) * 128u + column;
++        writeVram16((pixel * 2u) & 0x3FFFFEu, value);
++        return;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Pixel pipeline helpers (ports of the gs_cpu_backend.cpp free functions)
++// ---------------------------------------------------------------------------
++
++int clampInt(int v, int lo, int hi)
++{
++    return v < lo ? lo : (v > hi ? hi : v);
++}
++
++uint clampU8(int v)
++{
++    return uint(clampInt(v, 0, 255));
++}
++
++uint rgba5551to8888(uint c)
++{
++    const uint r = (c & 0x1Fu) << 3u;
++    const uint g = ((c >> 5u) & 0x1Fu) << 3u;
++    const uint b = ((c >> 10u) & 0x1Fu) << 3u;
++    const uint a = ((c >> 15u) & 1u) << 7u;
++    return r | (g << 8u) | (b << 16u) | (a << 24u);
++}
++
++uint rgba8888to5551(uint c)
++{
++    const uint r = ((c >> 3u) & 0x1Fu);
++    const uint g = ((c >> 11u) & 0x1Fu);
++    const uint b = ((c >> 19u) & 0x1Fu);
++    const uint a = ((c >> 31u) & 1u);
++    return r | (g << 5u) | (b << 10u) | (a << 15u);
++}
++
++uint applyTexa(uint psm, uint texel)
++{
++    if (psm == PSM_CT32 || psm == PSM_Z32)
++        return texel;
++
++    const uint r = texel & 0xFFu;
++    const uint g = (texel >> 8u) & 0xFFu;
++    const uint b = (texel >> 16u) & 0xFFu;
++    const bool rgbZero = r == 0u && g == 0u && b == 0u;
++    uint a = (texel >> 24u) & 0xFFu;
++
++    if (psm == PSM_CT24 || psm == PSM_Z24)
++    {
++        a = (pr.aem != 0u && rgbZero) ? 0u : pr.ta0;
++    }
++    else // 16-bit formats
++    {
++        if ((a & 0x80u) != 0u)
++            a = pr.ta1;
++        else
++            a = (pr.aem != 0u && rgbZero) ? 0u : pr.ta0;
++    }
++    return (texel & 0x00FFFFFFu) | (a << 24u);
++}
++
++int wrapTextureCoordinate(int coordinate, int textureSize, uint mode, uint regionMin, uint regionMax)
++{
++    switch (mode & 3u)
++    {
++    case 0u: // REPEAT
++        return int(uint(coordinate) & uint(textureSize - 1));
++    case 1u: // CLAMP
++        return clampInt(coordinate, 0, textureSize - 1);
++    case 2u: // REGION_CLAMP
++        return min(max(coordinate, int(regionMin)), int(regionMax));
++    case 3u: // REGION_REPEAT
++        return int((uint(coordinate) & regionMin) | regionMax);
++    }
++    return coordinate;
++}
++
++uint lookupClut(uint index)
++{
++    const bool sixteenBit = pr.cpsm == PSM_CT16 || pr.cpsm == PSM_CT16S;
++    const uint csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
++    const uint clutBase = (pr.csa & csaMask) << 4u;
++    const bool fourBit = pr.texPsm == PSM_T4 || pr.texPsm == PSM_T4HL || pr.texPsm == PSM_T4HH;
++    const uint sourceIndex = fourBit ? (index & 0x0Fu) : index;
++
++    uint clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
++    if (!sixteenBit && pr.csm == 0u && (pr.texPsm == PSM_T8 || pr.texPsm == PSM_T8H))
++    {
++        const uint block = min((sourceIndex & 0xF0u) + clutBase, 240u);
++        clutIndex = block + (sourceIndex & 0x0Fu);
++    }
++
++    if (pr.cpsm == PSM_CT32)
++    {
++        const uint raw = clut[clutIndex] | (clut[clutIndex + 256u] << 16u);
++        return applyTexa(pr.cpsm, raw);
++    }
++    if (pr.cpsm == PSM_CT24)
++    {
++        const uint raw = clut[clutIndex] | (clut[clutIndex + 256u] << 16u);
++        return applyTexa(pr.cpsm, raw & 0x00FFFFFFu);
++    }
++    if (sixteenBit)
++        return applyTexa(pr.cpsm, rgba5551to8888(clut[clutIndex]));
++    return 0xFFFF00FFu;
++}
++
++uint fetchTexel(int u, int v)
++{
++    const uint raw = readPixel(pr.texPsm, pr.tbp0, pr.tbw, uint(u), uint(v));
++    if (pr.texPsm == PSM_CT32 || pr.texPsm == PSM_Z32 || pr.texPsm == PSM_CT24 || pr.texPsm == PSM_Z24)
++        return applyTexa(pr.texPsm, raw);
++    if (is16Family(pr.texPsm))
++        return applyTexa(pr.texPsm, rgba5551to8888(raw));
++    // indexed formats
++    return lookupClut(raw & 0xFFu);
++}
++
++uint lerpChannel(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
++{
++    // Matches the CPU SSE path exactly: trunc toward zero, then round up when the
++    // fractional part reaches 0.5. `precise` blocks FMA contraction so the float
++    // ops round identically to _mm_mul_ps/_mm_add_ps.
++    precise const float top = float(c00) + (float(c10) - float(c00)) * fx;
++    precise const float bottom = float(c01) + (float(c11) - float(c01)) * fx;
++    precise const float v = top + (bottom - top) * fy;
++    float i = trunc(v);
++    const float frac = v - i;
++    if (frac >= 0.5)
++        i += 1.0;
++    if (frac <= -0.5)
++        i -= 1.0;
++    return clampU8(int(i));
++}
++
++uint lerpTexels(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
++{
++    uint outv = 0u;
++    for (uint shift = 0u; shift < 32u; shift += 8u)
++    {
++        outv |= lerpChannel((c00 >> shift) & 0xFFu, (c10 >> shift) & 0xFFu,
++                            (c01 >> shift) & 0xFFu, (c11 >> shift) & 0xFFu, fx, fy) << shift;
++    }
++    return outv;
++}
++
++uint samplePoint(float texUf, float texVf, int su, int sv, bool dbgPix)
++{
++    const int sampleU = wrapTextureCoordinate(su, pr.texW, pr.wrapU, pr.minU, pr.maxU);
++    const int sampleV = wrapTextureCoordinate(sv, pr.texH, pr.wrapV, pr.minV, pr.maxV);
++    if (dbgPix)
++    {
++        // TRI_DEBUG: stash wrapped coords + raw fetch into spare sprite slots.
++        pr.drawX1 = sampleU | (sampleV << 16);
++        pr.drawY0 = int(readPixel(pr.texPsm, pr.tbp0, pr.tbw, uint(sampleU), uint(sampleV)));
++    }
++    return fetchTexel(sampleU, sampleV);
++}
++
++uint sampleTexture(float s, float t, float q, uint u, uint v, bool dbgPix)
++{
++    precise float texUf, texVf;
++    if (pr.fst != 0u)
++    {
++        texUf = float(u) / 16.0;
++        texVf = float(v) / 16.0;
++    }
++    else
++    {
++        const float invQ = 1.0 / (abs(q) > 1.0e-8 ? q : 1.0);
++        texUf = s * invQ * float(pr.texW);
++        texVf = t * invQ * float(pr.texH);
++    }
++
++    if (pr.linear == 0u)
++        return samplePoint(texUf, texVf, int(texUf), int(texVf), dbgPix);
++
++    const float sampleU = texUf - 0.5;
++    const float sampleV = texVf - 0.5;
++    const int u0 = int(floor(sampleU));
++    const int v0 = int(floor(sampleV));
++    const float fx = sampleU - float(u0);
++    const float fy = sampleV - float(v0);
++    const uint c00 = samplePoint(texUf, texVf, u0, v0, dbgPix);
++    const uint c10 = samplePoint(texUf, texVf, u0 + 1, v0, dbgPix);
++    const uint c01 = samplePoint(texUf, texVf, u0, v0 + 1, dbgPix);
++    const uint c11 = samplePoint(texUf, texVf, u0 + 1, v0 + 1, dbgPix);
++    return lerpTexels(c00, c10, c01, c11, fx, fy);
++}
++
++// combineTexture from gs_cpu_backend.cpp
++void combineTexture(uint tr, uint tg, uint tb, uint ta,
++                    inout uint r, inout uint g, inout uint b, inout uint a)
++{
++    const bool textureHasAlpha = pr.tcc != 0u;
++    const uint vr = r, vg = g, vb = b, va = a;
++    r = tr; g = tg; b = tb; a = textureHasAlpha ? ta : va;
++    switch (pr.tfx)
++    {
++    case 0u: // MODULATE
++        r = clampU8(int(tr * vr) >> 7);
++        g = clampU8(int(tg * vg) >> 7);
++        b = clampU8(int(tb * vb) >> 7);
++        a = textureHasAlpha ? clampU8(int(ta * va) >> 7) : va;
++        break;
++    case 1u: // DECAL
++        break;
++    case 2u: // HIGHLIGHT
++        r = clampU8((int(tr * vr) >> 7) + int(va));
++        g = clampU8((int(tg * vg) >> 7) + int(va));
++        b = clampU8((int(tb * vb) >> 7) + int(va));
++        a = textureHasAlpha ? clampU8(int(ta + va)) : va;
++        break;
++    case 3u: // HIGHLIGHT2
++        r = clampU8((int(tr * vr) >> 7) + int(va));
++        g = clampU8((int(tg * vg) >> 7) + int(va));
++        b = clampU8((int(tb * vb) >> 7) + int(va));
++        a = textureHasAlpha ? ta : va;
++        break;
++    }
++}
++
++// passesAlphaTest
++bool passesAlphaTest(uint alpha)
++{
++    if ((pr.testLo & 1u) == 0u)
++        return true;
++    const uint atst = (pr.testLo >> 1u) & 7u;
++    const uint aref = (pr.testLo >> 4u) & 0xFFu;
++    switch (atst)
++    {
++    case 0u: return false;
++    case 1u: return true;
++    case 2u: return alpha < aref;
++    case 3u: return alpha <= aref;
++    case 4u: return alpha == aref;
++    case 5u: return alpha >= aref;
++    case 6u: return alpha > aref;
++    default: return alpha != aref;
++    }
++}
++
++bool passesDestinationAlphaTest(uint rawFramebufferPixel)
++{
++    const bool date = ((pr.testLo >> 14u) & 1u) != 0u;
++    if (!date)
++        return true;
++    const bool datm = ((pr.testLo >> 15u) & 1u) != 0u;
++    if (pr.fpsm == PSM_CT32)
++        return (((rawFramebufferPixel >> 31u) & 1u) != 0u) == datm;
++    if (pr.fpsm == PSM_CT16 || pr.fpsm == PSM_CT16S)
++        return (((rawFramebufferPixel >> 15u) & 1u) != 0u) == datm;
++    return true; // RGB24: no destination alpha, DATE always passes
++}
++
++// WritePixelFast from gs_cpu_backend.cpp
++void writePixelPipe(int x, int y, uint z, uint r, uint g, uint b, uint a, uint fog)
++{
++    if (x < pr.sx0 || x > pr.sx1 || y < pr.sy0 || y > pr.sy1)
++        return;
++
++    if (pr.fge != 0u)
++    {
++        const uint inverseFog = 255u - fog;
++        r = ((fog * r) >> 8u) + ((inverseFog * pr.fogR) >> 8u);
++        g = ((fog * g) >> 8u) + ((inverseFog * pr.fogG) >> 8u);
++        b = ((fog * b) >> 8u) + ((inverseFog * pr.fogB) >> 8u);
++    }
++
++    // classifyAlphaTest
++    bool writeRgb = true, writeAlpha = true, writeDepth = true;
++    if (!passesAlphaTest(a))
++    {
++        const uint afail = (pr.testLo >> 12u) & 3u;
++        if (afail == 1u) { writeDepth = false; }                     // FB_ONLY
++        else if (afail == 2u) { writeRgb = false; writeAlpha = false; } // ZB_ONLY
++        else if (afail == 3u)
++        {
++            // RGB_ONLY: only distinct for RGBA32; FB_ONLY otherwise
++            writeDepth = false;
++            if (pr.fpsm == PSM_CT32)
++                writeAlpha = false;
++        }
++        else { writeRgb = false; writeAlpha = false; writeDepth = false; } // KEEP
++    }
++    if (!((writeRgb || writeAlpha) || writeDepth))
++        return;
++
++    const bool preserveDestinationAlpha = writeRgb && !writeAlpha && pr.fpsm == PSM_CT32;
++    const bool dateRead = ((pr.testLo >> 14u) & 1u) != 0u &&
++                          (pr.fpsm == PSM_CT32 || pr.fpsm == PSM_CT16 || pr.fpsm == PSM_CT16S);
++    const bool frmw = dateRead || ((writeRgb || writeAlpha) && (pr.fbmsk != 0u || pr.abe != 0u || preserveDestinationAlpha));
++
++    uint rawFramebufferPixel = 0u;
++    uint fbrgba = 0u;
++    if (frmw)
++    {
++        rawFramebufferPixel = readPixel(pr.fpsm, pr.fbp, pr.fbw, uint(x), uint(y));
++        fbrgba = rawFramebufferPixel;
++        if (pr.frame16 != 0u)
++            fbrgba = rgba5551to8888(fbrgba);
++        else if (pr.fpsm == PSM_CT24)
++            fbrgba |= 0x80000000u; // the GS supplies 0x80 as destination alpha for RGB24 blending
++    }
++
++    if (!passesDestinationAlphaTest(rawFramebufferPixel))
++        return;
++
++    bool zpass = false;
++    const uint ztest = (pr.testLo >> 17u) & 3u;
++    if (ztest == 1u)
++        zpass = true;
++    else if (ztest == 2u)
++        zpass = z >= readPixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y));
++    else if (ztest == 3u)
++        zpass = z > readPixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y));
++    if (!zpass)
++        return;
++
++    if (writeRgb || writeAlpha)
++    {
++        if (pr.abe != 0u)
++        {
++            const uint dr = fbrgba & 0xFFu;
++            const uint dg = (fbrgba >> 8u) & 0xFFu;
++            const uint db = (fbrgba >> 16u) & 0xFFu;
++            const uint da = (fbrgba >> 24u) & 0xFFu;
++            // PABE disables alpha blending when the source alpha MSB is clear.
++            if (!(pr.pabe != 0u && (a & 0x80u) == 0u))
++            {
++                const int cAlpha = pr.csel == 0u ? int(a) : (pr.csel == 1u ? int(da) : int(pr.fixv));
++                const int sr = int(r), sg = int(g), sb = int(b);
++                const int idr = int(dr), idg = int(dg), idb = int(db);
++                const int ar = pr.asel == 0u ? sr : (pr.asel == 1u ? idr : 0);
++                const int br_ = pr.bsel == 0u ? sr : (pr.bsel == 1u ? idr : 0);
++                const int drr = pr.dsel == 0u ? sr : (pr.dsel == 1u ? idr : 0);
++                const int ag = pr.asel == 0u ? sg : (pr.asel == 1u ? idg : 0);
++                const int bg = pr.bsel == 0u ? sg : (pr.bsel == 1u ? idg : 0);
++                const int dg2 = pr.dsel == 0u ? sg : (pr.dsel == 1u ? idg : 0);
++                const int ab = pr.asel == 0u ? sb : (pr.asel == 1u ? idb : 0);
++                const int bb = pr.bsel == 0u ? sb : (pr.bsel == 1u ? idb : 0);
++                const int db2 = pr.dsel == 0u ? sb : (pr.dsel == 1u ? idb : 0);
++                r = clampU8(((ar - br_) * cAlpha >> 7) + drr);
++                g = clampU8(((ag - bg) * cAlpha >> 7) + dg2);
++                b = clampU8(((ab - bb) * cAlpha >> 7) + db2);
++            }
++        }
++
++        if (writeAlpha && pr.fbaOn != 0u)
++            a |= 0x80u;
++
++        uint pixel = r | (g << 8u) | (b << 16u) | (a << 24u);
++        if (pr.fbmsk != 0u)
++            pixel = (pixel & ~pr.fbmsk) | (fbrgba & pr.fbmsk);
++        if (preserveDestinationAlpha)
++            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
++        if (pr.frame16 != 0u)
++            pixel = rgba8888to5551(pixel);
++        writePixel(pr.fpsm, pr.fbp, pr.fbw, uint(x), uint(y), pixel);
++    }
++
++    if (writeDepth && pr.zmask == 0u)
++        writePixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y), z);
++}
++
+diff --git a/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp b/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp
+index e4f96c2..7275c5c 100755
+--- a/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp
++++ b/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp
+@@ -1,709 +1,14 @@
+ #version 450
+ 
+ // Sprite rasterizer for the Vulkan GS backend: one dispatch per GS sprite primitive, one
+-// invocation per candidate output pixel. Ports GSCpuBackend::DrawSprite + WritePixelFast +
+-// SampleTextureFast + the GSMem swizzled pixel access, operating directly on GS VRAM in a
+-// storage buffer. Invocations within a dispatch never touch the same pixel, and dispatches
+-// are serialized, so plain loads/stores are sufficient.
++// invocation per candidate output pixel (mirrors GSCpuBackend::DrawSprite).
+ 
+-layout(local_size_x = 8, local_size_y = 8) in;
+-
+-layout(set = 0, binding = 0, std430) buffer Vram
+-{
+-    uint vram[];
+-};
+-
+-// CPU backend's 512-entry u16 CLUT, widened to uint per entry.
+-layout(set = 0, binding = 2, std430) readonly buffer Clut
+-{
+-    uint clut[];
+-};
+-
+-layout(set = 0, binding = 3, std430) readonly buffer Params
+-{
+-    // sprite geometry (CPU-precomputed, matches DrawSprite)
+-    int drawX0;
+-    int drawY0;
+-    int drawX1;
+-    int drawY1;
+-    int unclippedX0;
+-    int unclippedY0;
+-    float spriteW;
+-    float spriteH;
+-    float u0f;
+-    float v0f;
+-    float u1f;
+-    float v1f;
+-    uint vertR;
+-    uint vertG;
+-    uint vertB;
+-    uint vertA;
+-    uint vertFog;
+-    uint z1;
+-    // pixel pipe (matches MakePixelPipe)
+-    int sx0;
+-    int sx1;
+-    int sy0;
+-    int sy1;
+-    uint fge;
+-    uint fogR;
+-    uint fogG;
+-    uint fogB;
+-    uint fbp;   // blocks (framePageBaseToBlock applied)
+-    uint fbw;
+-    uint fpsm;
+-    uint zbp;   // blocks
+-    uint zpsm;
+-    uint testLo;
+-    uint testHi;
+-    uint abe;
+-    uint pabe;
+-    uint asel;
+-    uint bsel;
+-    uint csel;
+-    uint dsel;
+-    uint fixv;
+-    uint fbaOn;
+-    uint fbmsk;
+-    uint zmask;
+-    uint frame16;
+-    // sampler (matches MakeTexSampler + combine state)
+-    uint tme;
+-    uint fst;
+-    uint linear;
+-    int texW;
+-    int texH;
+-    uint wrapU;
+-    uint wrapV;
+-    uint minU;
+-    uint maxU;
+-    uint minV;
+-    uint maxV;
+-    uint texPsm;
+-    uint tbp0;  // blocks
+-    uint tbw;
+-    uint tcc;
+-    uint tfx;
+-    uint ta0;
+-    uint ta1;
+-    uint aem;
+-    uint cpsm;
+-    uint csm;
+-    uint csa;
+-} pr;
+-
+-const uint WORD_MASK = 0xFFFFFu;   // (4MB / 4) - 1
+-
+-// ---------------------------------------------------------------------------
+-// GS swizzled memory access (mirrors PixelStorageTraits + ps2_gs_memory tables)
+-// ---------------------------------------------------------------------------
+-
+-const uint BlockTableC32[32] = uint[](
+-    0u, 1u, 4u, 5u, 16u, 17u, 20u, 21u,
+-    2u, 3u, 6u, 7u, 18u, 19u, 22u, 23u,
+-    8u, 9u, 12u, 13u, 24u, 25u, 28u, 29u,
+-    10u, 11u, 14u, 15u, 26u, 27u, 30u, 31u);
+-
+-const uint BlockTableZ32[32] = uint[](
+-    24u, 25u, 28u, 29u, 8u, 9u, 12u, 13u,
+-    26u, 27u, 30u, 31u, 10u, 11u, 14u, 15u,
+-    16u, 17u, 20u, 21u, 0u, 1u, 4u, 5u,
+-    18u, 19u, 22u, 23u, 2u, 3u, 6u, 7u);
+-
+-const uint ColumnTable32[64] = uint[](
+-    0u, 1u, 4u, 5u, 8u, 9u, 12u, 13u,
+-    2u, 3u, 6u, 7u, 10u, 11u, 14u, 15u,
+-    16u, 17u, 20u, 21u, 24u, 25u, 28u, 29u,
+-    18u, 19u, 22u, 23u, 26u, 27u, 30u, 31u,
+-    32u, 33u, 36u, 37u, 40u, 41u, 44u, 45u,
+-    34u, 35u, 38u, 39u, 42u, 43u, 46u, 47u,
+-    48u, 49u, 52u, 53u, 56u, 57u, 60u, 61u,
+-    50u, 51u, 54u, 55u, 58u, 59u, 62u, 63u);
+-
+-const uint BlockTableC16[32] = uint[](
+-    0u, 2u, 8u, 10u,
+-    1u, 3u, 9u, 11u,
+-    4u, 6u, 12u, 14u,
+-    5u, 7u, 13u, 15u,
+-    16u, 18u, 24u, 26u,
+-    17u, 19u, 25u, 27u,
+-    20u, 22u, 28u, 30u,
+-    21u, 23u, 29u, 31u);
+-
+-const uint BlockTableC16S[32] = uint[](
+-    0u, 2u, 16u, 18u,
+-    1u, 3u, 17u, 19u,
+-    8u, 10u, 24u, 26u,
+-    9u, 11u, 25u, 27u,
+-    4u, 6u, 20u, 22u,
+-    5u, 7u, 21u, 23u,
+-    12u, 14u, 28u, 30u,
+-    13u, 15u, 29u, 31u);
+-
+-const uint BlockTableZ16[32] = uint[](
+-    24u, 26u, 16u, 18u,
+-    25u, 27u, 17u, 19u,
+-    28u, 30u, 20u, 22u,
+-    29u, 31u, 21u, 23u,
+-    8u, 10u, 0u, 2u,
+-    9u, 11u, 1u, 3u,
+-    12u, 14u, 4u, 6u,
+-    13u, 15u, 5u, 7u);
+-
+-const uint BlockTableZ16S[32] = uint[](
+-    24u, 26u, 8u, 10u,
+-    25u, 27u, 9u, 11u,
+-    16u, 18u, 0u, 2u,
+-    17u, 19u, 1u, 3u,
+-    28u, 30u, 12u, 14u,
+-    29u, 31u, 13u, 15u,
+-    20u, 22u, 4u, 6u,
+-    21u, 23u, 5u, 7u);
+-
+-const uint ColumnTable16[128] = uint[](
+-    0u, 2u, 8u, 10u, 16u, 18u, 24u, 26u, 1u, 3u, 9u, 11u, 17u, 19u, 25u, 27u,
+-    4u, 6u, 12u, 14u, 20u, 22u, 28u, 30u, 5u, 7u, 13u, 15u, 21u, 23u, 29u, 31u,
+-    32u, 34u, 40u, 42u, 48u, 50u, 56u, 58u, 33u, 35u, 41u, 43u, 49u, 51u, 57u, 59u,
+-    36u, 38u, 44u, 46u, 52u, 54u, 60u, 62u, 37u, 39u, 45u, 47u, 53u, 55u, 61u, 63u,
+-    64u, 66u, 72u, 74u, 80u, 82u, 88u, 90u, 65u, 67u, 73u, 75u, 81u, 83u, 89u, 91u,
+-    68u, 70u, 76u, 78u, 84u, 86u, 92u, 94u, 69u, 71u, 77u, 79u, 85u, 87u, 93u, 95u,
+-    96u, 98u, 104u, 106u, 112u, 114u, 120u, 122u, 97u, 99u, 105u, 107u, 113u, 115u, 121u, 123u,
+-    100u, 102u, 108u, 110u, 116u, 118u, 124u, 126u, 101u, 103u, 109u, 111u, 117u, 119u, 125u, 127u);
+-
+-// T8 shares the C32 block table; T4 shares the C16 block table.
+-const uint ColumnTable8[256] = uint[](
+-    0u, 4u, 16u, 20u, 32u, 36u, 48u, 52u, 2u, 6u, 18u, 22u, 34u, 38u, 50u, 54u,
+-    8u, 12u, 24u, 28u, 40u, 44u, 56u, 60u, 10u, 14u, 26u, 30u, 42u, 46u, 58u, 62u,
+-    33u, 37u, 49u, 53u, 1u, 5u, 17u, 21u, 35u, 39u, 51u, 55u, 3u, 7u, 19u, 23u,
+-    41u, 45u, 57u, 61u, 9u, 13u, 25u, 29u, 43u, 47u, 59u, 63u, 11u, 15u, 27u, 31u,
+-    96u, 100u, 112u, 116u, 64u, 68u, 80u, 84u, 98u, 102u, 114u, 118u, 66u, 70u, 82u, 86u,
+-    104u, 108u, 120u, 124u, 72u, 76u, 88u, 92u, 106u, 110u, 122u, 126u, 74u, 78u, 90u, 94u,
+-    65u, 69u, 81u, 85u, 97u, 101u, 113u, 117u, 67u, 71u, 83u, 87u, 99u, 103u, 115u, 119u,
+-    73u, 77u, 89u, 93u, 105u, 109u, 121u, 125u, 75u, 79u, 91u, 95u, 107u, 111u, 123u, 127u,
+-    128u, 132u, 144u, 148u, 160u, 164u, 176u, 180u, 130u, 134u, 146u, 150u, 162u, 166u, 178u, 182u,
+-    136u, 140u, 152u, 156u, 168u, 172u, 184u, 188u, 138u, 142u, 154u, 158u, 170u, 174u, 186u, 190u,
+-    161u, 165u, 177u, 181u, 129u, 133u, 145u, 149u, 163u, 167u, 179u, 183u, 131u, 135u, 147u, 151u,
+-    169u, 173u, 185u, 189u, 137u, 141u, 153u, 157u, 171u, 175u, 187u, 191u, 139u, 143u, 155u, 159u,
+-    224u, 228u, 240u, 244u, 192u, 196u, 208u, 212u, 226u, 230u, 242u, 246u, 194u, 198u, 210u, 214u,
+-    232u, 236u, 248u, 252u, 200u, 204u, 216u, 220u, 234u, 238u, 250u, 254u, 202u, 206u, 218u, 222u,
+-    193u, 197u, 209u, 213u, 225u, 229u, 241u, 245u, 195u, 199u, 211u, 215u, 227u, 231u, 243u, 247u,
+-    201u, 205u, 217u, 221u, 233u, 237u, 249u, 253u, 203u, 207u, 219u, 223u, 235u, 239u, 251u, 255u);
+-
+-const uint ColumnTable4[512] = uint[](
+-    0u, 8u, 32u, 40u, 64u, 72u, 96u, 104u, 2u, 10u, 34u, 42u, 66u, 74u, 98u, 106u, 4u, 12u, 36u, 44u, 68u, 76u, 100u, 108u, 6u, 14u, 38u, 46u, 70u, 78u, 102u, 110u,
+-    16u, 24u, 48u, 56u, 80u, 88u, 112u, 120u, 18u, 26u, 50u, 58u, 82u, 90u, 114u, 122u, 20u, 28u, 52u, 60u, 84u, 92u, 116u, 124u, 22u, 30u, 54u, 62u, 86u, 94u, 118u, 126u,
+-    65u, 73u, 97u, 105u, 1u, 9u, 33u, 41u, 67u, 75u, 99u, 107u, 3u, 11u, 35u, 43u, 69u, 77u, 101u, 109u, 5u, 13u, 37u, 45u, 71u, 79u, 103u, 111u, 7u, 15u, 39u, 47u,
+-    81u, 89u, 113u, 121u, 17u, 25u, 49u, 57u, 83u, 91u, 115u, 123u, 19u, 27u, 51u, 59u, 85u, 93u, 117u, 125u, 21u, 29u, 53u, 61u, 87u, 95u, 119u, 127u, 23u, 31u, 55u, 63u,
+-    192u, 200u, 224u, 232u, 128u, 136u, 160u, 168u, 194u, 202u, 226u, 234u, 130u, 138u, 162u, 170u, 196u, 204u, 228u, 236u, 132u, 140u, 164u, 172u, 198u, 206u, 230u, 238u, 134u, 142u, 166u, 174u,
+-    208u, 216u, 240u, 248u, 144u, 152u, 176u, 184u, 210u, 218u, 242u, 250u, 146u, 154u, 178u, 186u, 212u, 220u, 244u, 252u, 148u, 156u, 180u, 188u, 214u, 222u, 246u, 254u, 150u, 158u, 182u, 190u,
+-    129u, 137u, 161u, 169u, 193u, 201u, 225u, 233u, 131u, 139u, 163u, 171u, 195u, 203u, 227u, 235u, 133u, 141u, 165u, 173u, 197u, 205u, 229u, 237u, 135u, 143u, 167u, 175u, 199u, 207u, 231u, 239u,
+-    145u, 153u, 177u, 185u, 209u, 217u, 241u, 249u, 147u, 155u, 179u, 187u, 211u, 219u, 243u, 251u, 149u, 157u, 181u, 189u, 213u, 221u, 245u, 253u, 151u, 159u, 183u, 191u, 215u, 223u, 247u, 255u,
+-    256u, 264u, 288u, 296u, 320u, 328u, 352u, 360u, 258u, 266u, 290u, 298u, 322u, 330u, 354u, 362u, 260u, 268u, 292u, 300u, 324u, 332u, 356u, 364u, 262u, 270u, 294u, 302u, 326u, 334u, 358u, 366u,
+-    272u, 280u, 304u, 312u, 336u, 344u, 368u, 376u, 274u, 282u, 306u, 314u, 338u, 346u, 370u, 378u, 276u, 284u, 308u, 316u, 340u, 348u, 372u, 380u, 278u, 286u, 310u, 318u, 342u, 350u, 374u, 382u,
+-    321u, 329u, 353u, 361u, 257u, 265u, 289u, 297u, 323u, 331u, 355u, 363u, 259u, 267u, 291u, 299u, 325u, 333u, 357u, 365u, 261u, 269u, 293u, 301u, 327u, 335u, 359u, 367u, 263u, 271u, 295u, 303u,
+-    337u, 345u, 369u, 377u, 273u, 281u, 305u, 313u, 339u, 347u, 371u, 379u, 275u, 283u, 307u, 315u, 341u, 349u, 373u, 381u, 277u, 285u, 309u, 317u, 343u, 351u, 375u, 383u, 279u, 287u, 311u, 319u,
+-    448u, 456u, 480u, 488u, 384u, 392u, 416u, 424u, 450u, 458u, 482u, 490u, 386u, 394u, 418u, 426u, 452u, 460u, 484u, 492u, 388u, 396u, 420u, 428u, 454u, 462u, 486u, 494u, 390u, 398u, 422u, 430u,
+-    464u, 472u, 496u, 504u, 400u, 408u, 432u, 440u, 466u, 474u, 498u, 506u, 402u, 410u, 434u, 442u, 468u, 476u, 500u, 508u, 404u, 412u, 436u, 444u, 470u, 478u, 502u, 510u, 406u, 414u, 438u, 446u,
+-    385u, 393u, 417u, 425u, 449u, 457u, 481u, 489u, 387u, 395u, 419u, 427u, 451u, 459u, 483u, 491u, 389u, 397u, 421u, 429u, 453u, 461u, 485u, 493u, 391u, 399u, 423u, 431u, 455u, 463u, 487u, 495u,
+-    401u, 409u, 433u, 441u, 465u, 473u, 497u, 505u, 403u, 411u, 435u, 443u, 467u, 475u, 499u, 507u, 405u, 413u, 437u, 445u, 469u, 477u, 501u, 509u, 407u, 415u, 439u, 447u, 471u, 479u, 503u, 511u);
+-
+-// PSM ids (gs_types.h GSPsm)
+-const uint PSM_CT32 = 0u;
+-const uint PSM_CT24 = 1u;
+-const uint PSM_CT16 = 2u;
+-const uint PSM_CT16S = 10u;
+-const uint PSM_T8 = 19u;
+-const uint PSM_T4 = 20u;
+-const uint PSM_T8H = 27u;
+-const uint PSM_T4HL = 36u;
+-const uint PSM_T4HH = 44u;
+-const uint PSM_Z32 = 48u;
+-const uint PSM_Z24 = 49u;
+-const uint PSM_Z16 = 50u;
+-const uint PSM_Z16S = 58u;
+-
+-bool is32Family(uint psm) { return psm == PSM_CT32 || psm == PSM_CT24 || psm == PSM_Z32 || psm == PSM_Z24; }
+-bool is16Family(uint psm) { return psm == PSM_CT16 || psm == PSM_CT16S || psm == PSM_Z16 || psm == PSM_Z16S; }
+-bool isZFamily(uint psm) { return psm == PSM_Z32 || psm == PSM_Z24 || psm == PSM_Z16 || psm == PSM_Z16S; }
+-
+-uint readVram8(uint byteAddr)
+-{
+-    return (vram[byteAddr >> 2u] >> ((byteAddr & 3u) * 8u)) & 0xFFu;
+-}
+-
+-uint readVram16(uint byteAddr)
+-{
+-    return (vram[byteAddr >> 2u] >> ((byteAddr & 2u) * 8u)) & 0xFFFFu;
+-}
+-
+-void writeVram16(uint byteAddr, uint value)
+-{
+-    const uint shift = (byteAddr & 2u) * 8u;
+-    const uint wordAddr = byteAddr >> 2u;
+-    vram[wordAddr] = (vram[wordAddr] & ~(0xFFFFu << shift)) | ((value & 0xFFFFu) << shift);
+-}
+-
+-void writeVram8(uint byteAddr, uint value)
+-{
+-    const uint shift = (byteAddr & 3u) * 8u;
+-    const uint wordAddr = byteAddr >> 2u;
+-    vram[wordAddr] = (vram[wordAddr] & ~(0xFFu << shift)) | ((value & 0xFFu) << shift);
+-}
+-
+-// Generic swizzled read, mirroring PixelStorageTraits<>::Read for the storage modes the
+-// rasterizer can meet as frame/z/texture formats. Returns the raw stored value.
+-uint readPixel(uint psm, uint base, uint bw, uint x, uint y)
+-{
+-    if (psm == PSM_CT32 || psm == PSM_CT24 || psm == PSM_Z32 || psm == PSM_Z24 ||
+-        psm == PSM_T8H || psm == PSM_T4HL || psm == PSM_T4HH)
+-    {
+-        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
+-        const bool ztab = psm == PSM_Z32 || psm == PSM_Z24;
+-        const uint block = (ztab ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
+-        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
+-        const uint pixel = page * 2048u + ((base & 31u) + block) * 64u + column;
+-        const uint word = vram[pixel & WORD_MASK];
+-        if (psm == PSM_CT24 || psm == PSM_Z24)
+-            return word & 0x00FFFFFFu;
+-        if (psm == PSM_T8H)
+-            return (word >> 24u) & 0xFFu;
+-        if (psm == PSM_T4HL)
+-            return (word >> 24u) & 0x0Fu;
+-        if (psm == PSM_T4HH)
+-            return (word >> 28u) & 0x0Fu;
+-        return word;
+-    }
+-    if (is16Family(psm))
+-    {
+-        const uint page = (base >> 5u) + (y >> 6u) * bw + (x >> 6u);
+-        uint block;
+-        if (psm == PSM_CT16)
+-            block = BlockTableC16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
+-        else if (psm == PSM_CT16S)
+-            block = BlockTableC16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
+-        else if (psm == PSM_Z16)
+-            block = BlockTableZ16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
+-        else
+-            block = BlockTableZ16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
+-        const uint column = ColumnTable16[(y & 7u) * 16u + (x & 15u)];
+-        const uint pixel = page * 4096u + ((base & 31u) + block) * 128u + column;
+-        return readVram16((pixel * 2u) & 0x3FFFFEu);
+-    }
+-    if (psm == PSM_T8)
+-    {
+-        // page 128x64, blocks 8x4 of 16x16, block table shared with C32
+-        const uint page = (base >> 5u) + (y >> 6u) * ((bw * 64u) / 128u) + (x >> 7u);
+-        const uint block = BlockTableC32[((y >> 4u) & 3u) * 8u + ((x >> 4u) & 7u)];
+-        const uint column = ColumnTable8[(y & 15u) * 16u + (x & 15u)];
+-        const uint pixel = page * 8192u + ((base & 31u) + block) * 256u + column;
+-        return readVram8(pixel & 0x3FFFFFu);
+-    }
+-    if (psm == PSM_T4)
+-    {
+-        // page 128x128, blocks 4x8 of 32x16, block table shared with C16
+-        const uint page = (base >> 5u) + (y >> 7u) * ((bw * 64u) / 128u) + (x >> 7u);
+-        const uint block = BlockTableC16[((y >> 4u) & 7u) * 4u + ((x >> 5u) & 3u)];
+-        const uint column = ColumnTable4[(y & 15u) * 32u + (x & 31u)];
+-        const uint pixel = page * 16384u + ((base & 31u) + block) * 512u + column;
+-        const uint bits = pixel * 4u;
+-        return (readVram8((bits >> 3u) & 0x3FFFFFu) >> (bits & 7u)) & 0x0Fu;
+-    }
+-    return 0xFFFF00FFu;
+-}
+-
+-// Swizzled write for frame/z formats (mirrors PixelStorageTraits<>::Write).
+-void writePixel(uint psm, uint base, uint bw, uint x, uint y, uint value)
+-{
+-    if (psm == PSM_CT32 || psm == PSM_Z32)
+-    {
+-        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
+-        const uint block = (psm == PSM_Z32 ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
+-        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
+-        vram[(page * 2048u + ((base & 31u) + block) * 64u + column) & WORD_MASK] = value;
+-        return;
+-    }
+-    if (psm == PSM_CT24 || psm == PSM_Z24)
+-    {
+-        const uint page = (base >> 5u) + (y >> 5u) * bw + (x >> 6u);
+-        const uint block = (psm == PSM_Z24 ? BlockTableZ32 : BlockTableC32)[((y >> 3u) & 3u) * 8u + ((x >> 3u) & 7u)];
+-        const uint column = ColumnTable32[(y & 7u) * 8u + (x & 7u)];
+-        const uint addr = (page * 2048u + ((base & 31u) + block) * 64u + column) & WORD_MASK;
+-        vram[addr] = (vram[addr] & 0xFF000000u) | (value & 0x00FFFFFFu);
+-        return;
+-    }
+-    if (is16Family(psm))
+-    {
+-        const uint page = (base >> 5u) + (y >> 6u) * bw + (x >> 6u);
+-        uint block;
+-        if (psm == PSM_CT16)
+-            block = BlockTableC16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
+-        else if (psm == PSM_CT16S)
+-            block = BlockTableC16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
+-        else if (psm == PSM_Z16)
+-            block = BlockTableZ16[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
+-        else
+-            block = BlockTableZ16S[((y >> 3u) & 7u) * 4u + ((x >> 4u) & 3u)];
+-        const uint column = ColumnTable16[(y & 7u) * 16u + (x & 15u)];
+-        const uint pixel = page * 4096u + ((base & 31u) + block) * 128u + column;
+-        writeVram16((pixel * 2u) & 0x3FFFFEu, value);
+-        return;
+-    }
+-}
+-
+-// ---------------------------------------------------------------------------
+-// Pixel pipeline helpers (ports of the gs_cpu_backend.cpp free functions)
+-// ---------------------------------------------------------------------------
+-
+-int clampInt(int v, int lo, int hi)
+-{
+-    return v < lo ? lo : (v > hi ? hi : v);
+-}
+-
+-uint clampU8(int v)
+-{
+-    return uint(clampInt(v, 0, 255));
+-}
+-
+-uint rgba5551to8888(uint c)
+-{
+-    const uint r = (c & 0x1Fu) << 3u;
+-    const uint g = ((c >> 5u) & 0x1Fu) << 3u;
+-    const uint b = ((c >> 10u) & 0x1Fu) << 3u;
+-    const uint a = ((c >> 15u) & 1u) << 7u;
+-    return r | (g << 8u) | (b << 16u) | (a << 24u);
+-}
+-
+-uint rgba8888to5551(uint c)
+-{
+-    const uint r = ((c >> 3u) & 0x1Fu);
+-    const uint g = ((c >> 11u) & 0x1Fu);
+-    const uint b = ((c >> 19u) & 0x1Fu);
+-    const uint a = ((c >> 31u) & 1u);
+-    return r | (g << 5u) | (b << 10u) | (a << 15u);
+-}
+-
+-uint applyTexa(uint psm, uint texel)
+-{
+-    if (psm == PSM_CT32 || psm == PSM_Z32)
+-        return texel;
+-
+-    const uint r = texel & 0xFFu;
+-    const uint g = (texel >> 8u) & 0xFFu;
+-    const uint b = (texel >> 16u) & 0xFFu;
+-    const bool rgbZero = r == 0u && g == 0u && b == 0u;
+-    uint a = (texel >> 24u) & 0xFFu;
+-
+-    if (psm == PSM_CT24 || psm == PSM_Z24)
+-    {
+-        a = (pr.aem != 0u && rgbZero) ? 0u : pr.ta0;
+-    }
+-    else // 16-bit formats
+-    {
+-        if ((a & 0x80u) != 0u)
+-            a = pr.ta1;
+-        else
+-            a = (pr.aem != 0u && rgbZero) ? 0u : pr.ta0;
+-    }
+-    return (texel & 0x00FFFFFFu) | (a << 24u);
+-}
++#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable
++#extension GL_GOOGLE_include_directive : enable
+ 
+-int wrapTextureCoordinate(int coordinate, int textureSize, uint mode, uint regionMin, uint regionMax)
+-{
+-    switch (mode & 3u)
+-    {
+-    case 0u: // REPEAT
+-        return int(uint(coordinate) & uint(textureSize - 1));
+-    case 1u: // CLAMP
+-        return clampInt(coordinate, 0, textureSize - 1);
+-    case 2u: // REGION_CLAMP
+-        return min(max(coordinate, int(regionMin)), int(regionMax));
+-    case 3u: // REGION_REPEAT
+-        return int((uint(coordinate) & regionMin) | regionMax);
+-    }
+-    return coordinate;
+-}
+-
+-uint lookupClut(uint index)
+-{
+-    const bool sixteenBit = pr.cpsm == PSM_CT16 || pr.cpsm == PSM_CT16S;
+-    const uint csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
+-    const uint clutBase = (pr.csa & csaMask) << 4u;
+-    const bool fourBit = pr.texPsm == PSM_T4 || pr.texPsm == PSM_T4HL || pr.texPsm == PSM_T4HH;
+-    const uint sourceIndex = fourBit ? (index & 0x0Fu) : index;
+-
+-    uint clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
+-    if (!sixteenBit && pr.csm == 0u && (pr.texPsm == PSM_T8 || pr.texPsm == PSM_T8H))
+-    {
+-        const uint block = min((sourceIndex & 0xF0u) + clutBase, 240u);
+-        clutIndex = block + (sourceIndex & 0x0Fu);
+-    }
+-
+-    if (pr.cpsm == PSM_CT32)
+-    {
+-        const uint raw = clut[clutIndex] | (clut[clutIndex + 256u] << 16u);
+-        return applyTexa(pr.cpsm, raw);
+-    }
+-    if (pr.cpsm == PSM_CT24)
+-    {
+-        const uint raw = clut[clutIndex] | (clut[clutIndex + 256u] << 16u);
+-        return applyTexa(pr.cpsm, raw & 0x00FFFFFFu);
+-    }
+-    if (sixteenBit)
+-        return applyTexa(pr.cpsm, rgba5551to8888(clut[clutIndex]));
+-    return 0xFFFF00FFu;
+-}
+-
+-uint fetchTexel(int u, int v)
+-{
+-    const uint raw = readPixel(pr.texPsm, pr.tbp0, pr.tbw, uint(u), uint(v));
+-    if (pr.texPsm == PSM_CT32 || pr.texPsm == PSM_Z32 || pr.texPsm == PSM_CT24 || pr.texPsm == PSM_Z24)
+-        return applyTexa(pr.texPsm, raw);
+-    if (is16Family(pr.texPsm))
+-        return applyTexa(pr.texPsm, rgba5551to8888(raw));
+-    // indexed formats
+-    return lookupClut(raw & 0xFFu);
+-}
+-
+-uint lerpChannel(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
+-{
+-    // Matches the CPU SSE path exactly: trunc toward zero, then round up when the
+-    // fractional part reaches 0.5. `precise` blocks FMA contraction so the float
+-    // ops round identically to _mm_mul_ps/_mm_add_ps.
+-    precise const float top = float(c00) + (float(c10) - float(c00)) * fx;
+-    precise const float bottom = float(c01) + (float(c11) - float(c01)) * fx;
+-    precise const float v = top + (bottom - top) * fy;
+-    float i = trunc(v);
+-    const float frac = v - i;
+-    if (frac >= 0.5)
+-        i += 1.0;
+-    if (frac <= -0.5)
+-        i -= 1.0;
+-    return clampU8(int(i));
+-}
+-
+-uint lerpTexels(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
+-{
+-    uint outv = 0u;
+-    for (uint shift = 0u; shift < 32u; shift += 8u)
+-    {
+-        outv |= lerpChannel((c00 >> shift) & 0xFFu, (c10 >> shift) & 0xFFu,
+-                            (c01 >> shift) & 0xFFu, (c11 >> shift) & 0xFFu, fx, fy) << shift;
+-    }
+-    return outv;
+-}
+-
+-uint samplePoint(float texUf, float texVf, int su, int sv)
+-{
+-    const int sampleU = wrapTextureCoordinate(su, pr.texW, pr.wrapU, pr.minU, pr.maxU);
+-    const int sampleV = wrapTextureCoordinate(sv, pr.texH, pr.wrapV, pr.minV, pr.maxV);
+-    return fetchTexel(sampleU, sampleV);
+-}
+-
+-uint sampleTexture(float s, float t, float q, uint u, uint v)
+-{
+-    precise float texUf, texVf;
+-    if (pr.fst != 0u)
+-    {
+-        texUf = float(u) / 16.0;
+-        texVf = float(v) / 16.0;
+-    }
+-    else
+-    {
+-        const float invQ = 1.0 / (abs(q) > 1.0e-8 ? q : 1.0);
+-        texUf = s * invQ * float(pr.texW);
+-        texVf = t * invQ * float(pr.texH);
+-    }
+-
+-    if (pr.linear == 0u)
+-        return samplePoint(texUf, texVf, int(texUf), int(texVf));
+-
+-    const float sampleU = texUf - 0.5;
+-    const float sampleV = texVf - 0.5;
+-    const int u0 = int(floor(sampleU));
+-    const int v0 = int(floor(sampleV));
+-    const float fx = sampleU - float(u0);
+-    const float fy = sampleV - float(v0);
+-    const uint c00 = samplePoint(texUf, texVf, u0, v0);
+-    const uint c10 = samplePoint(texUf, texVf, u0 + 1, v0);
+-    const uint c01 = samplePoint(texUf, texVf, u0, v0 + 1);
+-    const uint c11 = samplePoint(texUf, texVf, u0 + 1, v0 + 1);
+-    return lerpTexels(c00, c10, c01, c11, fx, fy);
+-}
+-
+-// combineTexture from gs_cpu_backend.cpp
+-void combineTexture(uint tr, uint tg, uint tb, uint ta,
+-                    inout uint r, inout uint g, inout uint b, inout uint a)
+-{
+-    const bool textureHasAlpha = pr.tcc != 0u;
+-    const uint vr = r, vg = g, vb = b, va = a;
+-    r = tr; g = tg; b = tb; a = textureHasAlpha ? ta : va;
+-    switch (pr.tfx)
+-    {
+-    case 0u: // MODULATE
+-        r = clampU8(int(tr * vr) >> 7);
+-        g = clampU8(int(tg * vg) >> 7);
+-        b = clampU8(int(tb * vb) >> 7);
+-        a = textureHasAlpha ? clampU8(int(ta * va) >> 7) : va;
+-        break;
+-    case 1u: // DECAL
+-        break;
+-    case 2u: // HIGHLIGHT
+-        r = clampU8((int(tr * vr) >> 7) + int(va));
+-        g = clampU8((int(tg * vg) >> 7) + int(va));
+-        b = clampU8((int(tb * vb) >> 7) + int(va));
+-        a = textureHasAlpha ? clampU8(int(ta + va)) : va;
+-        break;
+-    case 3u: // HIGHLIGHT2
+-        r = clampU8((int(tr * vr) >> 7) + int(va));
+-        g = clampU8((int(tg * vg) >> 7) + int(va));
+-        b = clampU8((int(tb * vb) >> 7) + int(va));
+-        a = textureHasAlpha ? ta : va;
+-        break;
+-    }
+-}
+-
+-// passesAlphaTest
+-bool passesAlphaTest(uint alpha)
+-{
+-    if ((pr.testLo & 1u) == 0u)
+-        return true;
+-    const uint atst = (pr.testLo >> 1u) & 7u;
+-    const uint aref = (pr.testLo >> 4u) & 0xFFu;
+-    switch (atst)
+-    {
+-    case 0u: return false;
+-    case 1u: return true;
+-    case 2u: return alpha < aref;
+-    case 3u: return alpha <= aref;
+-    case 4u: return alpha == aref;
+-    case 5u: return alpha >= aref;
+-    case 6u: return alpha > aref;
+-    default: return alpha != aref;
+-    }
+-}
+-
+-bool passesDestinationAlphaTest(uint rawFramebufferPixel)
+-{
+-    const bool date = ((pr.testLo >> 14u) & 1u) != 0u;
+-    if (!date)
+-        return true;
+-    const bool datm = ((pr.testLo >> 15u) & 1u) != 0u;
+-    if (pr.fpsm == PSM_CT32)
+-        return (((rawFramebufferPixel >> 31u) & 1u) != 0u) == datm;
+-    if (pr.fpsm == PSM_CT16 || pr.fpsm == PSM_CT16S)
+-        return (((rawFramebufferPixel >> 15u) & 1u) != 0u) == datm;
+-    return true; // RGB24: no destination alpha, DATE always passes
+-}
+-
+-// WritePixelFast from gs_cpu_backend.cpp
+-void writePixelPipe(int x, int y, uint z, uint r, uint g, uint b, uint a, uint fog)
+-{
+-    if (x < pr.sx0 || x > pr.sx1 || y < pr.sy0 || y > pr.sy1)
+-        return;
+-
+-    if (pr.fge != 0u)
+-    {
+-        const uint inverseFog = 255u - fog;
+-        r = ((fog * r) >> 8u) + ((inverseFog * pr.fogR) >> 8u);
+-        g = ((fog * g) >> 8u) + ((inverseFog * pr.fogG) >> 8u);
+-        b = ((fog * b) >> 8u) + ((inverseFog * pr.fogB) >> 8u);
+-    }
+-
+-    // classifyAlphaTest
+-    bool writeRgb = true, writeAlpha = true, writeDepth = true;
+-    if (!passesAlphaTest(a))
+-    {
+-        const uint afail = (pr.testLo >> 12u) & 3u;
+-        if (afail == 1u) { writeDepth = false; }                     // FB_ONLY
+-        else if (afail == 2u) { writeRgb = false; writeAlpha = false; } // ZB_ONLY
+-        else if (afail == 3u)
+-        {
+-            // RGB_ONLY: only distinct for RGBA32; FB_ONLY otherwise
+-            writeDepth = false;
+-            if (pr.fpsm == PSM_CT32)
+-                writeAlpha = false;
+-        }
+-        else { writeRgb = false; writeAlpha = false; writeDepth = false; } // KEEP
+-    }
+-    if (!((writeRgb || writeAlpha) || writeDepth))
+-        return;
+-
+-    const bool preserveDestinationAlpha = writeRgb && !writeAlpha && pr.fpsm == PSM_CT32;
+-    const bool dateRead = ((pr.testLo >> 14u) & 1u) != 0u &&
+-                          (pr.fpsm == PSM_CT32 || pr.fpsm == PSM_CT16 || pr.fpsm == PSM_CT16S);
+-    const bool frmw = dateRead || ((writeRgb || writeAlpha) && (pr.fbmsk != 0u || pr.abe != 0u || preserveDestinationAlpha));
+-
+-    uint rawFramebufferPixel = 0u;
+-    uint fbrgba = 0u;
+-    if (frmw)
+-    {
+-        rawFramebufferPixel = readPixel(pr.fpsm, pr.fbp, pr.fbw, uint(x), uint(y));
+-        fbrgba = rawFramebufferPixel;
+-        if (pr.frame16 != 0u)
+-            fbrgba = rgba5551to8888(fbrgba);
+-        else if (pr.fpsm == PSM_CT24)
+-            fbrgba |= 0x80000000u; // the GS supplies 0x80 as destination alpha for RGB24 blending
+-    }
+-
+-    if (!passesDestinationAlphaTest(rawFramebufferPixel))
+-        return;
+-
+-    bool zpass = false;
+-    const uint ztest = (pr.testLo >> 17u) & 3u;
+-    if (ztest == 1u)
+-        zpass = true;
+-    else if (ztest == 2u)
+-        zpass = z >= readPixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y));
+-    else if (ztest == 3u)
+-        zpass = z > readPixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y));
+-    if (!zpass)
+-        return;
+-
+-    if (writeRgb || writeAlpha)
+-    {
+-        if (pr.abe != 0u)
+-        {
+-            const uint dr = fbrgba & 0xFFu;
+-            const uint dg = (fbrgba >> 8u) & 0xFFu;
+-            const uint db = (fbrgba >> 16u) & 0xFFu;
+-            const uint da = (fbrgba >> 24u) & 0xFFu;
+-            // PABE disables alpha blending when the source alpha MSB is clear.
+-            if (!(pr.pabe != 0u && (a & 0x80u) == 0u))
+-            {
+-                const int cAlpha = pr.csel == 0u ? int(a) : (pr.csel == 1u ? int(da) : int(pr.fixv));
+-                const int sr = int(r), sg = int(g), sb = int(b);
+-                const int idr = int(dr), idg = int(dg), idb = int(db);
+-                const int ar = pr.asel == 0u ? sr : (pr.asel == 1u ? idr : 0);
+-                const int br_ = pr.bsel == 0u ? sr : (pr.bsel == 1u ? idr : 0);
+-                const int drr = pr.dsel == 0u ? sr : (pr.dsel == 1u ? idr : 0);
+-                const int ag = pr.asel == 0u ? sg : (pr.asel == 1u ? idg : 0);
+-                const int bg = pr.bsel == 0u ? sg : (pr.bsel == 1u ? idg : 0);
+-                const int dg2 = pr.dsel == 0u ? sg : (pr.dsel == 1u ? idg : 0);
+-                const int ab = pr.asel == 0u ? sb : (pr.asel == 1u ? idb : 0);
+-                const int bb = pr.bsel == 0u ? sb : (pr.bsel == 1u ? idb : 0);
+-                const int db2 = pr.dsel == 0u ? sb : (pr.dsel == 1u ? idb : 0);
+-                r = clampU8(((ar - br_) * cAlpha >> 7) + drr);
+-                g = clampU8(((ag - bg) * cAlpha >> 7) + dg2);
+-                b = clampU8(((ab - bb) * cAlpha >> 7) + db2);
+-            }
+-        }
+-
+-        if (writeAlpha && pr.fbaOn != 0u)
+-            a |= 0x80u;
+-
+-        uint pixel = r | (g << 8u) | (b << 16u) | (a << 24u);
+-        if (pr.fbmsk != 0u)
+-            pixel = (pixel & ~pr.fbmsk) | (fbrgba & pr.fbmsk);
+-        if (preserveDestinationAlpha)
+-            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
+-        if (pr.frame16 != 0u)
+-            pixel = rgba8888to5551(pixel);
+-        writePixel(pr.fpsm, pr.fbp, pr.fbw, uint(x), uint(y), pixel);
+-    }
++layout(local_size_x = 8, local_size_y = 8) in;
+ 
+-    if (writeDepth && pr.zmask == 0u)
+-        writePixel(pr.zpsm, pr.zbp, pr.fbw, uint(x), uint(y), z);
+-}
++#include "gs_raster_common.glsl"
+ 
+ void main()
+ {
+@@ -732,11 +37,11 @@ void main()
+             const int fixedV = int(fixedVf);
+             const uint sampleU = uint(clampInt(fixedU, 0, 65535));
+             const uint sampleV = uint(clampInt(fixedV, 0, 65535));
+-            texel = sampleTexture(0.0, 0.0, 1.0, sampleU, sampleV);
++            texel = sampleTexture(0.0, 0.0, 1.0, sampleU, sampleV, false);
+         }
+         else
+         {
+-            texel = sampleTexture(texUf / float(pr.texW), texVf / float(pr.texH), 1.0, 0u, 0u);
++            texel = sampleTexture(texUf / float(pr.texW), texVf / float(pr.texH), 1.0, 0u, 0u, false);
+         }
+ 
+         const uint tr = texel & 0xFFu;
+diff --git a/ps2xRuntime/src/lib/gs/shaders/raster_triangle.comp b/ps2xRuntime/src/lib/gs/shaders/raster_triangle.comp
+new file mode 100755
+index 0000000..98ef580
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/raster_triangle.comp
+@@ -0,0 +1,135 @@
++#version 450
++
++// Triangle rasterizer for the Vulkan GS backend: one dispatch per GS triangle primitive,
++// one invocation per candidate output pixel (mirrors GSCpuBackend::DrawTriangle).
++
++#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable
++#extension GL_GOOGLE_include_directive : enable
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++#include "gs_raster_common.glsl"
++
++void main()
++{
++    const int x = pr.triMinX + int(gl_GlobalInvocationID.x);
++    const int y = pr.triMinY + int(gl_GlobalInvocationID.y);
++    if (x > pr.triMaxX || y > pr.triMaxY)
++        return;
++
++    // Edge functions at pixel centers — same operation order as the CPU path
++    // (precise: no FMA contraction, rounding must match the scalar float ops).
++    precise const float px = float(x) + 0.5;
++    precise const float py = float(y) + 0.5;
++    precise const float dx = px - pr.fx2;
++    precise const float rowTerm0 = (pr.fx2 - pr.fx1) * (py - pr.fy2);
++    precise const float rowTerm1 = (pr.fx0 - pr.fx2) * (py - pr.fy2);
++    precise const float w0 = ((pr.edgeA0 * dx + rowTerm0) * pr.winding) * pr.invAbsDenom;
++    precise const float w1 = ((pr.edgeA1 * dx + rowTerm1) * pr.winding) * pr.invAbsDenom;
++    precise const float w2 = (1.0 - w0) - w1;
++
++    // TRI_DEBUG: dev-only per-pixel writeback into sprite-only params slots.
++    const bool dbg = pr.drawX0 == 1 && x == pr.unclippedX0 && y == pr.unclippedY0;
++    if (dbg)
++    {
++        pr.u0f = w0;
++        pr.v0f = w1;
++        pr.u1f = w2;
++        pr.vertG = 0x11111111u; // marker: reached edge test
++    }
++
++    if (w0 < -0.0001 || w1 < -0.0001 || w2 < -0.0001)
++        return;
++
++    uint r, g, b, a;
++    if (pr.iip != 0u)
++    {
++        precise const float ir = (pr.attrR0 * w0 + pr.attrR1 * w1) + pr.attrR2 * w2;
++        precise const float ig = (pr.attrG0 * w0 + pr.attrG1 * w1) + pr.attrG2 * w2;
++        precise const float ib = (pr.attrB0 * w0 + pr.attrB1 * w1) + pr.attrB2 * w2;
++        precise const float ia = (pr.attrA0 * w0 + pr.attrA1 * w1) + pr.attrA2 * w2;
++        r = clampU8(int(ir));
++        g = clampU8(int(ig));
++        b = clampU8(int(ib));
++        a = clampU8(int(ia));
++    }
++    else
++    {
++        // Flat shading: vertex 2 color (exact small ints in float).
++        r = uint(pr.attrR2);
++        g = uint(pr.attrG2);
++        b = uint(pr.attrB2);
++        a = uint(pr.attrA2);
++    }
++
++    if (pr.tme != 0u)
++    {
++        uint texel;
++        if (pr.fst != 0u)
++        {
++            // FST interpolates the raw 4.12 fixed-point UVs; the CPU truncates to u16.
++            precise const float iuf = (pr.attrS0 * w0 + pr.attrS1 * w1) + pr.attrS2 * w2;
++            precise const float ivf = (pr.attrT0 * w0 + pr.attrT1 * w1) + pr.attrT2 * w2;
++            const uint iu = uint(int(iuf)) & 0xFFFFu;
++            const uint iv = uint(int(ivf)) & 0xFFFFu;
++            texel = sampleTexture(0.0, 0.0, 1.0, iu, iv, dbg);
++            if (dbg)
++            {
++                pr.spriteW = iuf;
++                pr.spriteH = ivf;
++                pr.vertG = iu;
++                pr.vertB = iv;
++            }
++        }
++        else
++        {
++            // The GS DDA interpolates homogeneous S, T, Q; texel coordinates come from
++            // S/Q and T/Q only after interpolation (done inside sampleTexture).
++            precise const float isv = (pr.attrS0 * w0 + pr.attrS1 * w1) + pr.attrS2 * w2;
++            precise const float itv = (pr.attrT0 * w0 + pr.attrT1 * w1) + pr.attrT2 * w2;
++            precise const float iqv = (pr.attrQ0 * w0 + pr.attrQ1 * w1) + pr.attrQ2 * w2;
++            texel = sampleTexture(isv, itv, iqv, 0u, 0u, dbg);
++            if (dbg)
++            {
++                pr.spriteW = isv;
++                pr.spriteH = itv;
++                pr.v1f = iqv;
++            }
++        }
++        if (dbg)
++            pr.vertR = texel;
++
++        const uint tr = texel & 0xFFu;
++        const uint tg = (texel >> 8u) & 0xFFu;
++        const uint tb = (texel >> 16u) & 0xFFu;
++        const uint ta = (texel >> 24u) & 0xFFu;
++        combineTexture(tr, tg, tb, ta, r, g, b, a);
++    }
++
++    // Fog is always interpolated, independent of IIP.
++    precise const float fogf = (pr.attrFog0 * w0 + pr.attrFog1 * w1) + pr.attrFog2 * w2;
++    const uint fog = clampU8(int(fogf));
++
++    // Z in double precision like the CPU; trunc(z + 0.5) matches static_cast<u32>.
++    // precise: no reassociation/FMA of the double chain — 1 ulp flips the truncated Z.
++    precise const float64_t zw0 = pr.triZ0 * float64_t(w0);
++    precise const float64_t zw1 = pr.triZ1 * float64_t(w1);
++    precise const float64_t zw2 = pr.triZ2 * float64_t(w2);
++    precise const float64_t z = (zw0 + zw1) + zw2;
++    // static_cast<u32> on x86 truncates toward zero and wraps two's-complement;
++    // GLSL's uint() is undefined for negatives, so wrap explicitly.
++    float64_t zt = trunc(z + 0.5);
++    if (zt < 0.0)
++        zt += 4294967296.0;
++    const uint zValue = uint(min(zt, 4294967295.0));
++
++    if (dbg)
++    {
++        pr.vertA = a;
++        pr.vertFog = fog;
++        pr.z1 = zValue;
++        pr.drawY1 = 0x22222222; // marker: reached writePixelPipe
++    }
++
++    writePixelPipe(x, y, zValue, r, g, b, a, fog);
++}

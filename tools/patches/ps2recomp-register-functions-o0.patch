@@ -1,0 +1,16 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -471,9 +471,9 @@ else()
+     )
+ endif()
+ 
+-# register_functions.cpp is a single ~230k-line static initializer; MSVC's and mingw GCC 13's optimizers
+-# effectively never finish it. The table contents are plain stores, so -O0 loses nothing.
+-if((MSVC OR MINGW) AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp")
++# register_functions.cpp is a single ~230k-line static initializer; the optimizers (MSVC, GCC 13 and 15)
++# take 30+ minutes on it. The table contents are plain stores, so -O0 loses nothing.
++if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp")
+     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp" PROPERTIES
+         SKIP_UNITY_BUILD_INCLUSION TRUE
+         SKIP_PRECOMPILE_HEADERS TRUE

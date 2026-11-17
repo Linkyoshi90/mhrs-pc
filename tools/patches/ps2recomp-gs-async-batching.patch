@@ -1,0 +1,112 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+index 2dcf71f..7e8335a 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_async_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -62,7 +62,9 @@ private:
+     // Kept small: a frame queues ~100k of these.
+     using Command = std::variant<GSPrimitiveBatch, ClutLoad, GSTransferCommand, ImageData, FlushCmd, TextureFlushCmd, GSSyncReason, Clear>;
+ 
+-    void Enqueue(Command &&command);
++    // wakeNow: wake the worker even if it has less than kWakeDraws commands queued (anything but a draw).
++    template <class T>
++    void Enqueue(T &&command, bool wakeNow = true);
+     void Drain() const;
+     void Run(Command &command);
+     void WorkerLoop();
+@@ -74,5 +76,7 @@ private:
+     uint64_t m_submitted = 0;
+     uint64_t m_completed = 0;
+     bool m_stop = false;
++    bool m_wakeNow = false;         // a command other than a draw or CLUT load is queued
++    mutable int m_drainWaiters = 0; // threads in Drain
+     std::thread m_worker;
+ };
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index 051e5bc..0a342a8 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -1,11 +1,14 @@
+ #include "runtime/gs/gs_async_backend.h"
+ 
++#include <type_traits>
+ #include <utility>
+ 
+ namespace
+ {
+     // Bounds the queue so a producer far ahead of the rasteriser cannot use unbounded memory.
+     constexpr size_t kMaxPendingCommands = 1u << 18u; // a few frames
++    // Draws are cheap to queue but waking the worker is a syscall: wake it once this many commands wait.
++    constexpr size_t kWakeDraws = 1024u;
+ }
+ 
+ GSAsyncBackend::GSAsyncBackend(std::unique_ptr<GSRasterBackend> inner)
+@@ -24,15 +27,23 @@ GSAsyncBackend::~GSAsyncBackend()
+     m_worker.join();
+ }
+ 
+-void GSAsyncBackend::Enqueue(Command &&command)
++template <class T>
++void GSAsyncBackend::Enqueue(T &&command, bool wakeNow)
+ {
+     std::unique_lock<std::mutex> lock(m_mutex);
+-    m_cv.wait(lock, [this]() { return m_pending.size() < kMaxPendingCommands; });
+-    const bool wasEmpty = m_pending.empty();
+-    m_pending.push_back(std::move(command));
++    if (m_pending.size() >= kMaxPendingCommands)
++    {
++        m_wakeNow = true;
++        m_cv.notify_all();
++        m_cv.wait(lock, [this]() { return m_pending.size() < kMaxPendingCommands; });
++    }
++    m_pending.emplace_back(std::in_place_type<std::decay_t<T>>, std::forward<T>(command));
+     ++m_submitted;
++    if (wakeNow)
++        m_wakeNow = true;
++    const bool wake = wakeNow || m_pending.size() == kWakeDraws;
+     lock.unlock();
+-    if (wasEmpty)
++    if (wake)
+         m_cv.notify_all();
+ }
+ 
+@@ -40,7 +51,11 @@ void GSAsyncBackend::Drain() const
+ {
+     std::unique_lock<std::mutex> lock(m_mutex);
+     const uint64_t target = m_submitted;
++    ++m_drainWaiters;
++    if (m_completed < target)
++        m_cv.notify_all(); // draws may be waiting for kWakeDraws
+     m_cv.wait(lock, [this, target]() { return m_completed >= target; });
++    --m_drainWaiters;
+ }
+ 
+ void GSAsyncBackend::Run(Command &command)
+@@ -68,10 +83,12 @@ void GSAsyncBackend::WorkerLoop()
+     {
+         {
+             std::unique_lock<std::mutex> lock(m_mutex);
+-            m_cv.wait(lock, [this]() { return m_stop || !m_pending.empty(); });
++            m_cv.wait(lock, [this]()
++                      { return m_stop || (!m_pending.empty() && (m_wakeNow || m_drainWaiters > 0 || m_pending.size() >= kWakeDraws)); });
+             if (m_pending.empty())
+                 return; // stopping
+             batch.swap(m_pending);
++            m_wakeNow = false;
+         }
+         m_cv.notify_all(); // the queue has room again
+ 
+@@ -119,12 +136,12 @@ void GSAsyncBackend::Reset()
+ 
+ void GSAsyncBackend::Submit(const GSPrimitiveBatch &batch)
+ {
+-    Enqueue(batch);
++    Enqueue(batch, false);
+ }
+ 
+ void GSAsyncBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+-    Enqueue(ClutLoad{tex0, texclut});
++    Enqueue(ClutLoad{tex0, texclut}, false);
+ }
+ 
+ void GSAsyncBackend::BeginTransfer(const GSTransferCommand &transfer)

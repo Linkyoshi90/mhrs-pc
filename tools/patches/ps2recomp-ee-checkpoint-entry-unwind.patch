@@ -1,0 +1,217 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -279,6 +279,8 @@ public:
+     void requestStop();
+     void postEvent(EeEvent event);
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
++    // How many times checkpointDue() sent generated code back to the scheduler (see dispatchGuestBranch).
++    uint64_t checkpointExits() const noexcept { return m_checkpointExits; }
+     void accountCycles(uint32_t cycles) noexcept;
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+ 
+@@ -426,6 +428,7 @@ private:
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
++    uint64_t m_checkpointExits = 0;
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+     std::thread::id m_executorThread{};
+     std::atomic<bool> m_running{false};
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -276,76 +276,6 @@ void EeScheduler::run()
+                 continue;
+             }
+         }
+-        { // TEMP-DEBUG(mhrs): watch the projection matrix at 0x4C9FF0
+-            static uint8_t last[64];
+-            static bool init = false;
+-            static int reports = 0;
+-            if (m_rdram && reports < 80)
+-            {
+-                if (!init)
+-                {
+-                    std::memcpy(last, m_rdram + 0x4C9FF0u, 64);
+-                    init = true;
+-                }
+-                else if (std::memcmp(last, m_rdram + 0x4C9FF0u, 64) != 0)
+-                {
+-                    ++reports;
+-                    std::memcpy(last, m_rdram + 0x4C9FF0u, 64);
+-                    float f[16];
+-                    std::memcpy(f, last, 64);
+-                    std::cerr << "[mhrs-matwatch] after: " << mhrsLastDispatch << " now:";
+-                    for (float v : f)
+-                        std::cerr << " " << v;
+-                    extern std::string mhrsDispatchHistoryString();
+-                    std::cerr << " vsync=" << m_vsyncTick << " trace=" << mhrsDispatchHistoryString() << std::endl;
+-                }
+-            }
+-        }
+-        { // TEMP-DEBUG(mhrs): main-stack guard
+-            static uint8_t snap[0x400];
+-            static uint32_t snapSp = 0;
+-            static bool armed = false;
+-            static int reports = 0;
+-            GuestThread *mainT = thread(kMainThreadId);
+-            const bool mainFramesIdle = mainT && mainT->status != EeThreadStatus::Dormant &&
+-                                        (running != mainT || !mainT->invocations.empty());
+-            if (mainFramesIdle && m_rdram)
+-            {
+-                const uint32_t sp = getRegU32(&mainT->context, 29) & 0x1FFFFFF0u;
+-                if (sp >= 0x100000u && sp + sizeof(snap) <= PS2_RAM_SIZE)
+-                {
+-                    if (!armed || sp != snapSp)
+-                    {
+-                        std::memcpy(snap, m_rdram + sp, sizeof(snap));
+-                        snapSp = sp;
+-                        armed = true;
+-                    }
+-                    else if (std::memcmp(snap, m_rdram + sp, sizeof(snap)) != 0)
+-                    {
+-                        if (reports < 60)
+-                        {
+-                            for (size_t i = 0; i < sizeof(snap); i += 4)
+-                            {
+-                                uint32_t o, n;
+-                                std::memcpy(&o, snap + i, 4);
+-                                std::memcpy(&n, m_rdram + sp + i, 4);
+-                                if (o != n)
+-                                    std::cerr << "[mhrs-stackguard] main sp=0x" << std::hex << sp << " +0x" << i << " 0x" << o
+-                                              << " -> 0x" << n << " mainpc=0x" << mainT->context.pc << " mainra=0x" << getRegU32(&mainT->context, 31)
+-                                              << " after: " << mhrsLastDispatch << " next: tid=" << std::dec << running->id
+-                                              << " vsync=" << m_vsyncTick << std::endl;
+-                            }
+-                        }
+-                        ++reports;
+-                        std::memcpy(snap, m_rdram + sp, sizeof(snap));
+-                    }
+-                }
+-            }
+-            else
+-            {
+-                armed = false;
+-            }
+-        }
+         R5900Context &context = running->activeContext();
+         if (m_debugPublishCountdown == 0u)
+         {
+@@ -438,15 +368,6 @@ void EeScheduler::run()
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
+-            mhrs_debug::startSampler(); // TEMP-DEBUG(mhrs)
+-            { // TEMP-DEBUG(mhrs): describe this dispatch for the stack guard
+-                char buf[200];
+-                std::snprintf(buf, sizeof(buf), "tid=%d inv=%zu kind=%d pc=0x%x ra=0x%x sp=0x%x",
+-                              running->id, running->invocations.size(),
+-                              running->invocations.empty() ? -1 : static_cast<int>(running->invocations.back().kind),
+-                              context.pc, getRegU32(&context, 31), getRegU32(&context, 29));
+-                mhrsLastDispatch = buf;
+-            }
+             mhrs_debug::g_liveTid.store(running->id, std::memory_order_relaxed);
+             mhrs_debug::g_liveCtx.store(&context, std::memory_order_relaxed);
+             mhrs_debug::g_state.store(1, std::memory_order_relaxed);
+@@ -516,6 +437,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+         m_stopRequested.load(std::memory_order_acquire))
+     {
++        ++m_checkpointExits;
+         return true;
+     }
+ 
+@@ -523,6 +445,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+     {
+         m_checkpointPending.store(true, std::memory_order_release);
++        ++m_checkpointExits;
+         return true;
+     }
+ 
+@@ -536,6 +459,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     {
+         m_rescheduleRequested = true;
+         m_timeSliceExpired = true;
++        ++m_checkpointExits;
+         return true;
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1634,6 +1634,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     }
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    const uint64_t exitsBefore = m_eeScheduler ? m_eeScheduler->checkpointExits() : 0u;
+     targetFn(rdram, ctx, this);
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+@@ -1645,7 +1646,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    if (ctx->pc == entryPc)
++    // pc still at the entry: a stub that never set pc has returned. Not so when a checkpoint fired during the
++    // call: generated code then stopped with pc at the callee's entry (a back edge to it, or a recursive call
++    // into it) and must resume there, while the frames above it unwind. Taking that for a return let the
++    // caller run on with the callee's half-built frame (sp, ra slots), corrupting the guest stack.
++    if (ctx->pc == entryPc && (!m_eeScheduler || m_eeScheduler->checkpointExits() == exitsBefore))
+     {
+         ctx->pc = fallthroughPc;
+     }
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -157,6 +157,19 @@ namespace
+         }
+     }
+ 
++    // A generated loop whose back edge targets the function's own entry, stopped by a checkpoint on that edge:
++    // it returns with pc at the entry although it has not returned.
++    void testGuestBranchCheckpointAtEntryHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        runtime->eeScheduler().postEvent(EeEvent{});
++        ctx->pc = 0x3200u;
++        if (runtime->eeCheckpointDue())
++        {
++            return;
++        }
++        ctx->pc = 0x2008u;
++    }
++
+     void testGuestBranchTransferHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+     {
+         if (ctx)
+@@ -450,6 +463,29 @@ void register_ps2_runtime_expansion_tests()
+                      "callee should still execute normally");
+         });
+ 
++        tc.Run("dispatchGuestBranch call does not take a checkpoint stop at the callee entry for a return", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            runtime.registerFunction(0x3200u, &testGuestBranchCheckpointAtEntryHandler);
++
++            R5900Context ctx{};
++            ctx.pc = 0x2000u;
++
++            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
++                nullptr,
++                &ctx,
++                0x3200u,
++                0x2000u,
++                0x2008u,
++                PS2Runtime::GuestBranchKind::IndirectCall,
++                "test-jalr-checkpoint");
++
++            t.IsFalse(returnedToFallthrough,
++                      "the caller must unwind: the callee stopped at a checkpoint, it did not return");
++            t.Equals(ctx.pc, 0x3200u,
++                     "the scheduler must resume the callee at its entry");
++        });
++
+         tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)
+         {
+             PS2Runtime runtime;

@@ -1,0 +1,175 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index a746bf9..ad9323a 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -382,6 +382,7 @@ private:
+     void execUpper(uint32_t instr);
+     void execUpperInline(uint32_t instr);
+     void execFmac(const DecodedInstructionPair &decoded);
++    template <bool kFastFlags = true>
+     void execFmacInline(const DecodedInstructionPair &decoded);
+     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+     void execLowerInline(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.h b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+index 58a33c8..95c10fa 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+@@ -771,6 +771,7 @@ VU1_ALWAYS_INLINE VU1Interpreter::FlagPipelineEntry *VU1Interpreter::allocFlagEn
+ // A float product is exact in double and the sum is rounded once, so a double result that is zero, or in
+ // [2^-125, 2^127), classifies like the exact one (same zero-ness and sign, no overflow or underflow) in any
+ // rounding mode; only the rest needs long double. Packed float/double ops round exactly like scalar ones.
++template <bool kFastFlags>
+ VU1_ALWAYS_INLINE void VU1Interpreter::execFmacInline(const DecodedInstructionPair &decoded)
+ {
+     const uint32_t instr = decoded.upper;
+@@ -816,6 +817,62 @@ VU1_ALWAYS_INLINE void VU1Interpreter::execFmacInline(const DecodedInstructionPa
+     b = ps2_vu1_simd::normalizeOperands(b);
+     const __m128 acc = ps2_vu1_simd::normalizeOperands(_mm_loadu_ps(m_state.acc));
+ 
++    if constexpr (kFastFlags)
++    {
++        // The flags straight from the float result, where they are exactly what the path below finds (it is
++        // the reference: the test "FMAC flags from the float result match the exact path" checks the two).
++        // The VU rounds toward zero, so for one rounding (ADD/SUB/MUL) a result r with biased exponent in
++        // [2, 0xFD] means the exact result lies in [|r|, |r| + ulp) inside [2^-125, 2^127): not zero, r's sign,
++        // no underflow or overflow, r unchanged. MADD/MSUB round the product p, then the sum: the error is below
++        // ulp(p) + ulp(r) <= |r|/8 when exp(r) >= exp(p) - 19, so with exp(r) in [4, 0xFC] the exact sum has r's
++        // sign and stays inside that range; exp(p) in [1, 0xFD] makes the product's sticky flags just its sign.
++        if (source != FmacCross)
++        {
++            __m128 product = _mm_setzero_ps();
++            __m128 fast;
++            switch (form)
++            {
++            case FmacAdd: fast = _mm_add_ps(a, b); break;
++            case FmacSub: fast = _mm_sub_ps(a, b); break;
++            case FmacMulAdd: product = _mm_mul_ps(a, b), fast = _mm_add_ps(acc, product); break;
++            case FmacMulSub: product = _mm_mul_ps(a, b), fast = _mm_sub_ps(acc, product); break;
++            default: fast = _mm_mul_ps(a, b); break;
++            }
++            const __m128i exponentMask = _mm_set1_epi32(0xFF);
++            const __m128i resultExp = _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(fast), 23), exponentMask);
++            const bool fused = form == FmacMulAdd || form == FmacMulSub;
++            __m128i ok;
++            if (fused)
++            {
++                const __m128i productExp = _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(product), 23), exponentMask);
++                const __m128i productOk = _mm_and_si128(_mm_cmpgt_epi32(productExp, _mm_setzero_si128()), _mm_cmplt_epi32(productExp, _mm_set1_epi32(0xFE)));
++                const __m128i resultOk = _mm_and_si128(_mm_cmpgt_epi32(resultExp, _mm_set1_epi32(3)), _mm_cmplt_epi32(resultExp, _mm_set1_epi32(0xFD)));
++                ok = _mm_and_si128(_mm_and_si128(productOk, resultOk), _mm_cmpgt_epi32(_mm_add_epi32(resultExp, _mm_set1_epi32(20)), productExp));
++            }
++            else
++            {
++                ok = _mm_and_si128(_mm_cmpgt_epi32(resultExp, _mm_set1_epi32(1)), _mm_cmplt_epi32(resultExp, _mm_set1_epi32(0xFE)));
++            }
++            const uint32_t fastDest = ps2_vu1_simd::reverseLanes[dest];
++            if ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(ok))) & fastDest) == fastDest)
++            {
++                const uint32_t macSign = static_cast<uint32_t>(_mm_movemask_ps(fast)) & fastDest;
++                if (FlagPipelineEntry *entry = allocFlagEntry(true, 0xFFFFFFFFu))
++                {
++                    entry->mac = static_cast<uint32_t>(ps2_vu1_simd::reverseLanes[macSign]) << 4;
++                    entry->status = macSign != 0u ? 0x2u : 0u;
++                    entry->extraSticky = fused && (static_cast<uint32_t>(_mm_movemask_ps(product)) & fastDest) != 0u ? 0x2u : 0u;
++                    entry->writesMac = true;
++                    entry->writesStatus = true;
++                }
++                alignas(16) float result[4];
++                _mm_store_ps(result, fast);
++                applyDest(decoded.fmacToAcc ? m_state.acc : m_state.vf[VFD(instr)], result, dest);
++                return;
++            }
++        }
++    }
++
+     const __m128d aLo = _mm_cvtps_pd(a), aHi = _mm_cvtps_pd(_mm_movehl_ps(a, a));
+     const __m128d bLo = _mm_cvtps_pd(b), bHi = _mm_cvtps_pd(_mm_movehl_ps(b, b));
+     const __m128d productLo = _mm_mul_pd(aLo, bLo), productHi = _mm_mul_pd(aHi, bHi); // exact
+@@ -1436,6 +1493,22 @@ struct VU1Interpreter::CompiledAccess
+         return (settled(plan.checks[plan.checkBegin[I] + C]) && ...);
+     }
+ 
++    // Testing: one upper FMAC op through the float-result flags or only the exact path; returns the queued flag
++    // entry's mac, status and extraSticky (zeros if none was queued).
++    static std::array<uint32_t, 3> fmacForTest(VU1Interpreter &vu, uint32_t upper, bool fastFlags)
++    {
++        const DecodedInstructionPair pair = decodePair(0x8000033Cu, upper, Unit::VU1);
++        const uint32_t before = vu.m_flagCount;
++        if (fastFlags)
++            vu.execFmacInline<true>(pair);
++        else
++            vu.execFmacInline<false>(pair);
++        if (vu.m_flagCount == before)
++            return {0u, 0u, 0u};
++        const FlagPipelineEntry &entry = vu.m_flagPipeline[(vu.m_flagHead + vu.m_flagCount - 1u) % kMaxFlagEntries];
++        return {entry.mac, entry.status, entry.extraSticky};
++    }
++
+     // A plain pair of a run that passed its entry check; false if the run must stop after it.
+     template <const auto &Words, uint32_t Pc, size_t I>
+     static VU1_ALWAYS_INLINE bool plainStep(VU1Interpreter &vu)
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 49827e9..b7ea38f 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -1893,6 +1893,60 @@ void register_ps2_vu1_tests()
+             t.Equals(wrong, 0, "every run executes the code that is in VU1 memory");
+         });
+ 
++        tc.Run("FMAC flags from the float result match the exact path", [](TestCase &t)
++        {
++            std::mt19937 rng(2024u);
++            // Exponents on and around the shortcut's thresholds, plus ordinary ones.
++            const auto randomFloat = [&]() -> float
++            {
++                static const uint32_t edges[] = {0u, 1u, 2u, 3u, 4u, 5u, 6u, 0xF8u, 0xF9u, 0xFAu, 0xFBu, 0xFCu, 0xFDu, 0xFEu, 0xFFu};
++                uint32_t exponent;
++                switch (rng() % 4u)
++                {
++                case 0: exponent = edges[rng() % (sizeof(edges) / sizeof(edges[0]))]; break;
++                case 1: exponent = 0x40u + rng() % 0x80u; break;           // products that land near the edges
++                case 2: exponent = 0x7Fu - 70u + rng() % 140u; break;
++                default: exponent = rng() % 256u; break;
++                }
++                const uint32_t bits = ((rng() & 1u) << 31) | (exponent << 23) | (rng() & 0x7FFFFFu);
++                return std::bit_cast<float>(bits);
++            };
++            static const uint32_t ops[] = {0x28u /*ADD*/, 0x2Cu /*SUB*/, 0x2Au /*MUL*/, 0x29u /*MADD*/, 0x2Du /*MSUB*/};
++            const int previous = std::fegetround();
++            std::fesetround(FE_TOWARDZERO);
++            int mismatches = 0, fastTaken = 0;
++            for (int round = 0; round < 200000; ++round)
++            {
++                const uint32_t dest = 1u + rng() % 15u;
++                const uint32_t upper = (dest << 21) | (2u << 16) | (1u << 11) | (3u << 6) | ops[rng() % 5u];
++                VU1Interpreter fast, exact;
++                for (VU1Interpreter *vu : {&fast, &exact})
++                    vu->reset();
++                for (int lane = 0; lane < 4; ++lane)
++                {
++                    const float a = randomFloat(), b = randomFloat();
++                    float acc = randomFloat();
++                    if (rng() % 3u == 0u) // acc close to -a*b: cancellation
++                        acc = -(a * b) * (1.0f + static_cast<float>(static_cast<int>(rng() % 7u) - 3) * 0x1p-23f);
++                    for (VU1Interpreter *vu : {&fast, &exact})
++                    {
++                        vu->state().vf[1][lane] = a;
++                        vu->state().vf[2][lane] = b;
++                        vu->state().acc[lane] = acc;
++                        vu->state().vf[3][lane] = 12345.0f;
++                    }
++                }
++                const auto fastFlags = VU1Interpreter::CompiledAccess::fmacForTest(fast, upper, true);
++                const auto exactFlags = VU1Interpreter::CompiledAccess::fmacForTest(exact, upper, false);
++                if (fastFlags != exactFlags || std::memcmp(fast.state().vf[3], exact.state().vf[3], 16) != 0 ||
++                    std::memcmp(fast.state().acc, exact.state().acc, 16) != 0)
++                    ++mismatches;
++            }
++            std::fesetround(previous);
++            (void)fastTaken;
++            t.Equals(mismatches, 0, "result and flags agree for edge-case operands");
++        });
++
+         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
+         {
+             Vu1Fixture fx;

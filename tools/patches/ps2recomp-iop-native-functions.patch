@@ -1,0 +1,405 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..1ddb6d5 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -27,6 +27,8 @@ namespace ps2x::iop
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
+         void runEeCycles(uint64_t eeCycles) noexcept;
++        // Applies to modules loaded after registration; survives reset().
++        void registerNativeFunction(NativeFunction function);
+ 
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+diff --git a/ps2xIOP/include/ps2x/iop/iop_types.h b/ps2xIOP/include/ps2x/iop/iop_types.h
+index 3491440..2312a7e 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_types.h
++++ b/ps2xIOP/include/ps2x/iop/iop_types.h
+@@ -2,11 +2,40 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
++#include <span>
+ #include <string>
+ #include <vector>
+ 
+ namespace ps2x::iop
+ {
++    // Host implementation of a hot IRX function. When a module named `module` loads and the FNV-1a hash of
++    // the words at base+offset, each ANDed with its mask (clear bits = relocated fields), equals `maskedHash`,
++    // the entry instruction is replaced by a trap that runs `call` instead of interpreting the guest code and
++    // then returns to $ra. `call` gets the entry address, the 32 GPRs and physical IOP RAM, and returns the
++    // guest cycles to charge. A hash keeps the original code out of the caller's sources.
++    struct NativeFunction
++    {
++        std::string module; // IRX file name, case-insensitive, ";1" suffix ignored (e.g. "SNDDRV.IRX")
++        uint32_t offset = 0;
++        std::vector<uint32_t> masks; // one per instruction word covered by the check
++        uint32_t maskedHash = 0;
++        std::function<uint32_t(uint32_t entry, uint32_t *gpr, std::span<uint8_t> ram)> call;
++    };
++
++    // FNV-1a over (word & mask) for each word, as used by NativeFunction::maskedHash.
++    inline uint32_t nativeMaskedHash(const uint32_t *words, const uint32_t *masks, size_t count)
++    {
++        uint32_t hash = 2166136261u;
++        for (size_t i = 0; i < count; ++i)
++        {
++            const uint32_t value = words[i] & masks[i];
++            for (int b = 0; b < 4; ++b)
++                hash = (hash ^ ((value >> (8 * b)) & 0xFFu)) * 16777619u;
++        }
++        return hash;
++    }
++
+     struct GuestBuffer
+     {
+         uint32_t address = 0;
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.cpp b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+index e09642e..99fe104 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.cpp
++++ b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+@@ -459,6 +459,8 @@ namespace ps2x::iop::detail
+             break;
+         }
+         default:
++            if (m_reservedHook && m_reservedHook(cpu, instruction))
++                return !cpu.stopped;
+             raiseException(cpu, 10u, pc, wasDelaySlot);
+             break;
+         }
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.h b/ps2xIOP/src/emulator/core/iop_cpu.h
+index f236050..7a3d531 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.h
++++ b/ps2xIOP/src/emulator/core/iop_cpu.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <functional>
++
+ #include <array>
+ #include <cstdint>
+ #include <optional>
+@@ -31,6 +33,9 @@ namespace ps2x::iop::detail
+         explicit IopCpuCore(IopMemory &memory) noexcept;
+ 
+         [[nodiscard]] bool executeInstruction(IopCpuState &cpu);
++        // Called for unimplemented primary opcodes before the reserved-instruction exception;
++        // return true when handled (pc already updated). Keeps native traps off the hot path.
++        void setReservedInstructionHook(std::function<bool(IopCpuState &, uint32_t)> hook) { m_reservedHook = std::move(hook); }
+         void raiseException(IopCpuState &cpu, uint32_t code, uint32_t faultPc, bool delaySlot, std::optional<uint32_t> badAddress = std::nullopt) const;
+ 
+     private:
+@@ -38,5 +43,6 @@ namespace ps2x::iop::detail
+         static void scheduleLoad(uint32_t reg, uint32_t value, bool &scheduled, uint32_t &scheduledReg, uint32_t &scheduledValue);
+ 
+         IopMemory &m_memory;
++        std::function<bool(IopCpuState &, uint32_t)> m_reservedHook;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..2ebeeb5 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -69,6 +69,7 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
++        [[nodiscard]] std::span<uint8_t> ramMutable() noexcept { return m_ram; }
+ 
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+ 
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..dba6c57 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "iop_emulator.h"
+ #include "imports/iop_cdvd.h"
+ #include "core/iop_cpu.h"
+@@ -110,6 +111,8 @@ namespace ps2x::iop::detail
+               imports(memory),
+               loadcore(memory, imports)
+         {
++            cpuCore.setReservedInstructionHook([this](CpuState &cpu, uint32_t instruction)
++                                               { return runNativeTrap(cpu, instruction); });
+             reset();
+         }
+ 
+@@ -126,6 +129,7 @@ namespace ps2x::iop::detail
+             ioman.reset();
+             pendingDmaInterrupts.clear();
+             pendingGuestCallbacks.clear();
++            nativeSlots.clear();
+             nextModuleId = 1;
+             moduleCursor = kModuleLoadBase;
+             totalCycles = 0;
+@@ -624,6 +628,7 @@ namespace ps2x::iop::detail
+                     write8(args + argumentSize, 0u);
+                 }
+             }
++            installNativeFunctions(module.name, module.base);
+             const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+             if (args)
+                 freeAllocation(args);
+@@ -696,6 +701,134 @@ namespace ps2x::iop::detail
+         IopLoadcore loadcore;
+         std::map<int, Module> modules;
+         std::map<int, uint64_t> pendingDmaInterrupts;
++
++        // Native function overrides (see NativeFunction). Primary opcode 0x1B is unused on the R3000.
++        static constexpr uint32_t kNativeTrapOpcode = 0x1Bu;
++        struct NativeSlot
++        {
++            const NativeFunction *function = nullptr;
++            uint32_t entry = 0;
++            uint32_t originalWord = 0;
++        };
++        std::vector<NativeFunction> nativeFunctions;
++        std::vector<NativeSlot> nativeSlots;
++        const bool verifyNatives = std::getenv("PS2X_IOP_NATIVE_VERIFY") != nullptr;
++        uint64_t nativeVerifyCalls = 0, nativeVerifyMismatches = 0;
++
++        static std::string moduleKey(std::string name)
++        {
++            if (const size_t semi = name.find(';'); semi != std::string::npos)
++                name.resize(semi);
++            for (char &c : name)
++                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++            return name;
++        }
++
++        void installNativeFunctions(const std::string &moduleName, uint32_t base)
++        {
++            const std::string key = moduleKey(moduleName);
++            for (const NativeFunction &function : nativeFunctions)
++            {
++                if (moduleKey(function.module) != key)
++                    continue;
++                const uint32_t entry = base + function.offset;
++                std::vector<uint32_t> words(function.masks.size());
++                for (size_t i = 0; i < words.size(); ++i)
++                    words[i] = memory.read32(entry + 4u * static_cast<uint32_t>(i));
++                const bool matches = !words.empty() &&
++                                     nativeMaskedHash(words.data(), function.masks.data(), words.size()) == function.maskedHash;
++                std::ostringstream out;
++                out << "[IOP] native " << key << "+0x" << std::hex << function.offset;
++                if (!matches)
++                {
++                    out << " skipped: code does not match the expected build";
++                    log(LogLevel::Warning, out.str());
++                    continue;
++                }
++                const uint32_t slot = static_cast<uint32_t>(nativeSlots.size());
++                nativeSlots.push_back({&function, entry, memory.read32(entry)});
++                memory.write32(entry, (kNativeTrapOpcode << 26u) | slot);
++                out << " installed at 0x" << entry << (verifyNatives ? " (verify mode)" : "");
++                log(LogLevel::Info, out.str());
++            }
++        }
++
++        bool runNativeTrap(CpuState &cpu, uint32_t instruction)
++        {
++            const uint32_t slot = instruction & 0x03FFFFFFu;
++            if ((instruction >> 26u) != kNativeTrapOpcode || slot >= nativeSlots.size() || nativeSlots[slot].entry != cpu.pc)
++                return false;
++            // The caller's delay slot may have left a load in flight; it lands before the callee runs.
++            if (cpu.pendingLoad)
++            {
++                if (cpu.pendingLoadReg != 0u)
++                    cpu.gpr[cpu.pendingLoadReg] = cpu.pendingLoadValue;
++                cpu.pendingLoad = false;
++            }
++            const NativeSlot &native = nativeSlots[slot];
++            const std::span<uint8_t> ram = memory.ramMutable();
++            if (verifyNatives)
++                verifyNative(native, cpu);
++            const uint32_t cycles = native.function->call(native.entry, cpu.gpr.data(), ram);
++            cpu.gpr[0] = 0u;
++            cpu.pc = cpu.gpr[31];
++            cpu.branchPending = false;
++            totalCycles += cycles;
++            return true;
++        }
++
++        // Runs the original guest code through the interpreter and the native code on copies of IOP RAM
++        // and compares them (excluding the interpreter's nested-call stack), then restores RAM.
++        void verifyNative(const NativeSlot &native, const CpuState &cpu)
++        {
++            std::vector<uint8_t> before(memory.ram().begin(), memory.ram().end());
++            memory.write32(native.entry, native.originalWord);
++            const uint64_t savedCycles = totalCycles, savedInstructions = totalInstructions;
++            // Keep interrupt/callback servicing out of the reference run so only the function's own writes differ.
++            const bool savedDma = servicingDmaInterrupts, savedCallbacks = servicingGuestCallbacks;
++            servicingDmaInterrupts = servicingGuestCallbacks = true;
++            (void)callFunction(native.entry, cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], cpu.gpr[28]);
++            servicingDmaInterrupts = savedDma;
++            servicingGuestCallbacks = savedCallbacks;
++            const uint64_t guestInstructions = totalInstructions - savedInstructions;
++            totalCycles = savedCycles;
++            totalInstructions = savedInstructions;
++            std::vector<uint8_t> guest(memory.ram().begin(), memory.ram().end());
++            std::copy(before.begin(), before.end(), memory.ramMutable().begin());
++
++            uint32_t gpr[32];
++            std::copy(std::begin(cpu.gpr), std::end(cpu.gpr), gpr);
++            std::vector<uint8_t> host = before;
++            (void)native.function->call(native.entry, gpr, std::span<uint8_t>(host.data(), host.size()));
++            host[native.entry & 0x1FFFFFu] = guest[native.entry & 0x1FFFFFu]; // trap vs original word: not a result
++            for (uint32_t i = 1; i < 4; ++i)
++                host[(native.entry & 0x1FFFFFu) + i] = guest[(native.entry & 0x1FFFFFu) + i];
++
++            uint32_t mismatches = 0, first = 0;
++            for (uint32_t a = 0; a < guest.size(); ++a)
++            {
++                if (a >= kCallStackBase && a < kCallStackLimit)
++                    continue;
++                if (guest[a] != host[a] && mismatches++ == 0)
++                    first = a;
++            }
++            ++nativeVerifyCalls;
++            if (mismatches)
++            {
++                ++nativeVerifyMismatches;
++                std::ostringstream out;
++                out << "[IOP] native verify MISMATCH entry=0x" << std::hex << native.entry << " bytes=" << std::dec
++                    << mismatches << " first=0x" << std::hex << first << " guest=0x" << +guest[first] << " native=0x" << +host[first];
++                log(LogLevel::Error, out.str());
++            }
++            else if ((nativeVerifyCalls & (nativeVerifyCalls - 1u)) == 0u)
++            {
++                std::ostringstream out;
++                out << "[IOP] native verify ok entry=0x" << std::hex << native.entry << std::dec << " guestInsns=" << guestInstructions << " calls=" << nativeVerifyCalls
++                    << " mismatches=" << nativeVerifyMismatches;
++                log(LogLevel::Info, out.str());
++            }
++        }
+         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+         uint32_t nextModuleId = 1;
+         uint32_t moduleCursor = kModuleLoadBase;
+@@ -739,6 +872,11 @@ namespace ps2x::iop::detail
+         return m_impl->stopModule(moduleId, result);
+     }
+ 
++    void IopEmulator::registerNativeFunction(NativeFunction function)
++    {
++        m_impl->nativeFunctions.push_back(std::move(function));
++    }
++
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 01b48df..32f1cae 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -25,6 +25,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+         void runEeCycles(uint64_t eeCycles) noexcept;
++        void registerNativeFunction(NativeFunction function);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+         void onSifTransfer(const SifTransfer &transfer);
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..153c23c 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -249,6 +249,11 @@ namespace ps2x::iop
+         return m_impl->emulator.isMemoryRange(address, size);
+     }
+ 
++    void IopSubsystem::registerNativeFunction(NativeFunction function)
++    {
++        m_impl->emulator.registerNativeFunction(std::move(function));
++    }
++
+     DebugSnapshot IopSubsystem::debugSnapshot() const
+     {
+         DebugSnapshot snapshot;
+diff --git a/ps2xIOP/tests/iop_emulator_tests.cpp b/ps2xIOP/tests/iop_emulator_tests.cpp
+index 44c2494..56fa953 100644
+--- a/ps2xIOP/tests/iop_emulator_tests.cpp
++++ b/ps2xIOP/tests/iop_emulator_tests.cpp
+@@ -6,6 +6,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <iostream>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -1142,6 +1143,42 @@ int main()
+     if (!expect(!emittedUnhandledSeek,
+                 "sceCdSeek still emitted an unhandled IOP import")) return 1;
+ 
++    // Native function overrides: the minimal IRX (returns 7) is replaced only when its masked hash matches.
++    {
++        const uint32_t words[] = {0x24080001u, 0x11080002u, 0x24020007u, 0x24020063u, 0x03E00008u, 0x00000000u};
++        const std::vector<uint32_t> masks(std::size(words), 0xFFFFFFFFu);
++        for (const bool matching : {true, false})
++        {
++            TestHost nativeHost(0x20000u);
++            IopSubsystem nativeIop(nativeHost);
++            int calls = 0;
++            NativeFunction native;
++            native.module = "BUFFER@0X100"; // module names compare case-insensitively
++            native.offset = 0u;
++            native.masks = masks;
++            native.maskedHash = nativeMaskedHash(words, masks.data(), masks.size()) ^ (matching ? 0u : 1u);
++            native.call = [&calls](uint32_t, uint32_t *gpr, std::span<uint8_t>)
++            {
++                ++calls;
++                gpr[2] = 42u;
++                return 10u;
++            };
++            nativeIop.registerNativeFunction(native);
++            writeMinimalIrx(nativeHost, 0x100u);
++            const ModuleLoadResult loaded = nativeIop.loadModuleBuffer(0x100u);
++            if (matching)
++            {
++                if (!expect(loaded.startResult == 42, "native function must replace a matching IRX function")) return 1;
++                if (!expect(calls == 1, "native function must run exactly once per call")) return 1;
++            }
++            else
++            {
++                if (!expect(loaded.startResult == 7, "a hash mismatch must leave the guest code untouched")) return 1;
++                if (!expect(calls == 0, "a hash mismatch must not call the native function")) return 1;
++            }
++        }
++    }
++
+     std::cout << "ps2xIOP emulator smoke tests passed\n";
+     return 0;
+ }
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..51a92cd 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -294,6 +294,8 @@ public:
+     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
+     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
++    // For game overrides that extend the IOP, e.g. IopSubsystem::registerNativeFunction.
++    [[nodiscard]] ps2x::iop::IopSubsystem &iopSubsystem() noexcept;
+     uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
+     bool freeIopMemory(uint32_t address);
+     bool readIopMemory(uint32_t address, void *destination, size_t size) const;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..0491d8e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -615,6 +615,11 @@ void PS2Runtime::resetIop()
+     m_iopSubsystem->reset();
+ }
+ 
++ps2x::iop::IopSubsystem &PS2Runtime::iopSubsystem() noexcept
++{
++    return *m_iopSubsystem;
++}
++
+ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
+ {
+     return m_iopSubsystem->debugSnapshot();

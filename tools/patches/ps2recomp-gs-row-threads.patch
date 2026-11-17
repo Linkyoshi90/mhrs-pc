@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index b2dd812..fd4bed0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -396,7 +396,10 @@ namespace
+         RowWorkerPool()
+         {
+             // PS2X_GS_THREADS caps the threads rasterising one primitive (1 = serial).
++            // Default: leave about a third of the CPUs (at most 5) to the game, GIF/VU1 and GS stage threads, which
++            // limit the frame rate: 11 of 16 gave ~6-9% more frames than 16 in gameplay.
+             unsigned threads = std::thread::hardware_concurrency();
++            threads -= std::min(5u, threads / 3u);
+             if (const char *env = std::getenv("PS2X_GS_THREADS"))
+                 threads = static_cast<unsigned>(std::strtoul(env, nullptr, 10));
+             for (unsigned i = 1; i < threads; ++i)

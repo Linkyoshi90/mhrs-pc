@@ -1,0 +1,117 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 9be9cb6..a17c619 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -396,6 +396,8 @@ private:
+     void updateNextDeadline();
+     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
+     void renewTimeSlice();
++    [[nodiscard]] bool hostVBlankDue() const noexcept;
++    void catchUpToHostVBlank() noexcept;
+     void copyMainContextToRuntime();
+     void publishDebugContext(const R5900Context &context);
+     void publishIdleDebugContext();
+@@ -456,4 +458,9 @@ private:
+     mutable std::mutex m_snapshotMutex;
+     EeKernelSnapshot m_snapshot;
+     uint64_t m_snapshotSequence = 0;
++
++    // Next VBlankStart: PS2X_VBLANK_CLOCK=cycles keeps it on the guest cycle clock alone.
++    uint64_t m_nextVBlankCycle = 0;
++    std::chrono::steady_clock::time_point m_nextVBlankHost{};
++    bool m_hostPacedVBlank = true;
+ };
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index e059919..0751796 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -35,6 +36,7 @@ namespace
+     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
+     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
++    constexpr auto kVBlankMaxLag = std::chrono::milliseconds(500);
+     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+ 
+@@ -148,8 +150,11 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     main.status = EeThreadStatus::Ready;
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
+-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
+-                  std::chrono::steady_clock::now() + kVBlankPeriod,
++    const char *vblankClock = std::getenv("PS2X_VBLANK_CLOCK");
++    m_hostPacedVBlank = vblankClock == nullptr || std::strcmp(vblankClock, "cycles") != 0;
++    m_nextVBlankCycle = m_eeCycle + kVBlankPeriodCycles;
++    m_nextVBlankHost = std::chrono::steady_clock::now() + kVBlankPeriod;
++    scheduleEvent(m_nextVBlankCycle, m_nextVBlankHost,
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     publishSnapshot();
+ }
+@@ -454,6 +459,13 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return false;
+     }
+ 
++    if (hostVBlankDue())
++    {
++        m_checkpointPending.store(true, std::memory_order_release);
++        ++m_checkpointExits;
++        return true;
++    }
++
+     const GuestThread *running = currentThread();
+     if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
+     {
+@@ -467,6 +479,23 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     return false;
+ }
+ 
++bool EeScheduler::hostVBlankDue() const noexcept
++{
++    return m_hostPacedVBlank && m_nextVBlankCycle > m_eeCycle &&
++           std::chrono::steady_clock::now() >= m_nextVBlankHost;
++}
++
++void EeScheduler::catchUpToHostVBlank() noexcept
++{
++    // The guest clock counts executed EE code and idle waits only. Host time the EE spends blocked on the
++    // GIF/VU1 worker, or running slower than a real EE, did not count, so vblank came late and the game
++    // (which steps by elapsed vblanks) ran in slow motion. A vblank whose host time has come fires now.
++    if (hostVBlankDue())
++    {
++        accountCycles(static_cast<uint32_t>(m_nextVBlankCycle - m_eeCycle)); // at most one vblank period
++    }
++}
++
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+@@ -1867,6 +1896,7 @@ void EeScheduler::processPendingEvents()
+ 
+ void EeScheduler::processDueDeadlines()
+ {
++    catchUpToHostVBlank();
+     for (;;)
+     {
+         std::vector<ScheduledEvent> due;
+@@ -1942,8 +1972,11 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                // After a long host stall, drop the backlog instead of firing a burst of vblanks.
++                m_nextVBlankCycle = scheduled.deadlineCycle + kVBlankPeriodCycles;
++                m_nextVBlankHost = std::max(scheduled.hostDeadline + kVBlankPeriod,
++                                            std::chrono::steady_clock::now() - kVBlankMaxLag);
++                scheduleEvent(m_nextVBlankCycle, m_nextVBlankHost,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);

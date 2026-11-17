@@ -1,0 +1,16 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bbe695c..1362a06 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -846,7 +846,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ #endif
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     const bool codeCached = prepareDecodedCodeCache(vuCode, codeSize, memory);
+-    if (codeCached && m_unit == Unit::VU1 && vu1DumpDir() != nullptr)
++    // Only a start that has no lean program is recorded: the game composes tens of thousands of code images out of
++    // the same microprograms, and writing every one of them stuttered the game.
++    if (codeCached && m_unit == Unit::VU1 && vu1DumpDir() != nullptr &&
++        !((m_state.pc & 7u) == 0u && m_image->leanPrograms[(m_state.pc & (kCompiledCodeSize - 1u)) / 8u] != nullptr))
+         dumpCodeForCompiler(vuCode, codeSize);
+     bool programEnded = false;
+     bool leanTried = false;

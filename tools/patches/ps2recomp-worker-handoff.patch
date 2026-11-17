@@ -1,0 +1,131 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_ordered_worker.h b/ps2xRuntime/include/runtime/ps2_ordered_worker.h
+index 6d1f4bf..4a6eac0 100644
+--- a/ps2xRuntime/include/runtime/ps2_ordered_worker.h
++++ b/ps2xRuntime/include/runtime/ps2_ordered_worker.h
+@@ -1,6 +1,8 @@
+ #ifndef PS2_ORDERED_WORKER_H
+ #define PS2_ORDERED_WORKER_H
+ 
++#include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <cstdio>
+@@ -93,12 +95,15 @@ public:
+             job();
+             return;
+         }
++        bool sleeping;
+         {
+             std::lock_guard<std::mutex> lock(m_mutex);
+             m_jobs.push_back(std::move(job));
+-            ++m_posted;
++            std::atomic_ref<uint64_t>(m_posted).fetch_add(1u, std::memory_order_relaxed);
++            sleeping = m_sleeping;
+         }
+-        m_wake.notify_one();
++        if (sleeping) // waking a thread is a futex syscall: only when it sleeps (see loop)
++            m_wake.notify_one();
+         if (m_mode == Mode::Lockstep)
+             drain();
+     }
+@@ -117,14 +122,24 @@ private:
+     void loop()
+     {
+         std::vector<std::function<void()>> batch;
++        uint64_t taken = 0; // jobs taken off the queue so far
+         for (;;)
+         {
++            // Jobs often arrive microseconds apart (one per GIF packet), and a wake-up per job cost the
++            // poster a quarter of its time in futex syscalls: poll a short while before going to sleep.
++            const auto pollEnd = std::chrono::steady_clock::now() + kPollTime;
++            while (std::atomic_ref<uint64_t>(m_posted).load(std::memory_order_relaxed) == taken &&
++                   std::chrono::steady_clock::now() < pollEnd)
++                std::this_thread::yield();
+             {
+                 std::unique_lock<std::mutex> lock(m_mutex);
++                m_sleeping = true;
+                 m_wake.wait(lock, [&] { return !m_jobs.empty() || m_stopping; });
++                m_sleeping = false;
+                 if (m_jobs.empty())
+                     return; // stopping, nothing left
+                 batch.swap(m_jobs);
++                taken += batch.size();
+             }
+             for (auto &job : batch)
+             {
+@@ -160,6 +175,8 @@ private:
+     uint64_t m_posted = 0;
+     uint64_t m_done = 0;
+     bool m_stopping = false;
++    bool m_sleeping = false; // the thread is (about to be) blocked on m_wake; guarded by m_mutex
++    static constexpr std::chrono::microseconds kPollTime{100};
+ };
+ 
+ #endif // PS2_ORDERED_WORKER_H
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index fa88ac3..df1ef21 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -1,5 +1,8 @@
+ #include "runtime/gs/gs_async_backend.h"
+ 
++#if defined(__linux__)
++#include <pthread.h>
++#endif
+ #include <type_traits>
+ #include <utility>
+ 
+@@ -15,6 +18,9 @@ GSAsyncBackend::GSAsyncBackend(std::unique_ptr<GSRasterBackend> inner)
+     : m_inner(std::move(inner))
+ {
+     m_worker = std::thread([this]() { WorkerLoop(); });
++#if defined(__linux__)
++    pthread_setname_np(m_worker.native_handle(), "GsAsync");
++#endif
+ }
+ 
+ GSAsyncBackend::~GSAsyncBackend()
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 9a7d599..b2dd812 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -14,6 +14,9 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <condition_variable>
++#if defined(__linux__)
++#include <pthread.h>
++#endif
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -397,7 +400,12 @@ namespace
+             if (const char *env = std::getenv("PS2X_GS_THREADS"))
+                 threads = static_cast<unsigned>(std::strtoul(env, nullptr, 10));
+             for (unsigned i = 1; i < threads; ++i)
++            {
+                 m_threads.emplace_back([this] { loop(); });
++#if defined(__linux__)
++                pthread_setname_np(m_threads.back().native_handle(), "GsRow"); // for profilers
++#endif
++            }
+         }
+ 
+         void drain()
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 278889e..04f7377 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -452,7 +452,10 @@ void VU1Interpreter::finishXgkick()
+     if (!m_xgkick.active)
+         return;
+ 
+-    if (m_unit == Unit::VU1) // TEMP-DEBUG(mhrs) vurec: hash every XGKICK packet
++    // TEMP-DEBUG(mhrs) vurec: hash every XGKICK packet. Only for the recorder (MHRS_VUREC) and the replay tool
++    // (MHRS_VUREC_HASH): byte by byte it took ~9% of the GIF/VU1 worker in gameplay.
++    static const bool hashPackets = std::getenv("MHRS_VUREC") != nullptr || std::getenv("MHRS_VUREC_HASH") != nullptr;
++    if (hashPackets && m_unit == Unit::VU1)
+     {
+         extern std::atomic<uint64_t> g_mhrsVurecGif; extern std::atomic<uint32_t> g_mhrsVurecGifN;
+         uint64_t h = g_mhrsVurecGif.load();

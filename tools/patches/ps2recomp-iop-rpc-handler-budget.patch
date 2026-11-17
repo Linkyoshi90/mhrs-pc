@@ -1,0 +1,84 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 1def833..cdaf456 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -461,6 +461,13 @@ namespace ps2x::iop::detail
+             }
+             cpu.gpr[31] = kCallReturnSentinel;
+             runCpu(cpu, budget);
++            if (!cpu.stopped && !cpu.yielded)
++            {
++                std::ostringstream out;
++                out << "[IOP] guest call 0x" << std::hex << address << " exceeded its budget of " << std::dec
++                    << budget << " instructions and was abandoned at pc=0x" << std::hex << cpu.pc;
++                log(LogLevel::Warning, out.str());
++            }
+             return cpu.gpr[2];
+         }
+ 
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..b9163d1 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -273,6 +273,12 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    namespace
++    {
++        // Hardware runs RPC handlers in a server thread with no time limit; this only guards against hangs.
++        constexpr uint32_t kRpcHandlerInstructionBudget = 200'000'000u;
++    }
++
+     RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor)
+     {
+         RpcResult result{};
+@@ -292,12 +298,13 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
+-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
+-                                                               request.function,
+-                                                               server.buffer,
+-                                                               request.send.size,
+-                                                               0u,
+-                                                               server.gp);
++        uint32_t returnPointer = executor.executeGuestFunctionWithBudget(server.function,
++                                                                         request.function,
++                                                                         server.buffer,
++                                                                         request.send.size,
++                                                                         0u,
++                                                                         server.gp,
++                                                                         kRpcHandlerInstructionBudget);
+         if (returnPointer == 0u)
+             returnPointer = server.buffer;
+         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
+diff --git a/ps2xIOP/tests/iop_emulator_tests.cpp b/ps2xIOP/tests/iop_emulator_tests.cpp
+index e8c07fd..20e2881 100644
+--- a/ps2xIOP/tests/iop_emulator_tests.cpp
++++ b/ps2xIOP/tests/iop_emulator_tests.cpp
+@@ -1013,6 +1013,24 @@ int main()
+     if (!expect(iop.debugSnapshot().emulatorInstructions > soundInstructionsBefore,
+                 "Sound RPC did not execute the physical IOP handler")) return 1;
+ 
++    const uint32_t slowSoundHandler[] = {
++        0x3C080018u, // lui   t0, 0x18 (~3.1M loop instructions, above the generic call budget)
++        0x1500FFFFu, // bnez  t0, .
++        0x2508FFFFu, // addiu t0, t0, -1
++        0x3C020001u, // lui   v0, 1
++        0x34420400u, // ori   v0, v0, 0x400
++        0x3C09600Du, // lui   t1, 0x600D
++        0xAC490000u, // sw    t1, 0(v0)
++        0x03E00008u, // jr    ra
++        0x00000000u, // nop
++    };
++    if (!expect(iop.writeMemory(0x00010300u, slowSoundHandler, sizeof(slowSoundHandler)),
++                "Could not install the slow sound RPC handler")) return 1;
++    (void)iop.handleRpc(soundRequest);
++    std::memcpy(&soundResponse, host.guest.data() + 0x900u, sizeof(soundResponse));
++    if (!expect(soundResponse == 0x600D0000u,
++                "Long-running RPC handler was cut off before returning")) return 1;
++
+     constexpr uint32_t relocatableRpcSid = 0xA11CE001u;
+     writeRelocatableRpcServerIrx(host, 0x100u);
+     const ModuleLoadResult relocatableRpcModule = iop.loadModuleBuffer(0x100u);

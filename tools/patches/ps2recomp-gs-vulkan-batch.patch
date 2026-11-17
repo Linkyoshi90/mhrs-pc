@@ -1,0 +1,3317 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index f46bd15..82d883b 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -565,7 +565,7 @@ find_program(PS2X_GLSLANG_VALIDATOR
+ set(PS2X_VK_PREBUILT_SHADERS "" CACHE PATH "Directory with prebuilt shader .h files")
+ if(Vulkan_FOUND AND PS2X_VK_PREBUILT_SHADERS AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+     set(PS2X_VK_SHADER_HEADERS "")
+-    foreach(PS2X_VK_SHADER_NAME IN ITEMS present_deswizzle raster_sprite raster_triangle)
++    foreach(PS2X_VK_SHADER_NAME IN ITEMS present_deswizzle raster_batch)
+         set(PS2X_VK_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/shaders/${PS2X_VK_SHADER_NAME}.h")
+         configure_file("${PS2X_VK_PREBUILT_SHADERS}/${PS2X_VK_SHADER_NAME}.h" "${PS2X_VK_SHADER_HEADER}" COPYONLY)
+         list(APPEND PS2X_VK_SHADER_HEADERS "${PS2X_VK_SHADER_HEADER}")
+@@ -578,7 +578,7 @@ if(Vulkan_FOUND AND PS2X_VK_PREBUILT_SHADERS AND NOT PS2X_IS_VITA AND NOT PS2X_I
+     message(STATUS "ps2xRuntime: Vulkan GS backend enabled (prebuilt shaders: ${PS2X_VK_PREBUILT_SHADERS})")
+ elseif(Vulkan_FOUND AND PS2X_GLSLANG_VALIDATOR AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+     set(PS2X_VK_SHADER_HEADERS "")
+-    foreach(PS2X_VK_SHADER IN ITEMS "present_deswizzle:kPresentDeswizzleSpv" "raster_sprite:kRasterSpriteSpv" "raster_triangle:kRasterTriangleSpv")
++    foreach(PS2X_VK_SHADER IN ITEMS "present_deswizzle:kPresentDeswizzleSpv" "raster_batch:kRasterBatchSpv")
+         string(REGEX MATCH "^([^:]+):(.+)$" _ "${PS2X_VK_SHADER}")
+         set(PS2X_VK_SHADER_NAME "${CMAKE_MATCH_1}")
+         set(PS2X_VK_SHADER_VAR "${CMAKE_MATCH_2}")
+diff --git a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+index abf0411..3c98c95 100755
+--- a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+@@ -7,16 +7,16 @@
+ #include <memory>
+ #include <mutex>
+ 
+-// Vulkan GS backend (work in progress).
++// Vulkan GS backend.
+ //
+-// Canonical GS VRAM lives in a HOST_VISIBLE|HOST_COHERENT Vulkan buffer; the embedded CPU
+-// backend runs directly on its mapped pointer, so anything not yet ported to the GPU keeps
+-// working with zero divergence. Piece by piece, raster work moves to compute shaders that
+-// read/write the same buffer. GPU work only becomes CPU-visible at Sync/Present/readback
+-// points, mirroring the CPU backend's locking semantics.
++// An embedded CPU backend does everything by default, on a host-visible Vulkan buffer.
++// PS2X_VK_RASTER=1 moves sprite and triangle rasterization to a compute shader that works
++// on a device-local copy of VRAM (see VkState in the .cpp); the CPU backend keeps uploads,
++// CLUT loads, readbacks and the primitives the shader does not cover. PS2X_VK_PRESENT=1
++// moves the display deswizzle to the GPU, so the frame is read back instead of VRAM.
+ //
+ // Selected with PS2X_GS_BACKEND=vulkan; falls back to pure CPU behavior when no usable
+-// Vulkan device exists. PS2X_VK_PRESENT=1 also moves the display deswizzle to the GPU.
++// Vulkan device exists.
+ class GSVulkanBackend final : public GSRasterBackend
+ {
+ public:
+@@ -50,45 +50,16 @@ private:
+     struct VkState;
+     std::unique_ptr<VkState> m_vk;
+     GSCpuBackend m_cpu;
+-    // Serializes all GPU use: raster dispatches run on the GS worker thread while Present
+-    // runs on the calling thread; both share one command buffer, fence and VRAM buffer.
+-    // mutable so const readback methods (ReadVram/SnapshotVram) can flush pending work.
++    // Serializes the backend: draws arrive on the GS worker thread, Present on the caller's.
++    // mutable so const readback methods (ReadVram/SnapshotVram) can sync pending work.
+     mutable std::mutex m_gpuMutex;
+     bool m_gpuOk = false;
+     bool m_gpuPresent = false;
+     bool m_gpuRaster = false;
+-    bool m_gpuTriangles = false;
+-    bool m_rasterVerify = false;
+ 
+     bool initVulkan();
+     void shutdownVulkan();
+     PresentationFrame presentGpu(const GSPresentationRequest &request);
+-    // Compute-shader sprite rasterization (PS2X_VK_RASTER=1); PS2X_VK_RASTER_VERIFY=1
+-    // replays each primitive through the CPU backend on the same VRAM and diffs 4MB.
+-    void submitSpriteGpu(const GSPrimitiveBatch &batch);
+-    // Compute-shader triangle rasterization (same flags); needs shaderFloat64 for Z.
+-    void submitTriangleGpu(const GSPrimitiveBatch &batch);
+-    // Shared tail of the two raster paths: CLUT mirror, params upload, dispatch, fence
+-    // wait and the verify replay. useTrianglePipeline keeps VkPipeline out of this header.
+-    void runRasterDispatch(const GSPrimitiveBatch &batch,
+-                           bool useTrianglePipeline,
+-                           const void *params,
+-                           size_t paramsSize,
+-                           uint32_t groupsX,
+-                           uint32_t groupsY,
+-                           const char *tag);
+-    // Raster batching: dispatches are recorded into one command buffer and only
+-    // submitted (+waited) at flush points — Present/Sync/readbacks, CPU fallback
+-    // draws, VRAM/CLUT uploads, or when the params ring fills. flushRasterBatch
+-    // takes m_gpuMutex; the *Locked variants require it to be held already.
+-    // recordRasterDispatchLocked returns the params-slot byte offset used.
+-    uint32_t recordRasterDispatchLocked(bool useTrianglePipeline,
+-                                        const void *params,
+-                                        size_t paramsSize,
+-                                        uint32_t groupsX,
+-                                        uint32_t groupsY);
+-    void flushRasterBatch() const;
+-    void flushRasterBatchLocked() const;
+     // Mirrors GSCpuBackend::CopyFrameToHostRgba(useLocalMemoryLayout=true) on the GPU.
+     bool gpuCopyFrame(const GSFrameReg &frame,
+                       uint32_t width,
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+old mode 100755
+new mode 100644
+index ff8a2ca..d61009b
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -4,19 +4,23 @@
+ #include "runtime/gs/ps2_gs_memory.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <bitset>
++#include <chrono>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <initializer_list>
+ #include <iostream>
++#include <utility>
+ #include <vector>
+ 
+ #if defined(PS2X_HAS_VULKAN)
+ #include <vulkan/vulkan.h>
+ #include "present_deswizzle.h" // generated by glslangValidator --vn kPresentDeswizzleSpv
+-#include "raster_sprite.h"     // generated by glslangValidator --vn kRasterSpriteSpv
+-#include "raster_triangle.h"   // generated by glslangValidator --vn kRasterTriangleSpv
++#include "raster_batch.h"      // generated by glslangValidator --vn kRasterBatchSpv
+ #endif
+ 
+ namespace
+@@ -176,53 +180,246 @@ namespace
+ }
+ 
+ #if defined(PS2X_HAS_VULKAN)
+-struct GSVulkanBackend::VkState
++namespace
+ {
+-    VkInstance instance = VK_NULL_HANDLE;
+-    VkPhysicalDevice phys = VK_NULL_HANDLE;
+-    VkDevice device = VK_NULL_HANDLE;
+-    VkQueue queue = VK_NULL_HANDLE;
+-    uint32_t queueFamily = 0;
++    constexpr uint32_t kPageBytes = 8192u;
++    using PageSet = std::bitset<512>; // the 8 KiB pages of the 4 MiB GS VRAM
+ 
+-    VkBuffer vramBuffer = VK_NULL_HANDLE;
+-    VkDeviceMemory vramMemory = VK_NULL_HANDLE;
+-    void *vramMapped = nullptr;
+-    VkDeviceSize vramBufferSize = 0;
++    // Which of its page's 32 blocks a pixel lies in (the page tables hold the pixel
++    // offsets of a buffer that starts on a page).
++    uint32_t blockInPage(uint32_t psm, uint32_t x, uint32_t y)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT16: return GSMem::PageTableC16[0][y % 64u][x % 64u] / 128u;
++        case GS_PSM_CT16S: return GSMem::PageTableC16S[0][y % 64u][x % 64u] / 128u;
++        case GS_PSM_Z16: return GSMem::PageTableZ16[0][y % 64u][x % 64u] / 128u;
++        case GS_PSM_Z16S: return GSMem::PageTableZ16S[0][y % 64u][x % 64u] / 128u;
++        case GS_PSM_Z32:
++        case GS_PSM_Z24: return GSMem::PageTableZ32[0][y % 32u][x % 64u] / 64u;
++        case GS_PSM_T8: return GSMem::PageTableP8[0][y % 64u][x % 128u] / 256u;
++        case GS_PSM_T4: return GSMem::PageTableP4[0][y % 128u][x % 128u] / 512u;
++        default: return GSMem::PageTableC32[0][y % 32u][x % 64u] / 64u;
++        }
++    }
+ 
+-    VkBuffer outBuffer = VK_NULL_HANDLE;
+-    VkDeviceMemory outMemory = VK_NULL_HANDLE;
+-    void *outMapped = nullptr;
++    // Adds the pages that pixels (x0..x1, y0..y1) of a buffer at block bp / width bw can
++    // touch: a conservative range (the rule of pageSpan in gs_cpu_backend.cpp, file-local
++    // there), or the exact pages where that range would run over the end of VRAM. Palettes
++    // and small textures live in the last page; the range would claim page 0 for them.
++    void addPages(PageSet &set, uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++    {
++        uint32_t pw = 64u, ph = 32u, blockW = 8u, blockH = 8u;
++        if (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S || psm == GS_PSM_Z16 || psm == GS_PSM_Z16S)
++            ph = 64u, blockW = 16u;
++        else if (psm == GS_PSM_T8)
++            pw = 128u, ph = 64u, blockW = 16u, blockH = 16u;
++        else if (psm == GS_PSM_T4)
++            pw = 128u, ph = 128u, blockW = 32u, blockH = 16u;
++        const uint32_t perRow = (bw * 64u) / pw;
++        const uint32_t first = bp / 32u + (y0 / ph) * perRow + x0 / pw;
++        const uint32_t last = bp / 32u + (y1 / ph) * perRow + x1 / pw + ((bp % 32u) != 0u ? 1u : 0u);
++        if (last < 512u)
++        {
++            for (uint32_t page = first; page <= last; ++page)
++                set.set(page);
++            return;
++        }
++        // One pixel per block: a block that is not page aligned carries into the next page.
++        for (uint32_t y = y0;; y = std::min((y / blockH + 1u) * blockH, y1))
++        {
++            for (uint32_t x = x0;; x = std::min((x / blockW + 1u) * blockW, x1))
++            {
++                set.set((bp / 32u + (y / ph) * perRow + x / pw + (bp % 32u + blockInPage(psm, x, y)) / 32u) % 512u);
++                if (x == x1)
++                    break;
++            }
++            if (y == y1)
++                break;
++        }
++    }
+ 
+-    VkBuffer clutBuffer = VK_NULL_HANDLE;
+-    VkDeviceMemory clutMemory = VK_NULL_HANDLE;
+-    void *clutMapped = nullptr;
++    // Calls fn(firstPage, pageCount) for every run of set pages.
++    template <typename Fn>
++    void forPageRuns(const PageSet &set, Fn fn)
++    {
++        for (uint32_t page = 0; page < 512u; ++page)
++        {
++            if (!set[page])
++                continue;
++            const uint32_t first = page;
++            while (page < 512u && set[page])
++                ++page;
++            fn(first, page - first);
++        }
++    }
+ 
+-    VkBuffer paramsBuffer = VK_NULL_HANDLE;
+-    VkDeviceMemory paramsMemory = VK_NULL_HANDLE;
+-    void *paramsMapped = nullptr;
++    // Matches PipeState in gs_raster_common.glsl (std430, 4-byte members only).
++    struct PipeState
++    {
++        int32_t sx0, sx1, sy0, sy1;
++        uint32_t fge, fogR, fogG, fogB;
++        uint32_t fbp, fbw, fpsm, zbp, zpsm;
++        uint32_t testLo, testHi;
++        uint32_t abe, pabe;
++        uint32_t asel, bsel, csel, dsel, fixv;
++        uint32_t fbaOn, fbmsk, zmask, frame16;
++        uint32_t tme, fst, linear;
++        int32_t texW, texH;
++        uint32_t wrapU, wrapV, minU, maxU, minV, maxV;
++        uint32_t texPsm, tbp0, tbw;
++        uint32_t tcc, tfx;
++        uint32_t ta0, ta1, aem;
++        uint32_t cpsm, csm, csa;
++        uint32_t iip, clutBase;
++    };
++    static_assert(sizeof(PipeState) == 50u * 4u);
+ 
+-    VkPipeline rasterPipeline = VK_NULL_HANDLE;
+-    VkPipeline trianglePipeline = VK_NULL_HANDLE;
+-    bool shaderFloat64 = false;
++    // Matches Geom in gs_raster_common.glsl.
++    struct Geom
++    {
++        uint32_t kind, state;
++        int32_t minX, minY, maxX, maxY;
++        int32_t unclippedX0, unclippedY0;
++        float spriteW, spriteH;
++        float u0f, v0f, u1f, v1f;
++        uint32_t vertR, vertG, vertB, vertA;
++        uint32_t vertFog, z1;
++        float fx0, fy0, fx1, fy1, fx2, fy2;
++        float winding, invAbsDenom;
++        float edgeA0, edgeA1;
++        float attrR0, attrR1, attrR2;
++        float attrG0, attrG1, attrG2;
++        float attrB0, attrB1, attrB2;
++        float attrA0, attrA1, attrA2;
++        float attrS0, attrS1, attrS2; // FST: u as float; STQ: s
++        float attrT0, attrT1, attrT2;
++        float attrQ0, attrQ1, attrQ2;
++        float attrFog0, attrFog1, attrFog2;
++        double triZ0, triZ1, triZ2;
++    };
++    static_assert(sizeof(Geom) == 240u && offsetof(Geom, triZ0) == 216u);
+ 
+-    VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
+-    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+-    VkPipeline pipeline = VK_NULL_HANDLE;
+-    VkCommandPool commandPool = VK_NULL_HANDLE;
+-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+-    VkFence fence = VK_NULL_HANDLE;
+-
+-    // Raster batching state: dispatches are recorded until a flush point.
+-    static constexpr uint32_t kParamsSlotCount = 2048;
+-    static constexpr uint32_t kParamsSlotStride = 1024; // >= sizeof(SpriteParams), >= minStorageBufferOffsetAlignment
+-    uint32_t batchCount = 0;   // dispatches recorded in the currently open batch
+-    bool batchOpen = false;
+-};
++    // What a draw state means for batching; derived from the PipeState alone.
++    struct StateInfo
++    {
++        bool ok = false;               // the GPU path can draw it
++        std::array<uint32_t, 5> key{}; // frame and depth buffer: one batch has one key
++        PageSet target;                // pages it may write
++        PageSet pages;                 // target and texture pages
++    };
++
++    bool isOneOf(uint32_t psm, std::initializer_list<uint32_t> list)
++    {
++        return std::find(list.begin(), list.end(), psm) != list.end();
++    }
++
++    StateInfo analyzeState(const PipeState &p)
++    {
++        StateInfo info;
++        if (!isOneOf(p.fpsm, {GS_PSM_CT32, GS_PSM_CT24, GS_PSM_CT16, GS_PSM_CT16S}))
++            return info;
++        // One invocation owns one pixel: rows must not alias inside the buffer, and tile
++        // keys hold 8 bits per axis.
++        if (p.sx0 < 0 || p.sy0 < 0 || p.sx0 > p.sx1 || p.sy0 > p.sy1 || p.sx1 > 2047 || p.sy1 > 2047 ||
++            static_cast<uint32_t>(p.sx1) >= p.fbw * 64u)
++            return info;
++        PageSet frame, depth, tex;
++        addPages(frame, p.fpsm, p.fbp, p.fbw, p.sx0, p.sy0, p.sx1, p.sy1);
++        const bool depthUsed = ((p.testLo >> 17u) & 3u) >= 2u || p.zmask == 0u;
++        if (depthUsed)
++        {
++            if (!isOneOf(p.zpsm, {GS_PSM_Z32, GS_PSM_Z24, GS_PSM_Z16, GS_PSM_Z16S, GS_PSM_CT32, GS_PSM_CT24, GS_PSM_CT16, GS_PSM_CT16S}))
++                return info;
++            addPages(depth, p.zpsm, p.zbp, p.fbw, p.sx0, p.sy0, p.sx1, p.sy1);
++            if ((depth & frame).any())
++                return info;
++        }
++        if (p.tme != 0u)
++        {
++            if (!isOneOf(p.texPsm, {GS_PSM_CT32, GS_PSM_CT24, GS_PSM_CT16, GS_PSM_CT16S, GS_PSM_T8, GS_PSM_T4, GS_PSM_T8H,
++                                    GS_PSM_T4HL, GS_PSM_T4HH, GS_PSM_Z32, GS_PSM_Z24, GS_PSM_Z16, GS_PSM_Z16S}))
++                return info;
++            auto last = [](uint32_t wrap, uint32_t lo, uint32_t hi, int32_t size)
++            {
++                return wrap == 2u ? hi : (wrap == 3u ? (lo | hi) : static_cast<uint32_t>(std::max(size, 1) - 1));
++            };
++            // A primitive that samples its own target sees its own earlier pixels on the
++            // CPU; that order does not exist here.
++            addPages(tex, p.texPsm, p.tbp0, p.tbw, 0u, 0u, last(p.wrapU, p.minU, p.maxU, p.texW), last(p.wrapV, p.minV, p.maxV, p.texH));
++            if ((tex & (frame | depth)).any())
++                return info;
++        }
++        info.ok = true;
++        info.key = {p.fbp, p.fbw, p.fpsm, depthUsed ? p.zbp : UINT32_MAX, depthUsed ? p.zpsm : UINT32_MAX};
++        info.target = frame | depth;
++        info.pages = info.target | tex;
++        return info;
++    }
++
++    // MakePixelPipe + MakeTexSampler + combine state of the CPU backend.
++    void fillPipeState(PipeState &p, const GSDrawState &state)
++    {
++        const GSContext &ctx = state.context;
++
++        p.sx0 = ctx.scissor.x0;
++        p.sx1 = ctx.scissor.x1;
++        p.sy0 = ctx.scissor.y0;
++        p.sy1 = ctx.scissor.y1;
++        p.fge = state.prim.fge ? 1u : 0u;
++        p.fogR = state.fogR;
++        p.fogG = state.fogG;
++        p.fogB = state.fogB;
++        p.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
++        p.fbw = std::max(ctx.frame.fbw, 1u);
++        p.fpsm = ctx.frame.psm;
++        p.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
++        p.zpsm = ctx.zbuf.psm;
++        p.testLo = static_cast<uint32_t>(ctx.test);
++        p.testHi = static_cast<uint32_t>(ctx.test >> 32);
++        p.abe = state.prim.abe ? 1u : 0u;
++        p.pabe = state.pabe ? 1u : 0u;
++        p.asel = ctx.alpha & 3u;
++        p.bsel = (ctx.alpha >> 2u) & 3u;
++        p.csel = (ctx.alpha >> 4u) & 3u;
++        p.dsel = (ctx.alpha >> 6u) & 3u;
++        p.fixv = static_cast<uint32_t>((ctx.alpha >> 32u) & 0xFFu);
++        p.fbaOn = ((ctx.fba & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24) ? 1u : 0u;
++        p.fbmsk = ctx.frame.fbmsk;
++        p.zmask = ctx.zbuf.zmask ? 1u : 0u;
++        p.frame16 = GSInternal::bitsPerPixel(ctx.frame.psm) == 16u ? 1u : 0u;
++
++        p.tme = state.prim.tme ? 1u : 0u;
++        p.fst = state.prim.fst ? 1u : 0u;
++        p.linear = state.linearFilter ? 1u : 0u;
++        p.texW = state.textureWidth;
++        p.texH = state.textureHeight;
++        p.wrapU = static_cast<uint32_t>(ctx.clamp & 0x3u);
++        p.wrapV = static_cast<uint32_t>((ctx.clamp >> 2u) & 0x3u);
++        p.minU = static_cast<uint32_t>((ctx.clamp >> 4u) & 0x3FFu);
++        p.maxU = static_cast<uint32_t>((ctx.clamp >> 14u) & 0x3FFu);
++        p.minV = static_cast<uint32_t>((ctx.clamp >> 24u) & 0x3FFu);
++        p.maxV = static_cast<uint32_t>((ctx.clamp >> 34u) & 0x3FFu);
++        p.texPsm = ctx.tex0.psm;
++        p.tbp0 = ctx.tex0.tbp0;
++        p.tbw = ctx.tex0.tbw;
++        p.tcc = ctx.tex0.tcc;
++        p.tfx = ctx.tex0.tfx;
++        p.ta0 = state.texa.ta0;
++        p.ta1 = state.texa.ta1;
++        p.aem = state.texa.aem ? 1u : 0u;
++        p.cpsm = ctx.tex0.cpsm;
++        p.csm = ctx.tex0.csm;
++        p.csa = ctx.tex0.csa;
++        p.iip = state.prim.iip ? 1u : 0u;
++        p.clutBase = 0u;
++    }
++
++    float spriteFabsQ(float q)
++    {
++        return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
++    }
+ 
+-namespace
+-{
+     struct PresentPushConstants
+     {
+         uint32_t basePtr;
+@@ -236,59 +433,192 @@ namespace
+         uint32_t wordMask;
+         uint32_t byteMask16;
+     };
++}
+ 
+-    uint32_t findHostCoherentMemoryType(VkPhysicalDevice phys, uint32_t typeBits)
+-    {
+-        VkPhysicalDeviceMemoryProperties props{};
+-        vkGetPhysicalDeviceMemoryProperties(phys, &props);
+-        const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+-        // The CPU backend rasterizes straight into this mapping: uncached (write-combined)
+-        // memory makes every z-test/blend read a bus round trip, so prefer HOST_CACHED.
+-        for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
+-            if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & (wanted | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (wanted | VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+-                return i;
+-        for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
+-            if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & wanted) == wanted)
+-                return i;
+-        return UINT32_MAX;
+-    }
++// GS VRAM has two copies. The GPU rasterizes into a device-local buffer; the CPU backend
++// (uploads, CLUT loads, primitives the shader does not cover, readbacks, CPU present)
++// works on a host buffer. cpuDirty / gpuDirty say which copy of a page is newer (never
++// both); pages cross the bus only when the other side needs them.
++//
++// Sprites and triangles collect into a batch while they share a frame and depth buffer.
++// A batch is one dispatch: its primitives are binned into 8x8 pixel tiles, and each pixel
++// applies its tile's list in draw order. Batches, page copies and the present dispatch are
++// recorded in order into command buffers that are submitted without waiting; the CPU only
++// waits when it needs GPU results or a buffer runs full.
++struct GSVulkanBackend::VkState
++{
++    static constexpr uint32_t kNone = UINT32_MAX;
++    static constexpr uint32_t kMaxStates = 16384u;
++    static constexpr uint32_t kMaxGeoms = 131072u;
++    static constexpr uint32_t kTileWords = 4u * 1024u * 1024u;
++    static constexpr uint32_t kClutSlots = 2048u;
++    static constexpr uint32_t kUploadBytes = 16u * 1024u * 1024u;
++    static constexpr uint32_t kCommandBuffers = 64u;
++    static constexpr uint32_t kBatchPrims = 4096u; // also the most primitives left unsubmitted
+ 
+-    bool createMappedBuffer(VkDevice device,
+-                            VkPhysicalDevice phys,
+-                            VkDeviceSize size,
+-                            VkBufferUsageFlags usage,
+-                            VkBuffer &outBuffer,
+-                            VkDeviceMemory &outMemory,
+-                            void *&outMapped)
+-    {
+-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+-        bufferInfo.size = size;
+-        bufferInfo.usage = usage;
+-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+-        if (vkCreateBuffer(device, &bufferInfo, nullptr, &outBuffer) != VK_SUCCESS)
+-            return false;
++    VkInstance instance = VK_NULL_HANDLE;
++    VkPhysicalDevice phys = VK_NULL_HANDLE;
++    VkDevice device = VK_NULL_HANDLE;
++    VkQueue queue = VK_NULL_HANDLE;
++    uint32_t queueFamily = 0;
++    std::vector<std::pair<VkBuffer, VkDeviceMemory>> allocations;
+ 
+-        VkMemoryRequirements reqs{};
+-        vkGetBufferMemoryRequirements(device, outBuffer, &reqs);
+-        const uint32_t typeIndex = findHostCoherentMemoryType(phys, reqs.memoryTypeBits);
+-        if (typeIndex == UINT32_MAX)
+-            return false;
++    GSCpuBackend *cpu = nullptr;
++    VkBuffer vramBuffer = VK_NULL_HANDLE;     // device-local
++    VkBuffer hostVramBuffer = VK_NULL_HANDLE; // the CPU backend's VRAM
++    uint8_t *vramMapped = nullptr;
++    VkDeviceSize vramBufferSize = 0;
++    PageSet cpuDirty; // host copy is newer
++    PageSet gpuDirty; // device copy is newer
+ 
+-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+-        allocInfo.allocationSize = reqs.size;
+-        allocInfo.memoryTypeIndex = typeIndex;
+-        if (vkAllocateMemory(device, &allocInfo, nullptr, &outMemory) != VK_SUCCESS)
+-            return false;
+-        if (vkBindBufferMemory(device, outBuffer, outMemory, 0) != VK_SUCCESS)
+-            return false;
+-        return vkMapMemory(device, outMemory, 0, size, 0, &outMapped) == VK_SUCCESS;
+-    }
++    VkBuffer outBuffer = VK_NULL_HANDLE; // present output, host-visible
++    void *outMapped = nullptr;
++
++    // Snapshots of cpuDirty pages on their way to the device copy.
++    VkBuffer uploadBuffer = VK_NULL_HANDLE;
++    uint8_t *uploadMapped = nullptr;
++    uint32_t uploadUsed = 0;
++
++    // Shader inputs: written into a host buffer, copied to the device buffer the shader
++    // reads when a batch is recorded. Filled linearly; reset when the queue is idle.
++    struct Stream
++    {
++        VkBuffer host = VK_NULL_HANDLE;
++        VkBuffer dev = VK_NULL_HANDLE;
++        uint8_t *mapped = nullptr;
++        uint32_t stride = 0;
++        uint32_t used = 0;   // elements
++        uint32_t copied = 0; // elements already recorded for copy
++    };
++    Stream states, geoms, tiles, cluts;
++
++    VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
++    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
++    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
++    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++    VkPipeline pipeline = VK_NULL_HANDLE;       // present deswizzle
++    VkPipeline rasterPipeline = VK_NULL_HANDLE; // needs shaderFloat64
++    VkCommandPool commandPool = VK_NULL_HANDLE;
++    std::array<VkCommandBuffer, kCommandBuffers> commandBuffers{};
++    uint32_t commandIndex = 0;
++    bool commandOpen = false;
++
++    // The open batch: geoms[geoms.used - batchGeoms ..) with one tile box each.
++    struct TileBox
++    {
++        uint8_t x0, y0, x1, y1;
++    };
++    std::vector<TileBox> boxes;
++    uint32_t batchGeoms = 0;
++    uint32_t batchEntries = 0; // tile list words the batch needs
++    std::array<uint32_t, 5> batchKey{};
++    PageSet batchTarget; // pages the batch writes
++    PageSet batchPages;  // and the texture pages it reads
++    uint32_t unsubmitted = 0;
++    std::vector<uint32_t> tileCount = std::vector<uint32_t>(65536u);
++    std::vector<uint32_t> tileCursor = std::vector<uint32_t>(65536u);
++    std::vector<uint32_t> touchedTiles;
++    std::vector<VkBufferCopy> regions;
++
++    // State of the last primitive (runs of primitives share one).
++    bool haveState = false;
++    PipeState lastState{};
++    StateInfo info;
++    uint32_t stateIndex = kNone;   // lastState's slot in states, with stateClutBase
++    uint32_t stateClutBase = 0;
++    uint32_t clutSlot = kNone;     // snapshot of the CPU backend's current CLUT
++    bool clutStale = true;         // a CLUT load ran since clutSlot was taken
++    PageSet transferPages;         // destination of the host-to-local transfer in progress
++
++    // TEMP-DEBUG(mhrs): PS2X_VK_STATS=<n> prints these every n presents.
++    struct Stats
++    {
++        unsigned long long clutSyncs = 0, writeSyncs = 0, prims = 0, batches = 0, tiles = 0, entries = 0, statesUsed = 0, cpuDraws = 0, syncs = 0, syncPages = 0, stagedPages = 0, submits = 0, waits = 0;
++        double waitMs = 0;
++    } stats;
++
++    bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool hostVisible, VkBuffer &outBuffer, void **outMapped);
++    bool createStream(Stream &stream, uint32_t stride, uint32_t capacity);
++
++    VkCommandBuffer command();
++    void barrier(VkCommandBuffer cb);
++    void submit();
++    void idleReset();
++    void drain();
++    void waitIdle();
++    void stageCpuDirty();
++    void closeBatch();
++    void syncToCpu();
++    void flush();
++
++    void needCpu(const PageSet &pages);
++    void cpuWrite(const PageSet &pages);
++    void cpuWroteAll();
++    void draw(const GSPrimitiveBatch &batch);
++    void cpuDraw(const GSPrimitiveBatch &batch);
++    void loadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
++    void beginTransfer(const GSTransferCommand &command);
++    void beforeUpload();
++    void beforeWrite(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
++    void printStats();
++};
++
++bool GSVulkanBackend::VkState::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool hostVisible, VkBuffer &outBuffer, void **outMapped)
++{
++    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++    bufferInfo.size = size;
++    bufferInfo.usage = usage;
++    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    if (vkCreateBuffer(device, &bufferInfo, nullptr, &outBuffer) != VK_SUCCESS)
++        return false;
++    allocations.emplace_back(outBuffer, VK_NULL_HANDLE);
++
++    VkMemoryRequirements reqs{};
++    vkGetBufferMemoryRequirements(device, outBuffer, &reqs);
++    VkPhysicalDeviceMemoryProperties props{};
++    vkGetPhysicalDeviceMemoryProperties(phys, &props);
++    // Host buffers are read and written by the CPU backend: uncached (write-combined)
++    // memory makes every read a bus round trip, so prefer HOST_CACHED.
++    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    const VkMemoryPropertyFlags wanted[2] = {hostVisible ? (host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++                                             hostVisible ? host : 0u};
++    uint32_t typeIndex = UINT32_MAX;
++    for (const VkMemoryPropertyFlags flags : wanted)
++        for (uint32_t i = 0; i < props.memoryTypeCount && typeIndex == UINT32_MAX; ++i)
++            if ((reqs.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & flags) == flags)
++                typeIndex = i;
++    if (typeIndex == UINT32_MAX)
++        return false;
++
++    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++    allocInfo.allocationSize = reqs.size;
++    allocInfo.memoryTypeIndex = typeIndex;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    if (vkAllocateMemory(device, &allocInfo, nullptr, &memory) != VK_SUCCESS)
++        return false;
++    allocations.back().second = memory;
++    if (vkBindBufferMemory(device, outBuffer, memory, 0) != VK_SUCCESS)
++        return false;
++    return !outMapped || vkMapMemory(device, memory, 0, size, 0, outMapped) == VK_SUCCESS;
++}
++
++bool GSVulkanBackend::VkState::createStream(Stream &stream, uint32_t stride, uint32_t capacity)
++{
++    stream.stride = stride;
++    void *mapped = nullptr;
++    const VkDeviceSize size = static_cast<VkDeviceSize>(stride) * capacity;
++    if (!createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, stream.host, &mapped) ||
++        !createBuffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, stream.dev, nullptr))
++        return false;
++    stream.mapped = static_cast<uint8_t *>(mapped);
++    return true;
+ }
+ 
+ bool GSVulkanBackend::initVulkan()
+ {
+     m_vk = std::make_unique<VkState>();
+     VkState &vk = *m_vk;
++    vk.cpu = &m_cpu;
+ 
+     VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+     appInfo.pApplicationName = "ps2x-vulkan-gs";
+@@ -311,7 +641,7 @@ bool GSVulkanBackend::initVulkan()
+     std::vector<VkPhysicalDevice> devices(deviceCount);
+     vkEnumeratePhysicalDevices(vk.instance, &deviceCount, devices.data());
+ 
+-    // First device with a compute queue and host-coherent memory wins.
++    // First device with a compute queue wins.
+     for (VkPhysicalDevice candidate : devices)
+     {
+         uint32_t familyCount = 0;
+@@ -340,11 +670,10 @@ bool GSVulkanBackend::initVulkan()
+     queueInfo.queueFamilyIndex = vk.queueFamily;
+     queueInfo.queueCount = 1;
+     queueInfo.pQueuePriorities = &priority;
+-    // The triangle rasterizer needs float64 for Z (like the CPU); sprites and present
+-    // don't. Enable it when supported, otherwise triangles stay on the CPU backend.
++    // The rasterizer needs float64 for triangle Z (like the CPU); present does not.
++    // Without it drawing stays on the CPU backend.
+     VkPhysicalDeviceFeatures supportedFeatures{};
+     vkGetPhysicalDeviceFeatures(vk.phys, &supportedFeatures);
+-    vk.shaderFloat64 = supportedFeatures.shaderFloat64 == VK_TRUE;
+     VkPhysicalDeviceFeatures enabledFeatures{};
+     enabledFeatures.shaderFloat64 = supportedFeatures.shaderFloat64;
+     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+@@ -358,68 +687,47 @@ bool GSVulkanBackend::initVulkan()
+     }
+     vkGetDeviceQueue(vk.device, vk.queueFamily, 0, &vk.queue);
+ 
+-    // Buffers are sized in Initialize(); create them lazily-sized to 4MB (GS VRAM size) here
+-    // and re-check in Initialize. GS VRAM is always 4MB.
++    // GS VRAM is always 4MB (re-checked in Initialize).
+     vk.vramBufferSize = 4u * 1024u * 1024u;
+-    if (!createMappedBuffer(vk.device, vk.phys, vk.vramBufferSize,
+-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+-                            vk.vramBuffer, vk.vramMemory, vk.vramMapped))
++    void *vramMapped = nullptr, *uploadMapped = nullptr;
++    if (!vk.createBuffer(vk.vramBufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, vk.hostVramBuffer, &vramMapped) ||
++        !vk.createBuffer(vk.vramBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                         false, vk.vramBuffer, nullptr) ||
++        !vk.createBuffer(VkState::kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, vk.uploadBuffer, &uploadMapped) ||
++        !vk.createBuffer(kHostFrameWidth * kHostFrameHeight * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, vk.outBuffer, &vk.outMapped) ||
++        !vk.createStream(vk.states, sizeof(PipeState), VkState::kMaxStates) ||
++        !vk.createStream(vk.geoms, sizeof(Geom), VkState::kMaxGeoms) ||
++        !vk.createStream(vk.tiles, 4u, VkState::kTileWords) ||
++        !vk.createStream(vk.cluts, 512u * 4u, VkState::kClutSlots))
+     {
+-        std::cerr << "[gs-vulkan] VRAM buffer allocation failed, CPU fallback" << std::endl;
++        std::cerr << "[gs-vulkan] buffer allocation failed, CPU fallback" << std::endl;
+         return false;
+     }
+-    if (!createMappedBuffer(vk.device, vk.phys, kHostFrameWidth * kHostFrameHeight * 4u,
+-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+-                            vk.outBuffer, vk.outMemory, vk.outMapped))
+-    {
+-        std::cerr << "[gs-vulkan] output buffer allocation failed, CPU fallback" << std::endl;
+-        return false;
+-    }
+-    // CLUT widened to uint (512 entries) and per-primitive raster params: a ring of
+-    // slots bound via a dynamic-offset descriptor, so a batch of dispatches records
+-    // without any per-primitive submit.
+-    VkPhysicalDeviceProperties devProps{};
+-    vkGetPhysicalDeviceProperties(vk.phys, &devProps);
+-    if (devProps.limits.minStorageBufferOffsetAlignment > VkState::kParamsSlotStride)
+-    {
+-        std::cerr << "[gs-vulkan] storage offset alignment too large, raster on CPU" << std::endl;
+-        return false;
+-    }
+-    if (!createMappedBuffer(vk.device, vk.phys, 512u * 4u,
+-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+-                            vk.clutBuffer, vk.clutMemory, vk.clutMapped) ||
+-        !createMappedBuffer(vk.device, vk.phys,
+-                            VkState::kParamsSlotCount * VkState::kParamsSlotStride,
+-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+-                            vk.paramsBuffer, vk.paramsMemory, vk.paramsMapped))
+-    {
+-        std::cerr << "[gs-vulkan] clut/params buffer allocation failed, CPU fallback" << std::endl;
+-        return false;
+-    }
+-
+-    // Bindings: 0 = VRAM, 1 = present output, 2 = CLUT, 3 = raster params (dynamic offset).
+-    // Shaders use subsets of these; the layout and set are shared.
+-    VkDescriptorSetLayoutBinding bindings[4]{};
+-    for (uint32_t i = 0; i < 4; ++i)
++    vk.vramMapped = static_cast<uint8_t *>(vramMapped);
++    vk.uploadMapped = static_cast<uint8_t *>(uploadMapped);
++
++    // Bindings: 0 = VRAM, 1 = present output, 2 = CLUT snapshots, 3 = states, 4 = geoms,
++    // 5 = tile lists. Shaders use subsets of these; the layout and set are shared.
++    const VkBuffer bound[6] = {vk.vramBuffer, vk.outBuffer, vk.cluts.dev, vk.states.dev, vk.geoms.dev, vk.tiles.dev};
++    VkDescriptorSetLayoutBinding bindings[6]{};
++    for (uint32_t i = 0; i < 6; ++i)
+     {
+         bindings[i].binding = i;
+-        bindings[i].descriptorType = (i == 3) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+-                                              : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+         bindings[i].descriptorCount = 1;
+         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+     }
+     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+-    layoutInfo.bindingCount = 4;
++    layoutInfo.bindingCount = 6;
+     layoutInfo.pBindings = bindings;
+     if (vkCreateDescriptorSetLayout(vk.device, &layoutInfo, nullptr, &vk.descriptorLayout) != VK_SUCCESS)
+         return false;
+ 
+-    VkDescriptorPoolSize poolSizes[2]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3},
+-                                      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1}};
++    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6};
+     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+     poolInfo.maxSets = 1;
+-    poolInfo.poolSizeCount = 2;
+-    poolInfo.pPoolSizes = poolSizes;
++    poolInfo.poolSizeCount = 1;
++    poolInfo.pPoolSizes = &poolSize;
+     if (vkCreateDescriptorPool(vk.device, &poolInfo, nullptr, &vk.descriptorPool) != VK_SUCCESS)
+         return false;
+ 
+@@ -430,25 +738,19 @@ bool GSVulkanBackend::initVulkan()
+     if (vkAllocateDescriptorSets(vk.device, &setInfo, &vk.descriptorSet) != VK_SUCCESS)
+         return false;
+ 
+-    VkDescriptorBufferInfo vramDesc{vk.vramBuffer, 0, VK_WHOLE_SIZE};
+-    VkDescriptorBufferInfo outDesc{vk.outBuffer, 0, VK_WHOLE_SIZE};
+-    VkDescriptorBufferInfo clutDesc{vk.clutBuffer, 0, VK_WHOLE_SIZE};
+-    VkDescriptorBufferInfo paramsDesc{vk.paramsBuffer, 0, VK_WHOLE_SIZE};
+-    VkWriteDescriptorSet writes[4]{};
+-    for (uint32_t i = 0; i < 4; ++i)
++    VkDescriptorBufferInfo bufferDescs[6]{};
++    VkWriteDescriptorSet writes[6]{};
++    for (uint32_t i = 0; i < 6; ++i)
+     {
++        bufferDescs[i] = {bound[i], 0, VK_WHOLE_SIZE};
+         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+         writes[i].dstSet = vk.descriptorSet;
+         writes[i].dstBinding = i;
+         writes[i].descriptorCount = 1;
+-        writes[i].descriptorType = (i == 3) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+-                                            : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        writes[i].pBufferInfo = &bufferDescs[i];
+     }
+-    writes[0].pBufferInfo = &vramDesc;
+-    writes[1].pBufferInfo = &outDesc;
+-    writes[2].pBufferInfo = &clutDesc;
+-    writes[3].pBufferInfo = &paramsDesc;
+-    vkUpdateDescriptorSets(vk.device, 4, writes, 0, nullptr);
++    vkUpdateDescriptorSets(vk.device, 6, writes, 0, nullptr);
+ 
+     VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PresentPushConstants)};
+     VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+@@ -459,69 +761,31 @@ bool GSVulkanBackend::initVulkan()
+     if (vkCreatePipelineLayout(vk.device, &pipelineLayoutInfo, nullptr, &vk.pipelineLayout) != VK_SUCCESS)
+         return false;
+ 
+-    VkShaderModuleCreateInfo shaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+-    shaderInfo.codeSize = sizeof(kPresentDeswizzleSpv);
+-    shaderInfo.pCode = kPresentDeswizzleSpv;
+-    VkShaderModule shaderModule = VK_NULL_HANDLE;
+-    if (vkCreateShaderModule(vk.device, &shaderInfo, nullptr, &shaderModule) != VK_SUCCESS)
++    auto createPipeline = [&](const uint32_t *code, size_t codeSize, VkPipeline &out)
+     {
+-        std::cerr << "[gs-vulkan] shader module creation failed, CPU fallback" << std::endl;
+-        return false;
+-    }
+-
+-    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+-    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+-    pipelineInfo.stage.module = shaderModule;
+-    pipelineInfo.stage.pName = "main";
+-    pipelineInfo.layout = vk.pipelineLayout;
+-    const VkResult pipelineResult = vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk.pipeline);
+-    vkDestroyShaderModule(vk.device, shaderModule, nullptr);
+-    if (pipelineResult != VK_SUCCESS)
+-        return false;
+-
+-    // Sprite rasterizer pipeline (same layout; uses bindings 0, 2, 3).
+-    VkShaderModuleCreateInfo rasterShaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+-    rasterShaderInfo.codeSize = sizeof(kRasterSpriteSpv);
+-    rasterShaderInfo.pCode = kRasterSpriteSpv;
+-    VkShaderModule rasterShaderModule = VK_NULL_HANDLE;
+-    if (vkCreateShaderModule(vk.device, &rasterShaderInfo, nullptr, &rasterShaderModule) != VK_SUCCESS)
++        VkShaderModuleCreateInfo shaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++        shaderInfo.codeSize = codeSize;
++        shaderInfo.pCode = code;
++        VkShaderModule shaderModule = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(vk.device, &shaderInfo, nullptr, &shaderModule) != VK_SUCCESS)
++            return false;
++        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++        pipelineInfo.stage.module = shaderModule;
++        pipelineInfo.stage.pName = "main";
++        pipelineInfo.layout = vk.pipelineLayout;
++        const VkResult result = vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &out);
++        vkDestroyShaderModule(vk.device, shaderModule, nullptr);
++        return result == VK_SUCCESS;
++    };
++    if (!createPipeline(kPresentDeswizzleSpv, sizeof(kPresentDeswizzleSpv), vk.pipeline))
+     {
+-        std::cerr << "[gs-vulkan] raster shader module creation failed, CPU fallback" << std::endl;
++        std::cerr << "[gs-vulkan] present pipeline creation failed, CPU fallback" << std::endl;
+         return false;
+     }
+-    VkComputePipelineCreateInfo rasterPipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+-    rasterPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-    rasterPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+-    rasterPipelineInfo.stage.module = rasterShaderModule;
+-    rasterPipelineInfo.stage.pName = "main";
+-    rasterPipelineInfo.layout = vk.pipelineLayout;
+-    const VkResult rasterResult = vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &rasterPipelineInfo, nullptr, &vk.rasterPipeline);
+-    vkDestroyShaderModule(vk.device, rasterShaderModule, nullptr);
+-    if (rasterResult != VK_SUCCESS)
+-        return false;
+-
+-    // Triangle rasterizer pipeline (same layout; needs shaderFloat64 for Z). When the
+-    // device lacks float64 this stays null and triangles run on the CPU backend.
+-    if (vk.shaderFloat64)
+-    {
+-        VkShaderModuleCreateInfo triShaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+-        triShaderInfo.codeSize = sizeof(kRasterTriangleSpv);
+-        triShaderInfo.pCode = kRasterTriangleSpv;
+-        VkShaderModule triShaderModule = VK_NULL_HANDLE;
+-        VkComputePipelineCreateInfo triPipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+-        triPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-        triPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+-        triPipelineInfo.stage.pName = "main";
+-        triPipelineInfo.layout = vk.pipelineLayout;
+-        if (vkCreateShaderModule(vk.device, &triShaderInfo, nullptr, &triShaderModule) == VK_SUCCESS)
+-        {
+-            triPipelineInfo.stage.module = triShaderModule;
+-            if (vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &triPipelineInfo, nullptr, &vk.trianglePipeline) != VK_SUCCESS)
+-                std::cerr << "[gs-vulkan] triangle pipeline creation failed, triangles on CPU" << std::endl;
+-            vkDestroyShaderModule(vk.device, triShaderModule, nullptr);
+-        }
+-    }
++    if (!supportedFeatures.shaderFloat64 || !createPipeline(kRasterBatchSpv, sizeof(kRasterBatchSpv), vk.rasterPipeline))
++        std::cerr << "[gs-vulkan] no raster pipeline (shaderFloat64: " << supportedFeatures.shaderFloat64 << "), drawing on CPU" << std::endl;
+ 
+     VkCommandPoolCreateInfo commandPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+     commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+@@ -532,12 +796,8 @@ bool GSVulkanBackend::initVulkan()
+     VkCommandBufferAllocateInfo commandBufferInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+     commandBufferInfo.commandPool = vk.commandPool;
+     commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+-    commandBufferInfo.commandBufferCount = 1;
+-    if (vkAllocateCommandBuffers(vk.device, &commandBufferInfo, &vk.commandBuffer) != VK_SUCCESS)
+-        return false;
+-
+-    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+-    if (vkCreateFence(vk.device, &fenceInfo, nullptr, &vk.fence) != VK_SUCCESS)
++    commandBufferInfo.commandBufferCount = VkState::kCommandBuffers;
++    if (vkAllocateCommandBuffers(vk.device, &commandBufferInfo, vk.commandBuffers.data()) != VK_SUCCESS)
+         return false;
+ 
+     VkPhysicalDeviceProperties props{};
+@@ -554,38 +814,24 @@ void GSVulkanBackend::shutdownVulkan()
+     if (vk.device != VK_NULL_HANDLE)
+     {
+         vkDeviceWaitIdle(vk.device);
+-        if (vk.fence)
+-            vkDestroyFence(vk.device, vk.fence, nullptr);
+         if (vk.commandPool)
+             vkDestroyCommandPool(vk.device, vk.commandPool, nullptr);
+         if (vk.pipeline)
+             vkDestroyPipeline(vk.device, vk.pipeline, nullptr);
+         if (vk.rasterPipeline)
+             vkDestroyPipeline(vk.device, vk.rasterPipeline, nullptr);
+-        if (vk.trianglePipeline)
+-            vkDestroyPipeline(vk.device, vk.trianglePipeline, nullptr);
+         if (vk.pipelineLayout)
+             vkDestroyPipelineLayout(vk.device, vk.pipelineLayout, nullptr);
+         if (vk.descriptorPool)
+             vkDestroyDescriptorPool(vk.device, vk.descriptorPool, nullptr);
+         if (vk.descriptorLayout)
+             vkDestroyDescriptorSetLayout(vk.device, vk.descriptorLayout, nullptr);
+-        if (vk.outBuffer)
+-            vkDestroyBuffer(vk.device, vk.outBuffer, nullptr);
+-        if (vk.outMemory)
+-            vkFreeMemory(vk.device, vk.outMemory, nullptr);
+-        if (vk.clutBuffer)
+-            vkDestroyBuffer(vk.device, vk.clutBuffer, nullptr);
+-        if (vk.clutMemory)
+-            vkFreeMemory(vk.device, vk.clutMemory, nullptr);
+-        if (vk.paramsBuffer)
+-            vkDestroyBuffer(vk.device, vk.paramsBuffer, nullptr);
+-        if (vk.paramsMemory)
+-            vkFreeMemory(vk.device, vk.paramsMemory, nullptr);
+-        if (vk.vramBuffer)
+-            vkDestroyBuffer(vk.device, vk.vramBuffer, nullptr);
+-        if (vk.vramMemory)
+-            vkFreeMemory(vk.device, vk.vramMemory, nullptr);
++        for (const auto &[buffer, memory] : vk.allocations)
++        {
++            vkDestroyBuffer(vk.device, buffer, nullptr);
++            if (memory)
++                vkFreeMemory(vk.device, memory, nullptr);
++        }
+         vkDestroyDevice(vk.device, nullptr);
+     }
+     if (vk.instance)
+@@ -593,777 +839,689 @@ void GSVulkanBackend::shutdownVulkan()
+     m_vk.reset();
+ }
+ 
+-bool GSVulkanBackend::gpuCopyFrame(const GSFrameReg &frame,
+-                                   uint32_t width,
+-                                   uint32_t height,
+-                                   std::vector<uint8_t> &outPixels,
+-                                   bool preserveAlpha,
+-                                   bool frameBaseIsPages,
+-                                   uint32_t sourceOriginX,
+-                                   uint32_t sourceOriginY)
++VkCommandBuffer GSVulkanBackend::VkState::command()
+ {
+-    // Mirrors GSCpuBackend::CopyFrameToHostRgba with useLocalMemoryLayout=true.
+-    outPixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
+-    if (frame.psm != GS_PSM_CT32 && frame.psm != GS_PSM_CT24 && frame.psm != GS_PSM_CT16 && frame.psm != GS_PSM_CT16S)
++    const VkCommandBuffer cb = commandBuffers[commandIndex];
++    if (!commandOpen)
+     {
+-        outPixels.clear();
+-        return false;
++        VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        if (vkBeginCommandBuffer(cb, &beginInfo) != VK_SUCCESS)
++            std::cerr << "[gs-vulkan] vkBeginCommandBuffer failed" << std::endl;
++        commandOpen = true;
+     }
++    return cb;
++}
+ 
+-    VkState &vk = *m_vk;
+-    PresentPushConstants pc{};
+-    pc.basePtr = frameBaseIsPages ? GSInternal::framePageBaseToBlock(frame.fbp) : frame.fbp;
+-    pc.fbw = frame.fbw ? frame.fbw : kHostFrameWidth / 64u;
+-    pc.psm = frame.psm;
+-    pc.width = width;
+-    pc.height = height;
+-    pc.originX = sourceOriginX;
+-    pc.originY = sourceOriginY;
+-    pc.flags = preserveAlpha ? 1u : 0u;
+-    pc.wordMask = static_cast<uint32_t>(vk.vramBufferSize / 4u - 1u);
+-    pc.byteMask16 = static_cast<uint32_t>(vk.vramBufferSize - 2u);
++// Orders everything recorded so far before what follows: dispatches and copies read and
++// write the same buffers.
++void GSVulkanBackend::VkState::barrier(VkCommandBuffer cb)
++{
++    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++    mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                                          VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++    const VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
++    vkCmdPipelineBarrier(cb, stages, stages, 0, 1, &mb, 0, nullptr, 0, nullptr);
++}
+ 
+-    vkResetFences(vk.device, 1, &vk.fence);
+-    vkResetCommandBuffer(vk.commandBuffer, 0);
+-    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+-    if (vkBeginCommandBuffer(vk.commandBuffer, &beginInfo) != VK_SUCCESS)
+-    {
+-        outPixels.clear();
+-        return false;
+-    }
+-    vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipeline);
+-    const uint32_t dynamicOffset = 0; // present never touches binding 3, but the set has one dynamic slot
+-    vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 1, &dynamicOffset);
+-    vkCmdPushConstants(vk.commandBuffer, vk.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+-    vkCmdDispatch(vk.commandBuffer, (kHostFrameWidth * kHostFrameHeight + 63u) / 64u, 1, 1);
+-    vkEndCommandBuffer(vk.commandBuffer);
++// The queue is idle: everything submitted has run, so its inputs can be overwritten.
++void GSVulkanBackend::VkState::idleReset()
++{
++    commandIndex = 0;
++    uploadUsed = 0;
++    if (batchGeoms != 0u)
++        return; // the open batch still lives in the streams
++    for (Stream *stream : {&states, &geoms, &tiles, &cluts})
++        stream->used = stream->copied = 0;
++    stateIndex = kNone;
++    clutSlot = kNone;
++}
+ 
++void GSVulkanBackend::VkState::submit()
++{
++    if (!commandOpen)
++        return;
++    const VkCommandBuffer cb = commandBuffers[commandIndex];
++    vkEndCommandBuffer(cb);
+     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+     submitInfo.commandBufferCount = 1;
+-    submitInfo.pCommandBuffers = &vk.commandBuffer;
+-    if (vkQueueSubmit(vk.queue, 1, &submitInfo, vk.fence) != VK_SUCCESS ||
+-        vkWaitForFences(vk.device, 1, &vk.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
++    submitInfo.pCommandBuffers = &cb;
++    if (vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
++        std::cerr << "[gs-vulkan] vkQueueSubmit failed" << std::endl;
++    commandOpen = false;
++    unsubmitted = 0;
++    ++stats.submits;
++    if (++commandIndex == kCommandBuffers)
+     {
+-        outPixels.clear();
+-        return false;
++        vkQueueWaitIdle(queue);
++        idleReset();
+     }
++}
+ 
+-    std::memcpy(outPixels.data(), vk.outMapped, outPixels.size());
+-    return true;
++void GSVulkanBackend::VkState::drain()
++{
++    submit();
++    const auto t0 = std::chrono::steady_clock::now();
++    vkQueueWaitIdle(queue);
++    stats.waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    ++stats.waits;
++    idleReset();
+ }
+ 
+-PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &request)
++void GSVulkanBackend::VkState::waitIdle()
+ {
+-    // Mirrors GSCpuBackend::PresentFromLocalMemory, with CopyFrameToHostRgba on the GPU.
+-    PresentationFrame result{};
+-    const GSPmodeState pmode = decodePmode(request.pmode);
+-    const GSSmode2State smode2 = decodeSMode2(request.smode2);
+-    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
+-    const bool oddField = (request.vsyncTick & 1ull) != 0ull;
+-    const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+-    const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+-    const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
+-    const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
+-    uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
+-    decodeDisplaySize(request.display1, width1, height1);
+-    decodeDisplaySize(request.display2, width2, height2);
+-    const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+-    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+-    if (!valid1 && !valid2)
+-        return result;
++    closeBatch();
++    drain();
++}
+ 
+-    auto copySource = [&](const GSFrameReg &displayFrame,
+-                          const GSDisplayReadOrigin &origin,
+-                          uint32_t width,
+-                          uint32_t height,
+-                          bool allowPreferred,
+-                          bool preserveAlpha,
+-                          GSFrameReg &selected,
+-                          std::vector<uint8_t> &pixels,
+-                          bool &usedPreferred) -> bool
++void GSVulkanBackend::VkState::flush()
++{
++    closeBatch();
++    submit();
++}
++
++// Sends the pages the CPU wrote to the device copy, as they are now.
++void GSVulkanBackend::VkState::stageCpuDirty()
++{
++    if (cpuDirty.none())
++        return;
++    if (uploadUsed + cpuDirty.count() * kPageBytes > kUploadBytes)
++        drain();
++    regions.clear();
++    forPageRuns(cpuDirty, [&](uint32_t first, uint32_t count)
+     {
+-        selected = displayFrame;
+-        pixels.clear();
+-        usedPreferred = false;
+-        if (allowPreferred && request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp &&
+-            (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp) &&
+-            gpuCopyFrame(request.preferredSource, width, height, pixels, preserveAlpha, false, 0u, 0u))
+-        {
+-            selected = request.preferredSource;
+-            usedPreferred = true;
+-        }
+-        if (pixels.empty() && !gpuCopyFrame(displayFrame, width, height, pixels, preserveAlpha, true, origin.x, origin.y))
+-            return false;
++        std::memcpy(uploadMapped + uploadUsed, vramMapped + first * kPageBytes, count * kPageBytes);
++        regions.push_back({uploadUsed, first * kPageBytes, count * kPageBytes});
++        uploadUsed += count * kPageBytes;
++    });
++    const VkCommandBuffer cb = command();
++    vkCmdCopyBuffer(cb, uploadBuffer, vramBuffer, static_cast<uint32_t>(regions.size()), regions.data());
++    barrier(cb);
++    stats.stagedPages += cpuDirty.count();
++    cpuDirty.reset();
++}
+ 
+-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
+-        {
+-            for (const GSFrameReg &candidate : request.contextFrames)
+-            {
+-                if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
+-                    continue;
+-                std::vector<uint8_t> candidatePixels;
+-                if (!gpuCopyFrame(candidate, width, height, candidatePixels, preserveAlpha, true, 0u, 0u))
+-                    continue;
+-                if (countNonBlackPixels(candidatePixels, width, height) == 0u)
+-                    continue;
+-                selected = candidate;
+-                pixels.swap(candidatePixels);
+-                break;
+-            }
+-        }
+-        return true;
+-    };
++// Records the open batch as one dispatch.
++void GSVulkanBackend::VkState::closeBatch()
++{
++    if (batchGeoms == 0u)
++        return;
++    stageCpuDirty();
+ 
+-    if (valid1 && valid2)
++    // Tile lists, in draw order: count per tile, lay the lists out, fill them.
++    auto forTiles = [](const TileBox &box, auto fn)
+     {
+-        GSFrameReg selected1{}, selected2{};
+-        std::vector<uint8_t> crt1, crt2;
+-        bool preferred1 = false, preferred2 = false;
+-        if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
+-            copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
++        for (uint32_t ty = box.y0; ty <= box.y1; ++ty)
++            for (uint32_t tx = box.x0; tx <= box.x1; ++tx)
++                fn((ty << 8u) | tx);
++    };
++    touchedTiles.clear();
++    for (const TileBox &box : boxes)
++        forTiles(box, [&](uint32_t key)
+         {
+-            result.width = std::max(width1, width2);
+-            result.height = std::max(height1, height2);
+-            result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
+-            const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
+-            const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
+-            const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
+-            for (uint32_t y = 0; y < result.height; ++y)
+-                for (uint32_t x = 0; x < result.width; ++x)
+-                {
+-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
+-                    dst[0] = bgR;
+-                    dst[1] = bgG;
+-                    dst[2] = bgB;
+-                    dst[3] = pmode.alp;
+-                }
+-            if (!pmode.slbg)
+-                for (uint32_t y = 0; y < height2; ++y)
+-                    std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
+-            for (uint32_t y = 0; y < height1; ++y)
+-                for (uint32_t x = 0; x < width1; ++x)
+-                {
+-                    const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
+-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
+-                    const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
+-                    dst[0] = blendPresentationChannel(src[0], dst[0], factor);
+-                    dst[1] = blendPresentationChannel(src[1], dst[1], factor);
+-                    dst[2] = blendPresentationChannel(src[2], dst[2], factor);
+-                    dst[3] = pmode.amod ? dst[3] : src[3];
+-                }
+-            normalizePresentationAlpha(result.pixels, result.width, result.height);
+-            if (fieldMode)
+-                applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+-            result.displayFbp = displayFrame1.fbp;
+-            result.sourceFbp = selected1.fbp;
+-            debugDumpFrame(result);
+-            return result;
+-        }
++            if (tileCount[key]++ == 0u)
++                touchedTiles.push_back(key);
++        });
++    uint32_t *words = reinterpret_cast<uint32_t *>(tiles.mapped);
++    const uint32_t tileBase = tiles.used;
++    const uint32_t tileTotal = static_cast<uint32_t>(touchedTiles.size());
++    uint32_t cursor = tileBase + tileTotal * 3u;
++    for (uint32_t i = 0; i < tileTotal; ++i)
++    {
++        const uint32_t key = touchedTiles[i];
++        words[tileBase + i * 3u] = key;
++        words[tileBase + i * 3u + 1u] = cursor;
++        words[tileBase + i * 3u + 2u] = tileCount[key];
++        tileCursor[key] = cursor;
++        cursor += tileCount[key];
++        tileCount[key] = 0u;
+     }
++    const uint32_t firstGeom = geoms.used - batchGeoms;
++    for (uint32_t i = 0; i < batchGeoms; ++i)
++        forTiles(boxes[i], [&](uint32_t key) { words[tileCursor[key]++] = firstGeom + i; });
++    tiles.used = cursor;
+ 
+-    const GSFrameReg &displayFrame = valid1 ? displayFrame1 : displayFrame2;
+-    const GSDisplayReadOrigin &origin = valid1 ? origin1 : origin2;
+-    result.width = valid1 ? width1 : width2;
+-    result.height = valid1 ? height1 : height2;
+-    GSFrameReg selected = displayFrame;
+-    if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
+-        return {};
+-    if (fieldMode)
+-        applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+-    normalizePresentationAlpha(result.pixels, result.width, result.height);
+-    result.displayFbp = displayFrame.fbp;
+-    result.sourceFbp = selected.fbp;
+-    debugDumpFrame(result);
+-    return result;
++    const VkCommandBuffer cb = command();
++    for (Stream *stream : {&states, &geoms, &tiles, &cluts})
++    {
++        if (stream->used == stream->copied)
++            continue;
++        const VkBufferCopy region{static_cast<VkDeviceSize>(stream->copied) * stream->stride,
++                                  static_cast<VkDeviceSize>(stream->copied) * stream->stride,
++                                  static_cast<VkDeviceSize>(stream->used - stream->copied) * stream->stride};
++        vkCmdCopyBuffer(cb, stream->host, stream->dev, 1, &region);
++        stream->copied = stream->used;
++    }
++    barrier(cb);
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, rasterPipeline);
++    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
++    const uint32_t push[2] = {tileBase, tileTotal};
++    vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
++    vkCmdDispatch(cb, std::min(tileTotal, 256u), (tileTotal + 255u) / 256u, 1);
++    barrier(cb);
++
++    gpuDirty |= batchTarget;
++    stats.prims += batchGeoms;
++    stats.entries += batchEntries;
++    stats.tiles += tileTotal;
++    ++stats.batches;
++    unsubmitted += batchGeoms;
++    batchGeoms = 0;
++    batchEntries = 0;
++    boxes.clear();
++    batchTarget.reset();
++    batchPages.reset();
++    if (unsubmitted >= kBatchPrims)
++        submit();
+ }
+ 
+-namespace
++// Brings the host copy up to date with everything drawn so far.
++void GSVulkanBackend::VkState::syncToCpu()
+ {
+-    // Matches the std430 Params block in gs_raster_common.glsl exactly (the shared
+-    // include of raster_sprite.comp and raster_triangle.comp).
+-    struct SpriteParams
++    closeBatch();
++    if (gpuDirty.none())
++        return;
++    regions.clear();
++    forPageRuns(gpuDirty, [&](uint32_t first, uint32_t count)
+     {
+-        int32_t drawX0, drawY0, drawX1, drawY1;
+-        int32_t unclippedX0, unclippedY0;
+-        float spriteW, spriteH;
+-        float u0f, v0f, u1f, v1f;
+-        uint32_t vertR, vertG, vertB, vertA;
+-        uint32_t vertFog, z1;
+-        int32_t sx0, sx1, sy0, sy1;
+-        uint32_t fge, fogR, fogG, fogB;
+-        uint32_t fbp, fbw, fpsm, zbp, zpsm;
+-        uint32_t testLo, testHi;
+-        uint32_t abe, pabe;
+-        uint32_t asel, bsel, csel, dsel, fixv;
+-        uint32_t fbaOn, fbmsk, zmask, frame16;
+-        uint32_t tme, fst, linear;
+-        int32_t texW, texH;
+-        uint32_t wrapU, wrapV, minU, maxU, minV, maxV;
+-        uint32_t texPsm, tbp0, tbw;
+-        uint32_t tcc, tfx;
+-        uint32_t ta0, ta1, aem;
+-        uint32_t cpsm, csm, csa;
+-        // Triangle extension (raster_triangle.comp only; matches DrawTriangle).
+-        float fx0, fy0, fx1, fy1, fx2, fy2;
+-        float winding, invAbsDenom;
+-        float edgeA0, edgeA1; // fy1 - fy2, fy2 - fy0
+-        int32_t triMinX, triMinY, triMaxX, triMaxY;
+-        float attrR0, attrR1, attrR2;
+-        float attrG0, attrG1, attrG2;
+-        float attrB0, attrB1, attrB2;
+-        float attrA0, attrA1, attrA2;
+-        float attrS0, attrS1, attrS2; // FST: u as float; STQ: s
+-        float attrT0, attrT1, attrT2;
+-        float attrQ0, attrQ1, attrQ2;
+-        float attrFog0, attrFog1, attrFog2;
+-        uint32_t iip, pad0; // pad0 keeps the doubles 8-byte aligned (std430)
+-        double triZ0, triZ1, triZ2;
+-    };
+-    static_assert(sizeof(SpriteParams) <= 1024u);
+-    static_assert(offsetof(SpriteParams, triZ0) % 8 == 0);
++        regions.push_back({first * kPageBytes, first * kPageBytes, count * kPageBytes});
++    });
++    vkCmdCopyBuffer(command(), vramBuffer, hostVramBuffer, static_cast<uint32_t>(regions.size()), regions.data());
++    drain();
++    ++stats.syncs;
++    stats.syncPages += gpuDirty.count();
++    gpuDirty.reset();
++    cpu->TextureFlush(); // its cached texture page may show VRAM from before the copy
++}
+ 
+-    float spriteFabsQ(float q)
++// The CPU is about to read these pages.
++void GSVulkanBackend::VkState::needCpu(const PageSet &pages)
++{
++    if ((pages & (gpuDirty | batchTarget)).any())
+     {
+-        return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
++        ++stats.clutSyncs;
++        syncToCpu();
+     }
++}
+ 
+-    // MakePixelPipe + MakeTexSampler + combine state; shared by the sprite and triangle
+-    // raster paths.
+-    void fillPipeParams(SpriteParams &p, const GSDrawState &state)
++// The CPU is about to write these pages.
++void GSVulkanBackend::VkState::cpuWrite(const PageSet &pages)
++{
++    if ((pages & batchPages).any())
++        closeBatch(); // its primitives come first and must not see the write
++    if ((pages & gpuDirty).any())
+     {
+-        const GSContext &ctx = state.context;
+-
+-        // MakePixelPipe equivalents.
+-        p.sx0 = ctx.scissor.x0;
+-        p.sx1 = ctx.scissor.x1;
+-        p.sy0 = ctx.scissor.y0;
+-        p.sy1 = ctx.scissor.y1;
+-        p.fge = state.prim.fge ? 1u : 0u;
+-        p.fogR = state.fogR;
+-        p.fogG = state.fogG;
+-        p.fogB = state.fogB;
+-        p.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+-        p.fbw = std::max(ctx.frame.fbw, 1u);
+-        p.fpsm = ctx.frame.psm;
+-        p.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+-        p.zpsm = ctx.zbuf.psm;
+-        p.testLo = static_cast<uint32_t>(ctx.test);
+-        p.testHi = static_cast<uint32_t>(ctx.test >> 32);
+-        p.abe = state.prim.abe ? 1u : 0u;
+-        p.pabe = state.pabe ? 1u : 0u;
+-        p.asel = ctx.alpha & 3u;
+-        p.bsel = (ctx.alpha >> 2u) & 3u;
+-        p.csel = (ctx.alpha >> 4u) & 3u;
+-        p.dsel = (ctx.alpha >> 6u) & 3u;
+-        p.fixv = static_cast<uint32_t>((ctx.alpha >> 32u) & 0xFFu);
+-        p.fbaOn = ((ctx.fba & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24) ? 1u : 0u;
+-        p.fbmsk = ctx.frame.fbmsk;
+-        p.zmask = ctx.zbuf.zmask ? 1u : 0u;
+-        p.frame16 = GSInternal::bitsPerPixel(ctx.frame.psm) == 16u ? 1u : 0u;
+-
+-        // MakeTexSampler + combine state.
+-        p.tme = state.prim.tme ? 1u : 0u;
+-        p.fst = state.prim.fst ? 1u : 0u;
+-        p.linear = state.linearFilter ? 1u : 0u;
+-        p.texW = state.textureWidth;
+-        p.texH = state.textureHeight;
+-        p.wrapU = static_cast<uint32_t>(ctx.clamp & 0x3u);
+-        p.wrapV = static_cast<uint32_t>((ctx.clamp >> 2u) & 0x3u);
+-        p.minU = static_cast<uint32_t>((ctx.clamp >> 4u) & 0x3FFu);
+-        p.maxU = static_cast<uint32_t>((ctx.clamp >> 14u) & 0x3FFu);
+-        p.minV = static_cast<uint32_t>((ctx.clamp >> 24u) & 0x3FFu);
+-        p.maxV = static_cast<uint32_t>((ctx.clamp >> 34u) & 0x3FFu);
+-        p.texPsm = ctx.tex0.psm;
+-        p.tbp0 = ctx.tex0.tbp0;
+-        p.tbw = ctx.tex0.tbw;
+-        p.tcc = ctx.tex0.tcc;
+-        p.tfx = ctx.tex0.tfx;
+-        p.ta0 = state.texa.ta0;
+-        p.ta1 = state.texa.ta1;
+-        p.aem = state.texa.aem ? 1u : 0u;
+-        p.cpsm = ctx.tex0.cpsm;
+-        p.csm = ctx.tex0.csm;
+-        p.csa = ctx.tex0.csa;
++        ++stats.writeSyncs;
++        syncToCpu(); // the CPU may rewrite parts of words or pages
+     }
++    cpuDirty |= pages;
+ }
+ 
+-void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
++void GSVulkanBackend::VkState::cpuWroteAll()
+ {
+-    static_assert(sizeof(SpriteParams) <= VkState::kParamsSlotStride, "params ring slot too small");
+-    const GSDrawState &state = batch.state;
+-    const GSVertex &v0 = batch.vertices[0];
+-    const GSVertex &v1 = batch.vertices[1];
+-    const GSContext &ctx = state.context;
++    cpuDirty.set();
++}
+ 
+-    // DrawSprite's rectangle setup with identical rounding.
+-    const int ofx = ctx.xyoffset.ofx >> 4;
+-    const int ofy = ctx.xyoffset.ofy >> 4;
+-    int x0 = static_cast<int>(v0.x) - ofx;
+-    int y0 = static_cast<int>(v0.y) - ofy;
+-    int x1 = static_cast<int>(v1.x) - ofx;
+-    int y1 = static_cast<int>(v1.y) - ofy;
+-    if (x0 > x1)
+-        std::swap(x0, x1);
+-    if (y0 > y1)
+-        std::swap(y0, y1);
+-    const int unclippedX0 = x0;
+-    const int unclippedY0 = y0;
+-    const int spanX = std::max(1, x1 - x0);
+-    const int spanY = std::max(1, y1 - y0);
+-    const int unclippedX1 = unclippedX0 + spanX - 1;
+-    const int unclippedY1 = unclippedY0 + spanY - 1;
+-    if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
+-        unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
+-        return; // fully clipped: draws nothing, same as DrawSprite
+-
+-    SpriteParams p{};
+-    p.drawX0 = GSInternal::clampInt(unclippedX0, ctx.scissor.x0, ctx.scissor.x1);
+-    p.drawY0 = GSInternal::clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
+-    p.drawX1 = GSInternal::clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
+-    p.drawY1 = GSInternal::clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
+-    p.unclippedX0 = unclippedX0;
+-    p.unclippedY0 = unclippedY0;
+-    p.spriteW = std::max(1.0f, static_cast<float>(spanX));
+-    p.spriteH = std::max(1.0f, static_cast<float>(spanY));
+-
+-    const int texW = state.textureWidth;
+-    const int texH = state.textureHeight;
+-    if (state.prim.fst)
+-    {
+-        p.u0f = static_cast<float>(v0.u >> 4);
+-        p.v0f = static_cast<float>(v0.v >> 4);
+-        p.u1f = static_cast<float>(v1.u >> 4);
+-        p.v1f = static_cast<float>(v1.v >> 4);
++void GSVulkanBackend::VkState::cpuDraw(const GSPrimitiveBatch &batch)
++{
++    syncToCpu();
++    cpu->Submit(batch);
++    ++stats.cpuDraws;
++    const GSContext &ctx = batch.state.context;
++    const uint32_t fbw = std::max(ctx.frame.fbw, 1u);
++    if (ctx.scissor.x0 <= ctx.scissor.x1 && ctx.scissor.y0 <= ctx.scissor.y1 && static_cast<uint32_t>(ctx.scissor.x1) < fbw * 64u)
++    {
++        addPages(cpuDirty, ctx.frame.psm, GSInternal::framePageBaseToBlock(ctx.frame.fbp), fbw, ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1);
++        addPages(cpuDirty, ctx.zbuf.psm, GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), fbw, ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1);
+     }
+     else
++        cpuDirty.set();
++}
++
++void GSVulkanBackend::VkState::loadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    PageSet pages;
++    const bool fourBit = isOneOf(tex0.psm, {GS_PSM_T4, GS_PSM_T4HL, GS_PSM_T4HH});
++    if ((fourBit || isOneOf(tex0.psm, {GS_PSM_T8, GS_PSM_T8H})) && tex0.cld >= 1u && tex0.cld <= 5u)
+     {
+-        const float q0 = spriteFabsQ(v0.q);
+-        const float q1 = spriteFabsQ(v1.q);
+-        p.u0f = (v0.s / q0) * static_cast<float>(texW);
+-        p.v0f = (v0.t / q0) * static_cast<float>(texH);
+-        p.u1f = (v1.s / q1) * static_cast<float>(texW);
+-        p.v1f = (v1.t / q1) * static_cast<float>(texH);
++        // CSM1 reads a 16x16 block of blocks cbp..cbp+3, CSM2 a row of a buffer.
++        const uint32_t x = static_cast<uint32_t>(texclut.cou) * 16u;
++        if (tex0.csm == 0u)
++            for (uint32_t block = tex0.cbp; block <= tex0.cbp + 3u; ++block)
++                pages.set((block / 32u) % 512u);
++        else
++            addPages(pages, tex0.cpsm, tex0.cbp, texclut.cbw != 0u ? texclut.cbw : 1u, x, texclut.cov, x + (fourBit ? 15u : 255u), texclut.cov);
+     }
++    needCpu(pages);
++    cpu->LoadClut(tex0, texclut);
++    clutStale = true;
++}
+ 
+-    p.vertR = v1.r;
+-    p.vertG = v1.g;
+-    p.vertB = v1.b;
+-    p.vertA = v1.a;
+-    p.vertFog = v1.fog;
+-    p.z1 = static_cast<uint32_t>(v1.z);
++void GSVulkanBackend::VkState::beginTransfer(const GSTransferCommand &command)
++{
++    auto rect = [&](uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
++    {
++        PageSet pages;
++        const uint32_t w = command.trxreg.rrw, h = command.trxreg.rrh;
++        if (x + w > 2048u || y + h > 2048u)
++            pages.set(); // coordinates wrap
++        else if (w != 0u && h != 0u)
++            addPages(pages, psm, bp, std::max(bw, 1u), x, y, x + w - 1u, y + h - 1u);
++        return pages;
++    };
++    const GSBitBltBuf &buf = command.bitbltbuf;
++    transferPages = rect(buf.dpsm, buf.dbp, buf.dbw, command.trxpos.dsax, command.trxpos.dsay);
++    if (command.direction == 1u || command.direction == 2u)
++        syncToCpu(); // local-to-host and local-to-local read VRAM right here
++    cpu->BeginTransfer(command);
++    if (command.direction == 2u)
++        cpuDirty |= transferPages;
++}
+ 
+-    fillPipeParams(p, state);
++void GSVulkanBackend::VkState::beforeUpload()
++{
++    cpuWrite(transferPages);
++}
+ 
+-    runRasterDispatch(batch, false, &p, sizeof(p),
+-                      static_cast<uint32_t>((p.drawX1 - p.drawX0) / 8 + 1),
+-                      static_cast<uint32_t>((p.drawY1 - p.drawY0) / 8 + 1),
+-                      "sprite");
++void GSVulkanBackend::VkState::beforeWrite(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
++{
++    PageSet pages;
++    addPages(pages, psm, base, bw, x, y, x, y);
++    cpuWrite(pages);
+ }
+ 
+-void GSVulkanBackend::submitTriangleGpu(const GSPrimitiveBatch &batch)
++void GSVulkanBackend::VkState::printStats()
+ {
++    static const uint32_t every = std::getenv("PS2X_VK_STATS") ? std::max(1, std::atoi(std::getenv("PS2X_VK_STATS"))) : 0u;
++    static uint32_t presents = 0;
++    if (every == 0u || ++presents % every != 0u)
++        return;
++    std::fprintf(stderr, "[gs-vulkan] waitMs %.1f prims %llu batches %llu tiles %llu entries %llu states %llu cpuDraws %llu syncs %llu (%llu pages; clut %llu write %llu) staged %llu pages submits %llu waits %llu\n",
++                 stats.waitMs, stats.prims, stats.batches, stats.tiles, stats.entries, stats.statesUsed, stats.cpuDraws, stats.syncs,
++                 stats.syncPages, stats.clutSyncs, stats.writeSyncs, stats.stagedPages, stats.submits, stats.waits);
++    stats = {};
++}
++
++void GSVulkanBackend::VkState::draw(const GSPrimitiveBatch &batch)
++{
++    if (batch.vertexCount == 0u)
++        return;
+     const GSDrawState &state = batch.state;
++    const GSContext &ctx = state.context;
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+     const GSVertex &v2 = batch.vertices[2];
+-    const GSContext &ctx = state.context;
+-
+-    // DrawTriangle's coordinate setup with identical rounding.
+     const int ofx = ctx.xyoffset.ofx >> 4;
+     const int ofy = ctx.xyoffset.ofy >> 4;
+-    const float fx0 = v0.x - static_cast<float>(ofx);
+-    const float fy0 = v0.y - static_cast<float>(ofy);
+-    const float fx1 = v1.x - static_cast<float>(ofx);
+-    const float fy1 = v1.y - static_cast<float>(ofy);
+-    const float fx2 = v2.x - static_cast<float>(ofx);
+-    const float fy2 = v2.y - static_cast<float>(ofy);
+-
+-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
+-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
+-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
+-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
+-    minX = GSInternal::clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
+-    maxX = GSInternal::clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
+-    minY = GSInternal::clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
+-    maxY = GSInternal::clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
+-
+-    const float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+-    if (std::fabs(denom) < 0.001f)
+-        return; // degenerate: the CPU draws nothing
+-    if (minX > maxX || minY > maxY)
+-        return; // fully clipped: the CPU's loops run zero iterations
+-
+-    SpriteParams p{};
+-    fillPipeParams(p, state);
++    const auto type = state.prim.type;
+ 
+-    // TRI_DEBUG (dev-only): PS2X_TRI_DEBUG=x,y makes the shader write per-pixel
+-    // intermediates back into sprite-only params slots for that pixel.
++    Geom g{};
++    if (type == GS_PRIM_SPRITE && batch.vertexCount == 2u)
+     {
+-        static int dbgX = -1, dbgY = -1;
+-        static bool dbgParsed = false;
+-        if (!dbgParsed)
++        // DrawSprite's rectangle setup with identical rounding.
++        int x0 = static_cast<int>(v0.x) - ofx;
++        int y0 = static_cast<int>(v0.y) - ofy;
++        int x1 = static_cast<int>(v1.x) - ofx;
++        int y1 = static_cast<int>(v1.y) - ofy;
++        if (x0 > x1)
++            std::swap(x0, x1);
++        if (y0 > y1)
++            std::swap(y0, y1);
++        const int spanX = std::max(1, x1 - x0);
++        const int spanY = std::max(1, y1 - y0);
++        const int unclippedX1 = x0 + spanX - 1;
++        const int unclippedY1 = y0 + spanY - 1;
++        if (unclippedX1 < ctx.scissor.x0 || x0 > ctx.scissor.x1 || unclippedY1 < ctx.scissor.y0 || y0 > ctx.scissor.y1)
++            return; // fully clipped: draws nothing, same as DrawSprite
++
++        g.kind = 0u;
++        g.minX = GSInternal::clampInt(x0, ctx.scissor.x0, ctx.scissor.x1);
++        g.minY = GSInternal::clampInt(y0, ctx.scissor.y0, ctx.scissor.y1);
++        g.maxX = GSInternal::clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
++        g.maxY = GSInternal::clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
++        g.unclippedX0 = x0;
++        g.unclippedY0 = y0;
++        g.spriteW = std::max(1.0f, static_cast<float>(spanX));
++        g.spriteH = std::max(1.0f, static_cast<float>(spanY));
++        if (state.prim.fst)
+         {
+-            dbgParsed = true;
+-            if (const char *env = std::getenv("PS2X_TRI_DEBUG"))
+-                std::sscanf(env, "%d,%d", &dbgX, &dbgY);
++            g.u0f = static_cast<float>(v0.u >> 4);
++            g.v0f = static_cast<float>(v0.v >> 4);
++            g.u1f = static_cast<float>(v1.u >> 4);
++            g.v1f = static_cast<float>(v1.v >> 4);
+         }
+-        if (dbgX >= 0)
++        else
+         {
+-            p.drawX0 = 1; // debug flag (sprite-only field)
+-            p.unclippedX0 = dbgX;
+-            p.unclippedY0 = dbgY;
+-            p.u0f = p.v0f = p.u1f = p.v1f = p.spriteW = p.spriteH = -777.0f;
+-            p.vertR = 0xDEAD0001u;
+-            p.vertG = 0xDEAD0002u;
+-            p.vertB = 0xDEAD0003u;
+-            p.vertA = 0xDEAD0004u;
+-            p.vertFog = 0xDEAD0005u;
+-            p.z1 = 0xDEADBEEFu;
+-            p.drawY1 = 0;
++            const float q0 = spriteFabsQ(v0.q);
++            const float q1 = spriteFabsQ(v1.q);
++            g.u0f = (v0.s / q0) * static_cast<float>(state.textureWidth);
++            g.v0f = (v0.t / q0) * static_cast<float>(state.textureHeight);
++            g.u1f = (v1.s / q1) * static_cast<float>(state.textureWidth);
++            g.v1f = (v1.t / q1) * static_cast<float>(state.textureHeight);
+         }
++        g.vertR = v1.r;
++        g.vertG = v1.g;
++        g.vertB = v1.b;
++        g.vertA = v1.a;
++        g.vertFog = v1.fog;
++        g.z1 = static_cast<uint32_t>(v1.z);
+     }
+-
+-    p.fx0 = fx0;
+-    p.fy0 = fy0;
+-    p.fx1 = fx1;
+-    p.fy1 = fy1;
+-    p.fx2 = fx2;
+-    p.fy2 = fy2;
+-    p.winding = (denom < 0.0f) ? -1.0f : 1.0f;
+-    p.invAbsDenom = 1.0f / std::fabs(denom);
+-    p.edgeA0 = fy1 - fy2;
+-    p.edgeA1 = fy2 - fy0;
+-    p.triMinX = minX;
+-    p.triMinY = minY;
+-    p.triMaxX = maxX;
+-    p.triMaxY = maxY;
+-
+-    p.attrR0 = static_cast<float>(v0.r);
+-    p.attrR1 = static_cast<float>(v1.r);
+-    p.attrR2 = static_cast<float>(v2.r);
+-    p.attrG0 = static_cast<float>(v0.g);
+-    p.attrG1 = static_cast<float>(v1.g);
+-    p.attrG2 = static_cast<float>(v2.g);
+-    p.attrB0 = static_cast<float>(v0.b);
+-    p.attrB1 = static_cast<float>(v1.b);
+-    p.attrB2 = static_cast<float>(v2.b);
+-    p.attrA0 = static_cast<float>(v0.a);
+-    p.attrA1 = static_cast<float>(v1.a);
+-    p.attrA2 = static_cast<float>(v2.a);
+-    if (state.prim.fst)
+-    {
+-        // FST interpolates the raw 4.12 fixed-point UVs (u16 widened to float).
+-        p.attrS0 = static_cast<float>(v0.u);
+-        p.attrS1 = static_cast<float>(v1.u);
+-        p.attrS2 = static_cast<float>(v2.u);
+-        p.attrT0 = static_cast<float>(v0.v);
+-        p.attrT1 = static_cast<float>(v1.v);
+-        p.attrT2 = static_cast<float>(v2.v);
++    else if ((type == GS_PRIM_TRIANGLE || type == GS_PRIM_TRISTRIP || type == GS_PRIM_TRIFAN) && batch.vertexCount == 3u &&
++             std::isfinite(v0.x + v0.y + v1.x + v1.y + v2.x + v2.y))
++    {
++        // DrawTriangle's coordinate setup with identical rounding.
++        const float fx0 = v0.x - static_cast<float>(ofx);
++        const float fy0 = v0.y - static_cast<float>(ofy);
++        const float fx1 = v1.x - static_cast<float>(ofx);
++        const float fy1 = v1.y - static_cast<float>(ofy);
++        const float fx2 = v2.x - static_cast<float>(ofx);
++        const float fy2 = v2.y - static_cast<float>(ofy);
++        const float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
++        if (std::fabs(denom) < 0.001f)
++            return; // degenerate: the CPU draws nothing
++
++        g.kind = 1u;
++        g.minX = GSInternal::clampInt(static_cast<int>(std::floor(std::min({fx0, fx1, fx2}))), ctx.scissor.x0, ctx.scissor.x1);
++        g.maxX = GSInternal::clampInt(static_cast<int>(std::ceil(std::max({fx0, fx1, fx2}))), ctx.scissor.x0, ctx.scissor.x1);
++        g.minY = GSInternal::clampInt(static_cast<int>(std::floor(std::min({fy0, fy1, fy2}))), ctx.scissor.y0, ctx.scissor.y1);
++        g.maxY = GSInternal::clampInt(static_cast<int>(std::ceil(std::max({fy0, fy1, fy2}))), ctx.scissor.y0, ctx.scissor.y1);
++        g.fx0 = fx0;
++        g.fy0 = fy0;
++        g.fx1 = fx1;
++        g.fy1 = fy1;
++        g.fx2 = fx2;
++        g.fy2 = fy2;
++        g.winding = (denom < 0.0f) ? -1.0f : 1.0f;
++        g.invAbsDenom = 1.0f / std::fabs(denom);
++        g.edgeA0 = fy1 - fy2;
++        g.edgeA1 = fy2 - fy0;
++        g.attrR0 = static_cast<float>(v0.r);
++        g.attrR1 = static_cast<float>(v1.r);
++        g.attrR2 = static_cast<float>(v2.r);
++        g.attrG0 = static_cast<float>(v0.g);
++        g.attrG1 = static_cast<float>(v1.g);
++        g.attrG2 = static_cast<float>(v2.g);
++        g.attrB0 = static_cast<float>(v0.b);
++        g.attrB1 = static_cast<float>(v1.b);
++        g.attrB2 = static_cast<float>(v2.b);
++        g.attrA0 = static_cast<float>(v0.a);
++        g.attrA1 = static_cast<float>(v1.a);
++        g.attrA2 = static_cast<float>(v2.a);
++        if (state.prim.fst)
++        {
++            // FST interpolates the raw 4.12 fixed-point UVs (u16 widened to float).
++            g.attrS0 = static_cast<float>(v0.u);
++            g.attrS1 = static_cast<float>(v1.u);
++            g.attrS2 = static_cast<float>(v2.u);
++            g.attrT0 = static_cast<float>(v0.v);
++            g.attrT1 = static_cast<float>(v1.v);
++            g.attrT2 = static_cast<float>(v2.v);
++        }
++        else
++        {
++            g.attrS0 = v0.s;
++            g.attrS1 = v1.s;
++            g.attrS2 = v2.s;
++            g.attrT0 = v0.t;
++            g.attrT1 = v1.t;
++            g.attrT2 = v2.t;
++            g.attrQ0 = v0.q;
++            g.attrQ1 = v1.q;
++            g.attrQ2 = v2.q;
++        }
++        g.attrFog0 = static_cast<float>(v0.fog);
++        g.attrFog1 = static_cast<float>(v1.fog);
++        g.attrFog2 = static_cast<float>(v2.fog);
++        g.triZ0 = v0.z;
++        g.triZ1 = v1.z;
++        g.triZ2 = v2.z;
+     }
+     else
+     {
+-        p.attrS0 = v0.s;
+-        p.attrS1 = v1.s;
+-        p.attrS2 = v2.s;
+-        p.attrT0 = v0.t;
+-        p.attrT1 = v1.t;
+-        p.attrT2 = v2.t;
+-        p.attrQ0 = v0.q;
+-        p.attrQ1 = v1.q;
+-        p.attrQ2 = v2.q;
+-    }
+-    p.attrFog0 = static_cast<float>(v0.fog);
+-    p.attrFog1 = static_cast<float>(v1.fog);
+-    p.attrFog2 = static_cast<float>(v2.fog);
+-    p.iip = state.prim.iip ? 1u : 0u;
+-    p.triZ0 = v0.z;
+-    p.triZ1 = v1.z;
+-    p.triZ2 = v2.z;
+-
+-    runRasterDispatch(batch, true, &p, sizeof(p),
+-                      static_cast<uint32_t>((maxX - minX) / 8 + 1),
+-                      static_cast<uint32_t>((maxY - minY) / 8 + 1),
+-                      "triangle");
+-}
+-
+-void GSVulkanBackend::flushRasterBatchLocked() const
+-{
+-    VkState &vk = *m_vk;
+-    if (!vk.batchOpen)
++        cpuDraw(batch);
+         return;
+-    // Mirror the current CLUT (widened u16 -> u32) for the indexed fetch path. Flush
+-    // points precede every LoadClut, so one mirror per batch sees the right palette.
+-    uint32_t *clutDst = static_cast<uint32_t *>(vk.clutMapped);
+-    const auto &clut = m_cpu.clutEntries();
+-    for (size_t i = 0; i < clut.size(); ++i)
+-        clutDst[i] = clut[i];
+-
+-    vkEndCommandBuffer(vk.commandBuffer);
+-    vkResetFences(vk.device, 1, &vk.fence);
+-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+-    si.commandBufferCount = 1;
+-    si.pCommandBuffers = &vk.commandBuffer;
+-    if (vkQueueSubmit(vk.queue, 1, &si, vk.fence) != VK_SUCCESS ||
+-        vkWaitForFences(vk.device, 1, &vk.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+-        std::cerr << "[gs-vulkan] raster batch submit/wait failed" << std::endl;
+-    vk.batchOpen = false;
+-    vk.batchCount = 0;
+-}
++    }
++    if (g.minX > g.maxX || g.minY > g.maxY)
++        return; // fully clipped: the CPU's loops run zero iterations
+ 
+-void GSVulkanBackend::flushRasterBatch() const
+-{
+-    if (!m_gpuOk || !m_vk)
++    PipeState p;
++    fillPipeState(p, state);
++    if (!haveState || std::memcmp(&p, &lastState, sizeof(p)) != 0)
++    {
++        lastState = p;
++        haveState = true;
++        info = analyzeState(p);
++        stateIndex = kNone;
++    }
++    if (!info.ok)
++    {
++        cpuDraw(batch);
+         return;
+-    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+-    flushRasterBatchLocked();
+-}
+-
+-uint32_t GSVulkanBackend::recordRasterDispatchLocked(bool useTrianglePipeline,
+-                                                     const void *params,
+-                                                     size_t paramsSize,
+-                                                     uint32_t groupsX,
+-                                                     uint32_t groupsY)
+-{
+-    VkState &vk = *m_vk;
+-    if (!vk.batchOpen)
+-    {
+-        vkResetCommandBuffer(vk.commandBuffer, 0);
+-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+-        if (vkBeginCommandBuffer(vk.commandBuffer, &bi) != VK_SUCCESS)
+-            return UINT32_MAX;
+-        vk.batchOpen = true;
+-        vk.batchCount = 0;
+     }
+-    if (vk.batchCount >= VkState::kParamsSlotCount)
++    if (batchGeoms != 0u && info.key != batchKey)
++        closeBatch();
++
++    // info.ok bounds the scissor, and with it the box, to 0..2047.
++    const TileBox box{static_cast<uint8_t>(g.minX >> 3), static_cast<uint8_t>(g.minY >> 3),
++                      static_cast<uint8_t>(g.maxX >> 3), static_cast<uint8_t>(g.maxY >> 3)};
++    const uint32_t entries = (box.x1 - box.x0 + 1u) * (box.y1 - box.y0 + 1u);
++    // Tile headers take at most three words per list word.
++    if (geoms.used == kMaxGeoms || states.used == kMaxStates || cluts.used == kClutSlots ||
++        tiles.used + 4u * (batchEntries + entries) > kTileWords)
++        waitIdle();
++
++    uint32_t clutBase = 0u;
++    if (p.tme != 0u && isOneOf(p.texPsm, {GS_PSM_T8, GS_PSM_T4, GS_PSM_T8H, GS_PSM_T4HL, GS_PSM_T4HH}))
++    {
++        const auto &clut = cpu->clutEntries();
++        auto slotWords = [&](uint32_t slot) { return reinterpret_cast<uint32_t *>(cluts.mapped) + slot * 512u; };
++        if (clutSlot == kNone || (clutStale && !std::equal(clut.begin(), clut.end(), slotWords(clutSlot))))
++        {
++            clutSlot = cluts.used++;
++            std::copy(clut.begin(), clut.end(), slotWords(clutSlot));
++        }
++        clutStale = false;
++        clutBase = clutSlot * 512u;
++    }
++    if (stateIndex == kNone || clutBase != stateClutBase)
+     {
+-        flushRasterBatchLocked();
+-        return recordRasterDispatchLocked(useTrianglePipeline, params, paramsSize, groupsX, groupsY);
++        p.clutBase = stateClutBase = clutBase;
++        stateIndex = states.used++;
++        std::memcpy(states.mapped + stateIndex * sizeof(PipeState), &p, sizeof(p));
++        ++stats.statesUsed;
+     }
+-    const uint32_t slotOffset = vk.batchCount * VkState::kParamsSlotStride;
+-    std::memcpy(static_cast<uint8_t *>(vk.paramsMapped) + slotOffset, params, paramsSize);
+-    vkCmdBindPipeline(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+-                      useTrianglePipeline ? vk.trianglePipeline : vk.rasterPipeline);
+-    vkCmdBindDescriptorSets(vk.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout,
+-                            0, 1, &vk.descriptorSet, 1, &slotOffset);
+-    vkCmdDispatch(vk.commandBuffer, groupsX, groupsY, 1);
+-    // Serialize against the next dispatch: z-test/blending/texture-fetch read VRAM
+-    // written by earlier primitives in the same batch.
+-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+-    vkCmdPipelineBarrier(vk.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+-    ++vk.batchCount;
+-    return slotOffset;
++    g.state = stateIndex;
++    std::memcpy(geoms.mapped + geoms.used++ * sizeof(Geom), &g, sizeof(g));
++    boxes.push_back(box);
++    batchEntries += entries;
++    batchKey = info.key;
++    batchTarget |= info.target;
++    batchPages |= info.pages;
++    if (++batchGeoms >= kBatchPrims)
++        closeBatch();
+ }
+ 
+-void GSVulkanBackend::runRasterDispatch(const GSPrimitiveBatch &batch,
+-                                        bool useTrianglePipeline,
+-                                        const void *params,
+-                                        size_t paramsSize,
+-                                        uint32_t groupsX,
+-                                        uint32_t groupsY,
+-                                        const char *tag)
++bool GSVulkanBackend::gpuCopyFrame(const GSFrameReg &frame,
++                                   uint32_t width,
++                                   uint32_t height,
++                                   std::vector<uint8_t> &outPixels,
++                                   bool preserveAlpha,
++                                   bool frameBaseIsPages,
++                                   uint32_t sourceOriginX,
++                                   uint32_t sourceOriginY)
+ {
+-    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    // Mirrors GSCpuBackend::CopyFrameToHostRgba with useLocalMemoryLayout=true.
++    outPixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
++    if (frame.psm != GS_PSM_CT32 && frame.psm != GS_PSM_CT24 && frame.psm != GS_PSM_CT16 && frame.psm != GS_PSM_CT16S)
++    {
++        outPixels.clear();
++        return false;
++    }
++
+     VkState &vk = *m_vk;
++    PresentPushConstants pc{};
++    pc.basePtr = frameBaseIsPages ? GSInternal::framePageBaseToBlock(frame.fbp) : frame.fbp;
++    pc.fbw = frame.fbw ? frame.fbw : kHostFrameWidth / 64u;
++    pc.psm = frame.psm;
++    pc.width = width;
++    pc.height = height;
++    pc.originX = sourceOriginX;
++    pc.originY = sourceOriginY;
++    pc.flags = preserveAlpha ? 1u : 0u;
++    pc.wordMask = static_cast<uint32_t>(vk.vramBufferSize / 4u - 1u);
++    pc.byteMask16 = static_cast<uint32_t>(vk.vramBufferSize - 2u);
+ 
+-    static uint64_t dbgDispatchIndex = 0;
+-    const uint64_t thisDispatch = dbgDispatchIndex++;
++    vk.closeBatch();
++    vk.stageCpuDirty();
++    const VkCommandBuffer cb = vk.command();
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipeline);
++    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 0, nullptr);
++    vkCmdPushConstants(cb, vk.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
++    vkCmdDispatch(cb, (kHostFrameWidth * kHostFrameHeight + 63u) / 64u, 1, 1);
++    vk.drain();
+ 
+-    // Triangle debug writeback (PS2X_TRI_DEBUG) forces the immediate path so the
+-    // shader's per-pixel writeback is readable right after the dispatch.
+-    static const bool triDebug = []()
+-    {
+-        const char *env = std::getenv("PS2X_TRI_DEBUG");
+-        return env != nullptr && *env != '\0';
+-    }();
++    std::memcpy(outPixels.data(), vk.outMapped, outPixels.size());
++    return true;
++}
+ 
+-    // Fast path: record into the open batch; submitted at the next flush point.
+-    if (!m_rasterVerify && !(useTrianglePipeline && triDebug))
++PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &request)
++{
++    // Mirrors GSCpuBackend::PresentFromLocalMemory, with CopyFrameToHostRgba on the GPU.
++    PresentationFrame result{};
++    const GSPmodeState pmode = decodePmode(request.pmode);
++    const GSSmode2State smode2 = decodeSMode2(request.smode2);
++    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
++    const bool oddField = (request.vsyncTick & 1ull) != 0ull;
++    const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
++    const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
++    const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
++    const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
++    uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
++    decodeDisplaySize(request.display1, width1, height1);
++    decodeDisplaySize(request.display2, width2, height2);
++    const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
++    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
++    if (!valid1 && !valid2)
++        return result;
++
++    auto copySource = [&](const GSFrameReg &displayFrame,
++                          const GSDisplayReadOrigin &origin,
++                          uint32_t width,
++                          uint32_t height,
++                          bool allowPreferred,
++                          bool preserveAlpha,
++                          GSFrameReg &selected,
++                          std::vector<uint8_t> &pixels,
++                          bool &usedPreferred) -> bool
+     {
+-        if (recordRasterDispatchLocked(useTrianglePipeline, params, paramsSize, groupsX, groupsY) == UINT32_MAX)
++        selected = displayFrame;
++        pixels.clear();
++        usedPreferred = false;
++        if (allowPreferred && request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp &&
++            (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp) &&
++            gpuCopyFrame(request.preferredSource, width, height, pixels, preserveAlpha, false, 0u, 0u))
+         {
+-            flushRasterBatchLocked();
+-            m_cpu.Submit(batch);
++            selected = request.preferredSource;
++            usedPreferred = true;
+         }
+-        return;
+-    }
+-
+-    // Verify/debug path: run this one dispatch immediately (submit + wait).
+-    flushRasterBatchLocked(); // drain anything pending first
+-    std::vector<uint8_t> before;
+-    if (m_rasterVerify)
+-    {
+-        before.resize(static_cast<size_t>(vk.vramBufferSize));
+-        std::memcpy(before.data(), vk.vramMapped, before.size());
+-    }
+-
+-    // Re-run of this single dispatch (also used by the dev-only nondeterminism
+-    // probe below): record into a fresh batch and flush it.
+-    auto recordSubmitWait = [&]() -> bool
+-    {
+-        if (recordRasterDispatchLocked(useTrianglePipeline, params, paramsSize, groupsX, groupsY) == UINT32_MAX)
++        if (pixels.empty() && !gpuCopyFrame(displayFrame, width, height, pixels, preserveAlpha, true, origin.x, origin.y))
+             return false;
+-        flushRasterBatchLocked();
+-        return true; // flush logs submit/wait failures itself
+-    };
+-
+-    const uint32_t slotOffset = recordRasterDispatchLocked(useTrianglePipeline, params, paramsSize, groupsX, groupsY);
+-    if (slotOffset == UINT32_MAX)
+-    {
+-        std::cerr << "[gs-vulkan] " << tag << " dispatch failed, CPU fallback for this primitive" << std::endl;
+-        m_cpu.Submit(batch);
+-        return;
+-    }
+-    flushRasterBatchLocked();
+ 
+-    // TRI_DEBUG (dev-only): print the shader's per-pixel writeback.
+-    if (useTrianglePipeline)
+-    {
+-        const SpriteParams &dp = *static_cast<const SpriteParams *>(params);
+-        if (dp.drawX0 == 1)
++        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
+         {
+-            const SpriteParams &sp = *reinterpret_cast<const SpriteParams *>(
+-                static_cast<const uint8_t *>(vk.paramsMapped) + slotOffset);
+-            std::cerr << "[gpu-tri] d=" << thisDispatch
+-                      << " px=(" << dp.unclippedX0 << "," << dp.unclippedY0 << ")"
+-                      << std::hexfloat
+-                      << " w0=" << sp.u0f << " w1=" << sp.v0f << " w2=" << sp.u1f
+-                      << " st=" << sp.spriteW << "," << sp.spriteH << " q=" << sp.v1f
+-                      << std::defaultfloat
+-                      << " iu=" << sp.vertG << " iv=" << sp.vertB
+-                      << " wrapped=(" << (sp.drawX1 & 0xFFFF) << "," << ((sp.drawX1 >> 16) & 0xFFFF) << ")"
+-                      << " raw=0x" << std::hex << static_cast<uint32_t>(sp.drawY0) << std::dec
+-                      << " texel=0x" << std::hex << sp.vertR << std::dec
+-                      << " a=" << sp.vertA << " fog=" << sp.vertFog
+-                      << " z=0x" << std::hex << sp.z1 << std::dec
+-                      << " marks=" << std::hex << sp.vertG << "/" << sp.drawY1 << std::dec
+-                      << std::endl;
++            for (const GSFrameReg &candidate : request.contextFrames)
++            {
++                if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
++                    continue;
++                std::vector<uint8_t> candidatePixels;
++                if (!gpuCopyFrame(candidate, width, height, candidatePixels, preserveAlpha, true, 0u, 0u))
++                    continue;
++                if (countNonBlackPixels(candidatePixels, width, height) == 0u)
++                    continue;
++                selected = candidate;
++                pixels.swap(candidatePixels);
++                break;
++            }
+         }
+-    }
++        return true;
++    };
+ 
+-    if (m_rasterVerify)
++    if (valid1 && valid2)
+     {
+-        std::vector<uint8_t> gpuResult(static_cast<size_t>(vk.vramBufferSize));
+-        std::memcpy(gpuResult.data(), vk.vramMapped, gpuResult.size());
+-        std::memcpy(vk.vramMapped, before.data(), before.size());
+-        m_cpu.Submit(batch);
+-        const uint8_t *cpuResult = static_cast<const uint8_t *>(vk.vramMapped);
+-        uint64_t diffBytes = 0, firstDiff = UINT64_MAX;
+-        for (size_t i = 0; i < gpuResult.size(); ++i)
+-            if (gpuResult[i] != cpuResult[i])
+-            {
+-                ++diffBytes;
+-                if (firstDiff == UINT64_MAX)
+-                    firstDiff = i;
+-            }
+-        static uint64_t checks = 0, mismatches = 0, triChecks = 0;
+-        ++checks;
+-        if (tag[0] == 't')
+-            ++triChecks;
+-        if (diffBytes != 0)
++        GSFrameReg selected1{}, selected2{};
++        std::vector<uint8_t> crt1, crt2;
++        bool preferred1 = false, preferred2 = false;
++        if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
++            copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
+         {
+-            ++mismatches;
+-            const SpriteParams &p = *static_cast<const SpriteParams *>(params);
+-            std::cerr << "[gs-vulkan-raster-verify] MISMATCH " << tag << " #" << mismatches << "/" << checks
+-                      << " d=" << thisDispatch
+-                      << " diffBytes=" << diffBytes << " first=0x" << std::hex << firstDiff << std::dec
+-                      << " fbp=0x" << std::hex << p.fbp << " fpsm=" << p.fpsm << " zpsm=" << p.zpsm
+-                      << " tme=" << p.tme << " texPsm=" << p.texPsm << " fst=" << p.fst
+-                      << " linear=" << p.linear << " testLo=0x" << std::hex << p.testLo << std::dec
+-                      << " abe=" << p.abe << " fge=" << p.fge
+-                      << std::endl;
+-            if (tag[0] == 't')
+-            {
+-                std::cerr << "   [tri] f=(" << p.fx0 << "," << p.fy0 << ")-(" << p.fx1 << "," << p.fy1
+-                          << ")-(" << p.fx2 << "," << p.fy2 << ") winding=" << p.winding
+-                          << " invAbsDenom=" << p.invAbsDenom << " iip=" << p.iip
+-                          << " bbox=(" << p.triMinX << "," << p.triMinY << ")-(" << p.triMaxX << "," << p.triMaxY << ")"
+-                          << " texW=" << p.texW << " texH=" << p.texH << " tbp0=0x" << std::hex << p.tbp0
+-                          << " tbw=" << std::dec << p.tbw << " wrap=" << p.wrapU << "/" << p.wrapV
+-                          << " minmaxU=" << p.minU << "-" << p.maxU << " minmaxV=" << p.minV << "-" << p.maxV
+-                          << " tfx=" << p.tfx << " tcc=" << p.tcc << " cpsm=" << p.cpsm
+-                          << std::endl;
+-                std::cerr << "   [tri] S=(" << p.attrS0 << "," << p.attrS1 << "," << p.attrS2 << ")"
+-                          << " T=(" << p.attrT0 << "," << p.attrT1 << "," << p.attrT2 << ")"
+-                          << " Q=(" << p.attrQ0 << "," << p.attrQ1 << "," << p.attrQ2 << ")"
+-                          << " RGB0=(" << p.attrR0 << "," << p.attrG0 << "," << p.attrB0 << "," << p.attrA0 << ")"
+-                          << " RGB2=(" << p.attrR2 << "," << p.attrG2 << "," << p.attrB2 << "," << p.attrA2 << ")"
+-                          << " Z=(" << double(p.triZ0) << "," << double(p.triZ1) << "," << double(p.triZ2) << ")"
+-                          << std::endl;
+-            }
+-            if (mismatches <= 3)
+-            {
+-                // pixel-level detail: scan frame and z buffers with the PS2 swizzled layout
+-                const uint32_t scanW = std::min(p.fbw * 64u, 2048u);
+-                uint32_t shown = 0;
+-                for (uint32_t y = 0; y < 512 && shown < 8; ++y)
+-                    for (uint32_t x = 0; x < scanW && shown < 8; ++x)
+-                    {
+-                        const uint32_t gp = GSMem::ReadPixel(gpuResult.data(), p.fpsm, p.fbp, p.fbw, x, y);
+-                        const uint32_t cp = GSMem::ReadPixel(cpuResult, p.fpsm, p.fbp, p.fbw, x, y);
+-                        if (gp != cp)
+-                        {
+-                            std::cerr << "   [fdiff] frame (" << x << "," << y << ") gpu=0x" << std::hex << gp
+-                                      << " cpu=0x" << cp << std::dec << std::endl;
+-                            ++shown;
+-                        }
+-                    }
+-                shown = 0;
+-                for (uint32_t y = 0; y < 512 && shown < 4; ++y)
+-                    for (uint32_t x = 0; x < scanW && shown < 4; ++x)
+-                    {
+-                        const uint32_t gp = GSMem::ReadPixel(gpuResult.data(), p.zpsm, p.zbp, p.fbw, x, y);
+-                        const uint32_t cp = GSMem::ReadPixel(cpuResult, p.zpsm, p.zbp, p.fbw, x, y);
+-                        if (gp != cp)
+-                        {
+-                            std::cerr << "   [fdiff] zbuf (" << x << "," << y << ") gpu=0x" << std::hex << gp
+-                                      << " cpu=0x" << cp << std::dec << std::endl;
+-                            ++shown;
+-                        }
+-                    }
+-            }
+-            if (mismatches <= 5)
+-            {
+-                // Nondeterminism probe: re-run BOTH sides from the same 'before'
+-                // state and check whether either one flips its own result.
+-                const size_t sz = static_cast<size_t>(vk.vramBufferSize);
+-                std::vector<uint8_t> cpu1(cpuResult, cpuResult + sz);
+-                std::vector<uint8_t> gpu2(sz), cpu2(sz);
+-                std::memcpy(vk.vramMapped, before.data(), sz);
+-                if (recordSubmitWait())
+-                    std::memcpy(gpu2.data(), vk.vramMapped, sz);
+-                std::memcpy(vk.vramMapped, before.data(), sz);
+-                m_cpu.Submit(batch);
+-                std::memcpy(cpu2.data(), vk.vramMapped, sz);
+-                std::memcpy(vk.vramMapped, cpu1.data(), sz); // leave VRAM at CPU result
+-                uint64_t gpuFlip = 0, cpuFlip = 0, gpu2VsCpu = 0;
+-                for (size_t i = 0; i < sz; ++i)
++            result.width = std::max(width1, width2);
++            result.height = std::max(height1, height2);
++            result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
++            const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
++            const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
++            const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
++            for (uint32_t y = 0; y < result.height; ++y)
++                for (uint32_t x = 0; x < result.width; ++x)
++                {
++                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
++                    dst[0] = bgR;
++                    dst[1] = bgG;
++                    dst[2] = bgB;
++                    dst[3] = pmode.alp;
++                }
++            if (!pmode.slbg)
++                for (uint32_t y = 0; y < height2; ++y)
++                    std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
++            for (uint32_t y = 0; y < height1; ++y)
++                for (uint32_t x = 0; x < width1; ++x)
+                 {
+-                    if (gpuResult[i] != gpu2[i]) ++gpuFlip;
+-                    if (cpu1[i] != cpu2[i]) ++cpuFlip;
+-                    if (gpu2[i] != cpu2[i]) ++gpu2VsCpu;
++                    const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
++                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
++                    const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
++                    dst[0] = blendPresentationChannel(src[0], dst[0], factor);
++                    dst[1] = blendPresentationChannel(src[1], dst[1], factor);
++                    dst[2] = blendPresentationChannel(src[2], dst[2], factor);
++                    dst[3] = pmode.amod ? dst[3] : src[3];
+                 }
+-                std::cerr << "   [nondet] gpuRerunDiff=" << gpuFlip
+-                          << " cpuRerunDiff=" << cpuFlip
+-                          << " gpu2VsCpu2=" << gpu2VsCpu << std::endl;
+-            }
+-        }
+-        else if (checks % 500 == 0)
+-        {
+-            std::cerr << "[gs-vulkan-raster-verify] " << checks << " dispatches (" << triChecks << " triangles), all identical so far" << std::endl;
++            normalizePresentationAlpha(result.pixels, result.width, result.height);
++            if (fieldMode)
++                applyFieldPresentation(result.pixels, result.width, result.height, oddField);
++            result.displayFbp = displayFrame1.fbp;
++            result.sourceFbp = selected1.fbp;
++            debugDumpFrame(result);
++            return result;
+         }
+-        // VRAM now holds the CPU result (authoritative during verify).
+     }
++
++    const GSFrameReg &displayFrame = valid1 ? displayFrame1 : displayFrame2;
++    const GSDisplayReadOrigin &origin = valid1 ? origin1 : origin2;
++    result.width = valid1 ? width1 : width2;
++    result.height = valid1 ? height1 : height2;
++    GSFrameReg selected = displayFrame;
++    if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
++        return {};
++    if (fieldMode)
++        applyFieldPresentation(result.pixels, result.width, result.height, oddField);
++    normalizePresentationAlpha(result.pixels, result.width, result.height);
++    result.displayFbp = displayFrame.fbp;
++    result.sourceFbp = selected.fbp;
++    debugDumpFrame(result);
++    return result;
+ }
+ 
+ #else // !PS2X_HAS_VULKAN — no Vulkan in this build: everything stays on the CPU backend.
+ 
+ struct GSVulkanBackend::VkState
+ {
++    void syncToCpu() {}
++    void flush() {}
++    void cpuWroteAll() {}
++    void draw(const GSPrimitiveBatch &) {}
++    void loadClut(const GSTex0Reg &, const GSTexClutReg &) {}
++    void beginTransfer(const GSTransferCommand &) {}
++    void beforeUpload() {}
++    void beforeWrite(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}
++    void printStats() {}
+ };
+ 
+ bool GSVulkanBackend::initVulkan()
+@@ -1374,6 +1532,7 @@ bool GSVulkanBackend::initVulkan()
+ 
+ void GSVulkanBackend::shutdownVulkan()
+ {
++    m_vk.reset();
+ }
+ 
+ bool GSVulkanBackend::gpuCopyFrame(const GSFrameReg &, uint32_t, uint32_t, std::vector<uint8_t> &, bool, bool, uint32_t, uint32_t)
+@@ -1381,46 +1540,24 @@ bool GSVulkanBackend::gpuCopyFrame(const GSFrameReg &, uint32_t, uint32_t, std::
+     return false;
+ }
+ 
+-void GSVulkanBackend::submitSpriteGpu(const GSPrimitiveBatch &batch)
+-{
+-    m_cpu.Submit(batch);
+-}
+-
+-void GSVulkanBackend::submitTriangleGpu(const GSPrimitiveBatch &batch)
+-{
+-    m_cpu.Submit(batch);
+-}
+-
+ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &)
+ {
+     return {};
+ }
+ 
+-uint32_t GSVulkanBackend::recordRasterDispatchLocked(bool, const void *, size_t, uint32_t, uint32_t)
+-{
+-    return 0;
+-}
+-
+-void GSVulkanBackend::flushRasterBatchLocked() const
+-{
+-}
+-
+-void GSVulkanBackend::flushRasterBatch() const
+-{
+-}
+-
+ #endif // PS2X_HAS_VULKAN
+ 
+ GSVulkanBackend::GSVulkanBackend()
+ {
+     m_gpuPresent = std::getenv("PS2X_VK_PRESENT") != nullptr;
+     m_gpuRaster = std::getenv("PS2X_VK_RASTER") != nullptr;
+-    m_rasterVerify = std::getenv("PS2X_VK_RASTER_VERIFY") != nullptr;
+     m_gpuOk = initVulkan();
+     if (!m_gpuOk)
+         shutdownVulkan();
+ #if defined(PS2X_HAS_VULKAN)
+-    m_gpuTriangles = m_gpuOk && m_vk && m_vk->trianglePipeline != VK_NULL_HANDLE;
++    m_gpuRaster = m_gpuRaster && m_gpuOk && m_vk->rasterPipeline != VK_NULL_HANDLE;
++#else
++    m_gpuRaster = false;
+ #endif
+ }
+ 
+@@ -1431,20 +1568,19 @@ GSVulkanBackend::~GSVulkanBackend()
+ 
+ void GSVulkanBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ {
+-    if (m_gpuOk && m_vk && m_vk->vramMapped && vramSize <= m_vk->vramBufferSize)
++#if defined(PS2X_HAS_VULKAN)
++    if (m_gpuOk && vramSize <= m_vk->vramBufferSize)
+     {
+         std::memcpy(m_vk->vramMapped, vram, vramSize);
+-        m_cpu.Initialize(static_cast<uint8_t *>(m_vk->vramMapped), vramSize);
+-    }
+-    else
+-    {
+-        if (m_gpuOk)
+-        {
+-            std::cerr << "[gs-vulkan] VRAM size mismatch, CPU fallback" << std::endl;
+-            m_gpuOk = false;
+-        }
+-        m_cpu.Initialize(vram, vramSize);
++        m_vk->cpuWroteAll();
++        m_cpu.Initialize(m_vk->vramMapped, vramSize);
++        return;
+     }
++#endif
++    if (m_gpuOk)
++        std::cerr << "[gs-vulkan] VRAM size mismatch, CPU fallback" << std::endl;
++    m_gpuOk = m_gpuRaster = false;
++    m_cpu.Initialize(vram, vramSize);
+ }
+ 
+ void GSVulkanBackend::Reset()
+@@ -1454,73 +1590,61 @@ void GSVulkanBackend::Reset()
+ 
+ void GSVulkanBackend::Submit(const GSPrimitiveBatch &batch)
+ {
+-    if (m_gpuOk && m_gpuRaster)
+-    {
+-        if (batch.vertexCount == 2 && batch.state.prim.type == GS_PRIM_SPRITE)
+-        {
+-            submitSpriteGpu(batch);
+-            return;
+-        }
+-        if (m_gpuTriangles && batch.vertexCount == 3 && batch.state.prim.type == GS_PRIM_TRIANGLE)
+-        {
+-            submitTriangleGpu(batch);
+-            return;
+-        }
+-    }
+-    flushRasterBatch(); // CPU fallback draws must see all pending GPU work first
+-    m_cpu.Submit(batch);
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++        m_vk->draw(batch);
++    else
++        m_cpu.Submit(batch);
+ }
+ 
+ void GSVulkanBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+-    flushRasterBatch(); // batched dispatches mirror the CLUT at flush time
+-    m_cpu.LoadClut(tex0, texclut);
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++        m_vk->loadClut(tex0, texclut);
++    else
++        m_cpu.LoadClut(tex0, texclut);
+ }
+ 
+ void GSVulkanBackend::SubmitMany(const GSDrawStep *steps, size_t count)
+ {
+-    // The async backend coalesces consecutive draws into SubmitMany, so this is where
+-    // sprites actually arrive. Run the steps in order, GPU-rasterizing sprites.
+-    if (!(m_gpuOk && m_gpuRaster))
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (!m_gpuRaster)
+     {
+         m_cpu.SubmitMany(steps, count);
+         return;
+     }
+     for (size_t i = 0; i < count; ++i)
+     {
+-        if (!steps[i].draw)
+-        {
+-            flushRasterBatch(); // LoadClut must not change the CLUT under a pending batch
+-            m_cpu.LoadClut(steps[i].tex0, steps[i].texclut);
+-            continue;
+-        }
+-        const GSPrimitiveBatch &batch = *steps[i].draw;
+-        if (batch.vertexCount == 2 && batch.state.prim.type == GS_PRIM_SPRITE)
+-            submitSpriteGpu(batch);
+-        else if (m_gpuTriangles && batch.vertexCount == 3 && batch.state.prim.type == GS_PRIM_TRIANGLE)
+-            submitTriangleGpu(batch);
++        if (steps[i].draw)
++            m_vk->draw(*steps[i].draw);
+         else
+-        {
+-            flushRasterBatch();
+-            m_cpu.Submit(batch);
+-        }
++            m_vk->loadClut(steps[i].tex0, steps[i].texclut);
+     }
+ }
+ 
+ void GSVulkanBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+-    m_cpu.BeginTransfer(command);
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++        m_vk->beginTransfer(command);
++    else
++        m_cpu.BeginTransfer(command);
+ }
+ 
+ void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+-    flushRasterBatch(); // the upload must not overwrite VRAM pending GPU draws still sample
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++        m_vk->beforeUpload();
+     m_cpu.UploadImage(data, sizeBytes);
+ }
+ 
+ void GSVulkanBackend::Flush()
+ {
+-    flushRasterBatch();
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++        m_vk->flush(); // start the GPU on what is recorded; nobody waits for it here
+     m_cpu.Flush();
+ }
+ 
+@@ -1531,16 +1655,20 @@ void GSVulkanBackend::TextureFlush()
+ 
+ void GSVulkanBackend::Sync(GSSyncReason reason)
+ {
+-    flushRasterBatch();
++    // Every reader of VRAM goes through a method below that syncs for itself.
++    Flush();
+     m_cpu.Sync(reason);
+ }
+ 
+ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
+ {
+     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+-    flushRasterBatchLocked();
++    if (m_gpuOk)
++        m_vk->printStats();
+     if (m_gpuOk && m_gpuPresent)
+     {
++        if (!m_gpuRaster)
++            m_vk->cpuWroteAll(); // the CPU backend drew, untracked
+ #if defined(PS2X_HAS_VULKAN)
+         // TEMP-DEBUG(mhrs): PS2X_VK_PRESENT_VERIFY=1 runs both paths on the same VRAM
+         // contents and reports pixel differences (deterministic deswizzle A/B).
+@@ -1548,6 +1676,8 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
+         if (verify)
+         {
+             PresentationFrame gpuFrame = presentGpu(request);
++            if (m_gpuRaster)
++                m_vk->syncToCpu();
+             PresentationFrame cpuFrame = m_cpu.Present(request);
+             static uint64_t checks = 0, mismatches = 0;
+             ++checks;
+@@ -1583,36 +1713,48 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
+ #endif
+         return presentGpu(request);
+     }
++    if (m_gpuRaster)
++        m_vk->syncToCpu();
+     return m_cpu.Present(request);
+ }
+ 
+ bool GSVulkanBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
+-    flushRasterBatch();
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++    {
++        m_vk->syncToCpu();
++        m_vk->cpuWroteAll();
++    }
+     return m_cpu.ClearFramebuffer(context, rgba);
+ }
+ 
+ uint32_t GSVulkanBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+-    flushRasterBatch();
+-    return m_cpu.ConsumeLocalToHostBytes(dst, maxBytes);
++    return m_cpu.ConsumeLocalToHostBytes(dst, maxBytes); // read out of VRAM at BeginTransfer
+ }
+ 
+ uint32_t GSVulkanBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
+-    flushRasterBatch();
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++        m_vk->syncToCpu();
+     return m_cpu.ReadVram(psm, base, bw, x, y);
+ }
+ 
+ void GSVulkanBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+-    flushRasterBatch(); // keep program order between pending GPU draws and host writes
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++        m_vk->beforeWrite(psm, base, bw, x, y);
+     m_cpu.WriteVram(psm, base, bw, x, y, value);
+ }
+ 
+ void GSVulkanBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
+-    flushRasterBatch();
++    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
++    if (m_gpuRaster)
++        m_vk->syncToCpu();
+     m_cpu.SnapshotVram(out);
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_raster_common.glsl b/ps2xRuntime/src/lib/gs/shaders/gs_raster_common.glsl
+index 6e5e6c3..6d4e2d0 100755
+--- a/ps2xRuntime/src/lib/gs/shaders/gs_raster_common.glsl
++++ b/ps2xRuntime/src/lib/gs/shaders/gs_raster_common.glsl
+@@ -1,42 +1,26 @@
+-// Shared rasterizer core for the Vulkan GS backend (included by raster_sprite.comp and
+-// raster_triangle.comp): swizzled GS VRAM access, texture sampling, texture combine and
+-// the WritePixelFast pixel pipeline, ported from gs_cpu_backend.cpp. Invocations within a
+-// dispatch never touch the same pixel, and dispatches are serialized, so plain
+-// loads/stores are sufficient. Requires `#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable`
+-// in the including shader (triangle Z interpolation is double precision, like the CPU).
++// Shared rasterizer core for the Vulkan GS backend (included by raster_batch.comp): swizzled
++// GS VRAM access, texture sampling, texture combine and the WritePixelFast pixel pipeline,
++// ported from gs_cpu_backend.cpp. One invocation owns one frame pixel for a whole batch and
++// applies the batch primitives to it in draw order, so plain loads/stores are sufficient
++// (16/24-bit formats share words between pixels and use atomics). Requires
++// `#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable` in the including
++// shader (triangle Z interpolation is double precision, like the CPU).
+ 
+ layout(set = 0, binding = 0, std430) buffer Vram
+ {
+     uint vram[];
+ };
+ 
+-// CPU backend's 512-entry u16 CLUT, widened to uint per entry.
++// Snapshots of the CPU backend's 512-entry u16 CLUT, widened to uint per entry; a state
++// names its snapshot with clutBase.
+ layout(set = 0, binding = 2, std430) readonly buffer Clut
+ {
+     uint clut[];
+ };
+ 
+-layout(set = 0, binding = 3, std430) buffer Params
++// Draw state shared by a run of primitives. Matches PipeState in gs_vulkan_backend.cpp.
++struct PipeState
+ {
+-    // sprite geometry (CPU-precomputed, matches DrawSprite)
+-    int drawX0;
+-    int drawY0;
+-    int drawX1;
+-    int drawY1;
+-    int unclippedX0;
+-    int unclippedY0;
+-    float spriteW;
+-    float spriteH;
+-    float u0f;
+-    float v0f;
+-    float u1f;
+-    float v1f;
+-    uint vertR;
+-    uint vertG;
+-    uint vertB;
+-    uint vertA;
+-    uint vertFog;
+-    uint z1;
+     // pixel pipe (matches MakePixelPipe)
+     int sx0;
+     int sx1;
+@@ -77,7 +61,7 @@ layout(set = 0, binding = 3, std430) buffer Params
+     uint minV;
+     uint maxV;
+     uint texPsm;
+-    uint tbp0;  // blocks
++    uint tbp0;
+     uint tbw;
+     uint tcc;
+     uint tfx;
+@@ -87,7 +71,35 @@ layout(set = 0, binding = 3, std430) buffer Params
+     uint cpsm;
+     uint csm;
+     uint csa;
+-    // triangle extension (raster_triangle.comp only; matches DrawTriangle)
++    uint iip;
++    uint clutBase; // first entry of this state's CLUT snapshot in clut[]
++};
++
++// One primitive. Matches Geom in gs_vulkan_backend.cpp.
++struct Geom
++{
++    uint kind;  // 0 sprite, 1 triangle
++    uint state; // index into states[]
++    int minX;   // pixels the primitive may touch (scissor applied)
++    int minY;
++    int maxX;
++    int maxY;
++    // sprite (CPU-precomputed, matches DrawSprite)
++    int unclippedX0;
++    int unclippedY0;
++    float spriteW;
++    float spriteH;
++    float u0f;
++    float v0f;
++    float u1f;
++    float v1f;
++    uint vertR;
++    uint vertG;
++    uint vertB;
++    uint vertA;
++    uint vertFog;
++    uint z1;
++    // triangle (matches DrawTriangle)
+     float fx0;
+     float fy0;
+     float fx1;
+@@ -98,10 +110,6 @@ layout(set = 0, binding = 3, std430) buffer Params
+     float invAbsDenom;
+     float edgeA0; // fy1 - fy2
+     float edgeA1; // fy2 - fy0
+-    int triMinX;
+-    int triMinY;
+-    int triMaxX;
+-    int triMaxY;
+     float attrR0;
+     float attrR1;
+     float attrR2;
+@@ -126,12 +134,31 @@ layout(set = 0, binding = 3, std430) buffer Params
+     float attrFog0;
+     float attrFog1;
+     float attrFog2;
+-    uint iip;
+-    uint pad0; // keep the doubles below 8-byte aligned in std430
+     float64_t triZ0;
+     float64_t triZ1;
+     float64_t triZ2;
+-} pr;
++};
++
++layout(set = 0, binding = 3, std430) readonly buffer States
++{
++    PipeState states[];
++};
++
++layout(set = 0, binding = 4, std430) readonly buffer Geoms
++{
++    Geom geoms[];
++};
++
++// Per batch: tile headers (key, first list word, count), then the tile lists of geom indices.
++layout(set = 0, binding = 5, std430) readonly buffer Tiles
++{
++    uint tiles[];
++};
++
++uint stateIndex; // state and primitive the invocation is working on
++uint geomIndex;
++#define pr states[stateIndex]
++#define gm geoms[geomIndex]
+ 
+ const uint WORD_MASK = 0xFFFFFu;   // (4MB / 4) - 1
+ 
+@@ -489,16 +516,16 @@ uint lookupClut(uint index)
+ 
+     if (pr.cpsm == PSM_CT32)
+     {
+-        const uint raw = clut[clutIndex] | (clut[clutIndex + 256u] << 16u);
++        const uint raw = clut[pr.clutBase + clutIndex] | (clut[pr.clutBase + clutIndex + 256u] << 16u);
+         return applyTexa(pr.cpsm, raw);
+     }
+     if (pr.cpsm == PSM_CT24)
+     {
+-        const uint raw = clut[clutIndex] | (clut[clutIndex + 256u] << 16u);
++        const uint raw = clut[pr.clutBase + clutIndex] | (clut[pr.clutBase + clutIndex + 256u] << 16u);
+         return applyTexa(pr.cpsm, raw & 0x00FFFFFFu);
+     }
+     if (sixteenBit)
+-        return applyTexa(pr.cpsm, rgba5551to8888(clut[clutIndex]));
++        return applyTexa(pr.cpsm, rgba5551to8888(clut[pr.clutBase + clutIndex]));
+     return 0xFFFF00FFu;
+ }
+ 
+@@ -541,20 +568,14 @@ uint lerpTexels(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
+     return outv;
+ }
+ 
+-uint samplePoint(float texUf, float texVf, int su, int sv, bool dbgPix)
++uint samplePoint(int su, int sv)
+ {
+     const int sampleU = wrapTextureCoordinate(su, pr.texW, pr.wrapU, pr.minU, pr.maxU);
+     const int sampleV = wrapTextureCoordinate(sv, pr.texH, pr.wrapV, pr.minV, pr.maxV);
+-    if (dbgPix)
+-    {
+-        // TRI_DEBUG: stash wrapped coords + raw fetch into spare sprite slots.
+-        pr.drawX1 = sampleU | (sampleV << 16);
+-        pr.drawY0 = int(readPixel(pr.texPsm, pr.tbp0, pr.tbw, uint(sampleU), uint(sampleV)));
+-    }
+     return fetchTexel(sampleU, sampleV);
+ }
+ 
+-uint sampleTexture(float s, float t, float q, uint u, uint v, bool dbgPix)
++uint sampleTexture(float s, float t, float q, uint u, uint v)
+ {
+     precise float texUf, texVf;
+     if (pr.fst != 0u)
+@@ -570,7 +591,7 @@ uint sampleTexture(float s, float t, float q, uint u, uint v, bool dbgPix)
+     }
+ 
+     if (pr.linear == 0u)
+-        return samplePoint(texUf, texVf, int(texUf), int(texVf), dbgPix);
++        return samplePoint(int(texUf), int(texVf));
+ 
+     const float sampleU = texUf - 0.5;
+     const float sampleV = texVf - 0.5;
+@@ -578,10 +599,10 @@ uint sampleTexture(float s, float t, float q, uint u, uint v, bool dbgPix)
+     const int v0 = int(floor(sampleV));
+     const float fx = sampleU - float(u0);
+     const float fy = sampleV - float(v0);
+-    const uint c00 = samplePoint(texUf, texVf, u0, v0, dbgPix);
+-    const uint c10 = samplePoint(texUf, texVf, u0 + 1, v0, dbgPix);
+-    const uint c01 = samplePoint(texUf, texVf, u0, v0 + 1, dbgPix);
+-    const uint c11 = samplePoint(texUf, texVf, u0 + 1, v0 + 1, dbgPix);
++    const uint c00 = samplePoint(u0, v0);
++    const uint c10 = samplePoint(u0 + 1, v0);
++    const uint c01 = samplePoint(u0, v0 + 1);
++    const uint c11 = samplePoint(u0 + 1, v0 + 1);
+     return lerpTexels(c00, c10, c01, c11, fx, fy);
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/shaders/raster_batch.comp b/ps2xRuntime/src/lib/gs/shaders/raster_batch.comp
+new file mode 100644
+index 0000000..be71451
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/raster_batch.comp
+@@ -0,0 +1,152 @@
++#version 450
++
++// Batch rasterizer for the Vulkan GS backend: one dispatch per batch of sprites and
++// triangles that share a frame and depth buffer. A workgroup is one 8x8 pixel tile; every
++// invocation walks the tile's list in draw order, so overlapping primitives keep PS2 order.
++// Mirrors GSCpuBackend::DrawSprite / DrawTriangle.
++
++#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable
++#extension GL_GOOGLE_include_directive : enable
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++#include "gs_raster_common.glsl"
++
++layout(push_constant) uniform Push
++{
++    uint tileBase;  // first tile header word of the batch in tiles[]
++    uint tileCount;
++} pc;
++
++void drawSprite(int x, int y)
++{
++    uint r = gm.vertR, g = gm.vertG, b = gm.vertB, a = gm.vertA;
++
++    if (pr.tme != 0u)
++    {
++        // precise: no FMA contraction — must round like the CPU's scalar float ops
++        precise const float ty = (float(y - gm.unclippedY0) + 0.5) / gm.spriteH;
++        precise const float tx = (float(x - gm.unclippedX0) + 0.5) / gm.spriteW;
++        precise const float texVf = gm.v0f + (gm.v1f - gm.v0f) * ty;
++        precise const float texUf = gm.u0f + (gm.u1f - gm.u0f) * tx;
++
++        uint texel;
++        if (pr.fst != 0u)
++        {
++            // precise: texUf * 16 + 0.5 must not fuse into an FMA (CPU rounds as two ops)
++            precise const float fixedUf = texUf * 16.0 + 0.5;
++            precise const float fixedVf = texVf * 16.0 + 0.5;
++            const uint sampleU = uint(clampInt(int(fixedUf), 0, 65535));
++            const uint sampleV = uint(clampInt(int(fixedVf), 0, 65535));
++            texel = sampleTexture(0.0, 0.0, 1.0, sampleU, sampleV);
++        }
++        else
++        {
++            texel = sampleTexture(texUf / float(pr.texW), texVf / float(pr.texH), 1.0, 0u, 0u);
++        }
++        combineTexture(texel & 0xFFu, (texel >> 8u) & 0xFFu, (texel >> 16u) & 0xFFu, (texel >> 24u) & 0xFFu, r, g, b, a);
++    }
++
++    writePixelPipe(x, y, gm.z1, r, g, b, a, gm.vertFog);
++}
++
++void drawTriangle(int x, int y)
++{
++    // Edge functions at pixel centers — same operation order as the CPU path
++    // (precise: no FMA contraction, rounding must match the scalar float ops).
++    precise const float px = float(x) + 0.5;
++    precise const float py = float(y) + 0.5;
++    precise const float dx = px - gm.fx2;
++    precise const float rowTerm0 = (gm.fx2 - gm.fx1) * (py - gm.fy2);
++    precise const float rowTerm1 = (gm.fx0 - gm.fx2) * (py - gm.fy2);
++    precise const float w0 = ((gm.edgeA0 * dx + rowTerm0) * gm.winding) * gm.invAbsDenom;
++    precise const float w1 = ((gm.edgeA1 * dx + rowTerm1) * gm.winding) * gm.invAbsDenom;
++    precise const float w2 = (1.0 - w0) - w1;
++    if (w0 < -0.0001 || w1 < -0.0001 || w2 < -0.0001)
++        return;
++
++    uint r, g, b, a;
++    if (pr.iip != 0u)
++    {
++        precise const float ir = (gm.attrR0 * w0 + gm.attrR1 * w1) + gm.attrR2 * w2;
++        precise const float ig = (gm.attrG0 * w0 + gm.attrG1 * w1) + gm.attrG2 * w2;
++        precise const float ib = (gm.attrB0 * w0 + gm.attrB1 * w1) + gm.attrB2 * w2;
++        precise const float ia = (gm.attrA0 * w0 + gm.attrA1 * w1) + gm.attrA2 * w2;
++        r = clampU8(int(ir));
++        g = clampU8(int(ig));
++        b = clampU8(int(ib));
++        a = clampU8(int(ia));
++    }
++    else
++    {
++        // Flat shading: vertex 2 color (exact small ints in float).
++        r = uint(gm.attrR2);
++        g = uint(gm.attrG2);
++        b = uint(gm.attrB2);
++        a = uint(gm.attrA2);
++    }
++
++    if (pr.tme != 0u)
++    {
++        precise const float isv = (gm.attrS0 * w0 + gm.attrS1 * w1) + gm.attrS2 * w2;
++        precise const float itv = (gm.attrT0 * w0 + gm.attrT1 * w1) + gm.attrT2 * w2;
++        uint texel;
++        if (pr.fst != 0u)
++        {
++            // FST interpolates the raw 4.12 fixed-point UVs; the CPU truncates to u16.
++            texel = sampleTexture(0.0, 0.0, 1.0, uint(int(isv)) & 0xFFFFu, uint(int(itv)) & 0xFFFFu);
++        }
++        else
++        {
++            // The GS DDA interpolates homogeneous S, T, Q; texel coordinates come from
++            // S/Q and T/Q only after interpolation (done inside sampleTexture).
++            precise const float iqv = (gm.attrQ0 * w0 + gm.attrQ1 * w1) + gm.attrQ2 * w2;
++            texel = sampleTexture(isv, itv, iqv, 0u, 0u);
++        }
++        combineTexture(texel & 0xFFu, (texel >> 8u) & 0xFFu, (texel >> 16u) & 0xFFu, (texel >> 24u) & 0xFFu, r, g, b, a);
++    }
++
++    // Fog is always interpolated, independent of IIP.
++    precise const float fogf = (gm.attrFog0 * w0 + gm.attrFog1 * w1) + gm.attrFog2 * w2;
++    const uint fog = clampU8(int(fogf));
++
++    // Z in double precision like the CPU; trunc(z + 0.5) matches static_cast<u32>.
++    // precise: no reassociation/FMA of the double chain — 1 ulp flips the truncated Z.
++    precise const float64_t zw0 = gm.triZ0 * float64_t(w0);
++    precise const float64_t zw1 = gm.triZ1 * float64_t(w1);
++    precise const float64_t zw2 = gm.triZ2 * float64_t(w2);
++    precise const float64_t z = (zw0 + zw1) + zw2;
++    // static_cast<u32> on x86 truncates toward zero and wraps two's-complement;
++    // GLSL's uint() is undefined for negatives, so wrap explicitly.
++    float64_t zt = trunc(z + 0.5);
++    if (zt < 0.0)
++        zt += 4294967296.0;
++    const uint zValue = uint(min(zt, 4294967295.0));
++
++    writePixelPipe(x, y, zValue, r, g, b, a, fog);
++}
++
++void main()
++{
++    // Dispatched as (min(tileCount, 256), ceil(tileCount / 256), 1) workgroups.
++    const uint tile = gl_WorkGroupID.y * 256u + gl_WorkGroupID.x;
++    if (tile >= pc.tileCount)
++        return;
++    const uint header = pc.tileBase + tile * 3u;
++    const uint key = tiles[header];
++    const int x = int(key & 0xFFu) * 8 + int(gl_LocalInvocationID.x);
++    const int y = int(key >> 8u) * 8 + int(gl_LocalInvocationID.y);
++    const uint first = tiles[header + 1u];
++    const uint end = first + tiles[header + 2u];
++    for (uint i = first; i < end; ++i)
++    {
++        geomIndex = tiles[i];
++        if (x < gm.minX || x > gm.maxX || y < gm.minY || y > gm.maxY)
++            continue;
++        stateIndex = gm.state;
++        if (gm.kind == 0u)
++            drawSprite(x, y);
++        else
++            drawTriangle(x, y);
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp b/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp
+deleted file mode 100755
+index 7275c5c..0000000
+--- a/ps2xRuntime/src/lib/gs/shaders/raster_sprite.comp
++++ /dev/null
+@@ -1,55 +0,0 @@
+-#version 450
+-
+-// Sprite rasterizer for the Vulkan GS backend: one dispatch per GS sprite primitive, one
+-// invocation per candidate output pixel (mirrors GSCpuBackend::DrawSprite).
+-
+-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable
+-#extension GL_GOOGLE_include_directive : enable
+-
+-layout(local_size_x = 8, local_size_y = 8) in;
+-
+-#include "gs_raster_common.glsl"
+-
+-void main()
+-{
+-    const int x = pr.drawX0 + int(gl_GlobalInvocationID.x);
+-    const int y = pr.drawY0 + int(gl_GlobalInvocationID.y);
+-    if (x > pr.drawX1 || y > pr.drawY1)
+-        return;
+-
+-    uint r = pr.vertR, g = pr.vertG, b = pr.vertB, a = pr.vertA;
+-
+-    if (pr.tme != 0u)
+-    {
+-        // precise: no FMA contraction — must round like the CPU's scalar float ops
+-        precise const float ty = (float(y - pr.unclippedY0) + 0.5) / pr.spriteH;
+-        precise const float tx = (float(x - pr.unclippedX0) + 0.5) / pr.spriteW;
+-        precise const float texVf = pr.v0f + (pr.v1f - pr.v0f) * ty;
+-        precise const float texUf = pr.u0f + (pr.u1f - pr.u0f) * tx;
+-
+-        uint texel;
+-        if (pr.fst != 0u)
+-        {
+-            // precise: texUf * 16 + 0.5 must not fuse into an FMA (CPU rounds as two ops)
+-            precise const float fixedUf = texUf * 16.0 + 0.5;
+-            precise const float fixedVf = texVf * 16.0 + 0.5;
+-            const int fixedU = int(fixedUf);
+-            const int fixedV = int(fixedVf);
+-            const uint sampleU = uint(clampInt(fixedU, 0, 65535));
+-            const uint sampleV = uint(clampInt(fixedV, 0, 65535));
+-            texel = sampleTexture(0.0, 0.0, 1.0, sampleU, sampleV, false);
+-        }
+-        else
+-        {
+-            texel = sampleTexture(texUf / float(pr.texW), texVf / float(pr.texH), 1.0, 0u, 0u, false);
+-        }
+-
+-        const uint tr = texel & 0xFFu;
+-        const uint tg = (texel >> 8u) & 0xFFu;
+-        const uint tb = (texel >> 16u) & 0xFFu;
+-        const uint ta = (texel >> 24u) & 0xFFu;
+-        combineTexture(tr, tg, tb, ta, r, g, b, a);
+-    }
+-
+-    writePixelPipe(x, y, pr.z1, r, g, b, a, pr.vertFog);
+-}
+diff --git a/ps2xRuntime/src/lib/gs/shaders/raster_triangle.comp b/ps2xRuntime/src/lib/gs/shaders/raster_triangle.comp
+deleted file mode 100755
+index 98ef580..0000000
+--- a/ps2xRuntime/src/lib/gs/shaders/raster_triangle.comp
++++ /dev/null
+@@ -1,135 +0,0 @@
+-#version 450
+-
+-// Triangle rasterizer for the Vulkan GS backend: one dispatch per GS triangle primitive,
+-// one invocation per candidate output pixel (mirrors GSCpuBackend::DrawTriangle).
+-
+-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable
+-#extension GL_GOOGLE_include_directive : enable
+-
+-layout(local_size_x = 8, local_size_y = 8) in;
+-
+-#include "gs_raster_common.glsl"
+-
+-void main()
+-{
+-    const int x = pr.triMinX + int(gl_GlobalInvocationID.x);
+-    const int y = pr.triMinY + int(gl_GlobalInvocationID.y);
+-    if (x > pr.triMaxX || y > pr.triMaxY)
+-        return;
+-
+-    // Edge functions at pixel centers — same operation order as the CPU path
+-    // (precise: no FMA contraction, rounding must match the scalar float ops).
+-    precise const float px = float(x) + 0.5;
+-    precise const float py = float(y) + 0.5;
+-    precise const float dx = px - pr.fx2;
+-    precise const float rowTerm0 = (pr.fx2 - pr.fx1) * (py - pr.fy2);
+-    precise const float rowTerm1 = (pr.fx0 - pr.fx2) * (py - pr.fy2);
+-    precise const float w0 = ((pr.edgeA0 * dx + rowTerm0) * pr.winding) * pr.invAbsDenom;
+-    precise const float w1 = ((pr.edgeA1 * dx + rowTerm1) * pr.winding) * pr.invAbsDenom;
+-    precise const float w2 = (1.0 - w0) - w1;
+-
+-    // TRI_DEBUG: dev-only per-pixel writeback into sprite-only params slots.
+-    const bool dbg = pr.drawX0 == 1 && x == pr.unclippedX0 && y == pr.unclippedY0;
+-    if (dbg)
+-    {
+-        pr.u0f = w0;
+-        pr.v0f = w1;
+-        pr.u1f = w2;
+-        pr.vertG = 0x11111111u; // marker: reached edge test
+-    }
+-
+-    if (w0 < -0.0001 || w1 < -0.0001 || w2 < -0.0001)
+-        return;
+-
+-    uint r, g, b, a;
+-    if (pr.iip != 0u)
+-    {
+-        precise const float ir = (pr.attrR0 * w0 + pr.attrR1 * w1) + pr.attrR2 * w2;
+-        precise const float ig = (pr.attrG0 * w0 + pr.attrG1 * w1) + pr.attrG2 * w2;
+-        precise const float ib = (pr.attrB0 * w0 + pr.attrB1 * w1) + pr.attrB2 * w2;
+-        precise const float ia = (pr.attrA0 * w0 + pr.attrA1 * w1) + pr.attrA2 * w2;
+-        r = clampU8(int(ir));
+-        g = clampU8(int(ig));
+-        b = clampU8(int(ib));
+-        a = clampU8(int(ia));
+-    }
+-    else
+-    {
+-        // Flat shading: vertex 2 color (exact small ints in float).
+-        r = uint(pr.attrR2);
+-        g = uint(pr.attrG2);
+-        b = uint(pr.attrB2);
+-        a = uint(pr.attrA2);
+-    }
+-
+-    if (pr.tme != 0u)
+-    {
+-        uint texel;
+-        if (pr.fst != 0u)
+-        {
+-            // FST interpolates the raw 4.12 fixed-point UVs; the CPU truncates to u16.
+-            precise const float iuf = (pr.attrS0 * w0 + pr.attrS1 * w1) + pr.attrS2 * w2;
+-            precise const float ivf = (pr.attrT0 * w0 + pr.attrT1 * w1) + pr.attrT2 * w2;
+-            const uint iu = uint(int(iuf)) & 0xFFFFu;
+-            const uint iv = uint(int(ivf)) & 0xFFFFu;
+-            texel = sampleTexture(0.0, 0.0, 1.0, iu, iv, dbg);
+-            if (dbg)
+-            {
+-                pr.spriteW = iuf;
+-                pr.spriteH = ivf;
+-                pr.vertG = iu;
+-                pr.vertB = iv;
+-            }
+-        }
+-        else
+-        {
+-            // The GS DDA interpolates homogeneous S, T, Q; texel coordinates come from
+-            // S/Q and T/Q only after interpolation (done inside sampleTexture).
+-            precise const float isv = (pr.attrS0 * w0 + pr.attrS1 * w1) + pr.attrS2 * w2;
+-            precise const float itv = (pr.attrT0 * w0 + pr.attrT1 * w1) + pr.attrT2 * w2;
+-            precise const float iqv = (pr.attrQ0 * w0 + pr.attrQ1 * w1) + pr.attrQ2 * w2;
+-            texel = sampleTexture(isv, itv, iqv, 0u, 0u, dbg);
+-            if (dbg)
+-            {
+-                pr.spriteW = isv;
+-                pr.spriteH = itv;
+-                pr.v1f = iqv;
+-            }
+-        }
+-        if (dbg)
+-            pr.vertR = texel;
+-
+-        const uint tr = texel & 0xFFu;
+-        const uint tg = (texel >> 8u) & 0xFFu;
+-        const uint tb = (texel >> 16u) & 0xFFu;
+-        const uint ta = (texel >> 24u) & 0xFFu;
+-        combineTexture(tr, tg, tb, ta, r, g, b, a);
+-    }
+-
+-    // Fog is always interpolated, independent of IIP.
+-    precise const float fogf = (pr.attrFog0 * w0 + pr.attrFog1 * w1) + pr.attrFog2 * w2;
+-    const uint fog = clampU8(int(fogf));
+-
+-    // Z in double precision like the CPU; trunc(z + 0.5) matches static_cast<u32>.
+-    // precise: no reassociation/FMA of the double chain — 1 ulp flips the truncated Z.
+-    precise const float64_t zw0 = pr.triZ0 * float64_t(w0);
+-    precise const float64_t zw1 = pr.triZ1 * float64_t(w1);
+-    precise const float64_t zw2 = pr.triZ2 * float64_t(w2);
+-    precise const float64_t z = (zw0 + zw1) + zw2;
+-    // static_cast<u32> on x86 truncates toward zero and wraps two's-complement;
+-    // GLSL's uint() is undefined for negatives, so wrap explicitly.
+-    float64_t zt = trunc(z + 0.5);
+-    if (zt < 0.0)
+-        zt += 4294967296.0;
+-    const uint zValue = uint(min(zt, 4294967295.0));
+-
+-    if (dbg)
+-    {
+-        pr.vertA = a;
+-        pr.vertFog = fog;
+-        pr.z1 = zValue;
+-        pr.drawY1 = 0x22222222; // marker: reached writePixelPipe
+-    }
+-
+-    writePixelPipe(x, y, zValue, r, g, b, a, fog);
+-}
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 113cc88..36bcd00 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -4,6 +4,8 @@
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/gs_vulkan_backend.h"
+ #include "runtime/ee_scheduler.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+@@ -15,6 +17,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <thread>
+ #include <vector>
+@@ -4672,5 +4675,123 @@ void register_ps2_gs_tests()
+             t.IsTrue(pattern2Ok,
+                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+         });
++
++        tc.Run("Vulkan batch raster matches the CPU backend on overlapping primitives", [](TestCase &t)
++        {
++            // Without a Vulkan device the Vulkan backend is the CPU backend and this passes trivially.
++            static char rasterEnv[] = "PS2X_VK_RASTER=1";
++            putenv(rasterEnv);
++            constexpr uint32_t kTexCt32 = 8192u, kTexT8 = 8256u, kClut = 16380u; // palette in the last VRAM page
++
++            auto scene = [&](GSRasterBackend &backend, std::vector<uint8_t> &vram)
++            {
++                backend.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++                uint32_t seed = 12345u;
++                auto rnd = [&](uint32_t n)
++                {
++                    seed = seed * 1664525u + 1013904223u;
++                    return (seed >> 8) % n;
++                };
++                auto upload = [&](uint32_t dbp, uint8_t psm, uint32_t bytes)
++                {
++                    GSTransferCommand command;
++                    command.bitbltbuf.dbp = dbp;
++                    command.bitbltbuf.dbw = 1;
++                    command.bitbltbuf.dpsm = psm;
++                    command.trxreg.rrw = 16;
++                    command.trxreg.rrh = 16;
++                    command.direction = 0;
++                    std::vector<uint8_t> data(bytes);
++                    for (uint8_t &byte : data)
++                        byte = static_cast<uint8_t>(rnd(256u));
++                    backend.BeginTransfer(command);
++                    backend.UploadImage(data.data(), bytes);
++                };
++                upload(kTexCt32, GS_PSM_CT32, 1024u);
++                upload(kTexT8, GS_PSM_T8, 256u);
++                upload(kClut, GS_PSM_CT32, 1024u);
++
++                for (uint32_t i = 0; i < 400u; ++i)
++                {
++                    GSPrimitiveBatch batch;
++                    GSContext &ctx = batch.state.context;
++                    ctx.frame.fbw = 2;
++                    ctx.scissor = {0, 127, 0, 63};
++                    ctx.zbuf.zbp = 4;
++                    ctx.zbuf.psm = GS_PSM_Z32;
++                    ctx.zbuf.zmask = rnd(4u) == 0u;
++                    ctx.test = rnd(4u) == 0u ? 0x30000ull : 0x50000ull; // depth always / greater-or-equal
++                    ctx.alpha = 0x44ull;                                 // (Cs - Cd) * As + Cd
++                    const bool sprite = rnd(3u) == 0u;
++                    batch.state.prim.type = i == 150u ? GS_PRIM_LINE : (sprite ? GS_PRIM_SPRITE : GS_PRIM_TRIANGLE);
++                    batch.state.prim.abe = rnd(2u) != 0u;
++                    batch.state.prim.iip = rnd(2u) != 0u;
++                    batch.state.prim.tme = rnd(2u) != 0u;
++                    batch.state.prim.fst = rnd(2u) != 0u;
++                    batch.state.linearFilter = rnd(2u) != 0u;
++                    batch.state.textureWidth = batch.state.textureHeight = 16;
++                    ctx.tex0.tbw = 1;
++                    ctx.tex0.tw = ctx.tex0.th = 4;
++                    ctx.tex0.tcc = 1;
++                    if (rnd(2u) != 0u)
++                    {
++                        ctx.tex0.tbp0 = kTexT8;
++                        ctx.tex0.psm = GS_PSM_T8;
++                        ctx.tex0.cbp = kClut;
++                        ctx.tex0.cld = 1;
++                        if (batch.state.prim.tme)
++                            backend.LoadClut(ctx.tex0, batch.state.texclut);
++                    }
++                    else
++                        ctx.tex0.tbp0 = kTexCt32;
++                    batch.vertexCount = (sprite || i == 150u) ? 2 : 3;
++                    for (uint32_t k = 0; k < batch.vertexCount; ++k)
++                    {
++                        GSVertex &v = batch.vertices[k];
++                        v.x = static_cast<float>(rnd(144u)) - 8.0f + static_cast<float>(rnd(16u)) / 16.0f;
++                        v.y = static_cast<float>(rnd(80u)) - 8.0f + static_cast<float>(rnd(16u)) / 16.0f;
++                        v.z = rnd(0x1000000u);
++                        v.r = static_cast<uint8_t>(rnd(256u));
++                        v.g = static_cast<uint8_t>(rnd(256u));
++                        v.b = static_cast<uint8_t>(rnd(256u));
++                        v.a = static_cast<uint8_t>(rnd(256u));
++                        v.s = static_cast<float>(rnd(1000u)) / 1000.0f;
++                        v.t = static_cast<float>(rnd(1000u)) / 1000.0f;
++                        v.u = static_cast<uint16_t>(rnd(256u));
++                        v.v = static_cast<uint16_t>(rnd(256u));
++                    }
++                    if (i == 250u)
++                        upload(kTexCt32, GS_PSM_CT32, 1024u); // later primitives see the new texels, earlier ones the old
++                    backend.Submit(batch);
++                }
++            };
++
++            std::vector<uint8_t> cpuVram(4u * 1024u * 1024u), vkVram(cpuVram.size());
++            GSCpuBackend cpu;
++            GSVulkanBackend vk;
++            scene(cpu, cpuVram);
++            scene(vk, vkVram);
++            uint32_t drawn = 0u, wrong = 0u;
++            for (uint32_t y = 0; y < 64u; ++y)
++            {
++                for (uint32_t x = 0; x < 128u; ++x)
++                {
++                    const uint32_t a = cpu.ReadVram(GS_PSM_CT32, 0u, 2u, x, y);
++                    const uint32_t b = vk.ReadVram(GS_PSM_CT32, 0u, 2u, x, y);
++                    drawn += a != 0u ? 1u : 0u;
++                    for (uint32_t shift = 0; shift < 32u; shift += 8u)
++                    {
++                        const int delta = static_cast<int>((a >> shift) & 0xFFu) - static_cast<int>((b >> shift) & 0xFFu);
++                        if (delta < -2 || delta > 2) // a GPU may round a float differently, no more
++                        {
++                            ++wrong;
++                            break;
++                        }
++                    }
++                }
++            }
++            t.IsTrue(drawn > 4000u, "the scene should cover most of the frame");
++            t.Equals(wrong, 0u, "Vulkan batch raster should match the CPU backend pixel for pixel, up to rounding");
++        });
+     });
+ }

@@ -1,0 +1,161 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_pad_keys.h b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+old mode 100644
+new mode 100755
+index 4258824..b6b6f52
+--- a/ps2xRuntime/include/runtime/ps2_pad_keys.h
++++ b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+@@ -41,6 +41,7 @@ inline uint8_t ps2PadMouseAxis(float delta, float scale)
+ // targets:  up down left right cross circle square triangle l1 r1 l2 r2 l3 r3 start select (buttons),
+ //           move_up move_down move_left move_right (left stick), look_up look_down look_left look_right (right stick),
+ //           skip_movie (not a pad button: ends the movie that is playing)
++//           fast_forward (not a pad button: while held the game runs several times faster, without 3D drawing)
+ // inputs:   a key name (W, SPACE, LEFT_SHIFT, F1, KP_0, UP ...), mouse:left|right|middle|side|extra,
+ //           pad:<button> (a b x y lb rb lt rt back start ls rs dpad_up dpad_down dpad_left dpad_right),
+ //           pad:<axis><+|-> (lx ly rx ry; + is right/down)
+@@ -87,6 +88,7 @@ enum PadTarget : uint8_t
+     PadLookLeft,
+     PadLookRight,
+     PadSkipMovie,
++    PadFastForward,
+     PadTargetCount
+ };
+ 
+@@ -112,6 +114,11 @@ const PadControls &ps2PadControls();
+ // held: the caller's memory of the input (-1 before its first poll, so a key held from before does not count).
+ bool ps2PadSkipMoviePressed(int &held, uint32_t picturesShown);
+ 
++// Fast forward: polled by the EE scheduler at every vblank (ps2PadPollFastForward), read anywhere.
++// PS2X_FAST_FORWARD=1 holds it down (for unattended runs).
++bool ps2PadPollFastForward();
++bool ps2PadFastForward();
++
+ // Stick byte for a deflection in [-1, 1].
+ inline uint8_t ps2PadStickByte(float v)
+ {
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c65e70c..3943e39 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
++#include "runtime/ps2_pad_keys.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -56,6 +57,15 @@ namespace
+     }
+ 
+     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
++
++    // Fast forward (ps2_pad_keys.h): guest time runs kFastForward times faster than host time, so the host wait
++    // for a guest duration (a vblank period, an alarm) shrinks by that factor.
++    constexpr int kFastForward = 8;
++    template <typename Duration>
++    Duration hostWait(Duration guestDuration)
++    {
++        return ps2PadFastForward() ? guestDuration / kFastForward : guestDuration;
++    }
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+ 
+@@ -1207,7 +1217,7 @@ int EeScheduler::setAlarm(uint16_t ticks,
+     m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
+     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
+     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
+-                  std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
++                  std::chrono::steady_clock::now() + hostWait(std::chrono::microseconds(tickCount * kAlarmTickMicroseconds)),
+                   EeEvent{EeEventType::Alarm, static_cast<uint32_t>(id), 0});
+     return id;
+ }
+@@ -1994,12 +2004,13 @@ void EeScheduler::processDueDeadlines()
+         {
+             if (scheduled.event.type == EeEventType::VBlankStart)
+             {
++                ps2PadPollFastForward();
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+-                              scheduled.hostDeadline + kVBlankDuration,
++                              scheduled.hostDeadline + hostWait(kVBlankDuration),
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                 // After a long host stall, drop the backlog instead of firing a burst of vblanks.
+                 m_nextVBlankCycle = scheduled.deadlineCycle + kVBlankPeriodCycles;
+-                m_nextVBlankHost = std::max(scheduled.hostDeadline + kVBlankPeriod,
++                m_nextVBlankHost = std::max(scheduled.hostDeadline + hostWait(kVBlankPeriod),
+                                             std::chrono::steady_clock::now() - kVBlankMaxLag);
+                 scheduleEvent(m_nextVBlankCycle, m_nextVBlankHost,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index d2634b6..34f314e 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_pad_keys.h"
+ #include "ps2_host_backend.h"
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
+ #include <cstdio>
+ #include <cstring>
+@@ -24,7 +25,7 @@ namespace
+         "up", "down", "left", "right", "cross", "circle", "square", "triangle",
+         "l1", "r1", "l2", "r2", "l3", "r3", "start", "select",
+         "move_up", "move_down", "move_left", "move_right", "look_up", "look_down", "look_left", "look_right",
+-        "skip_movie"};
++        "skip_movie", "fast_forward"};
+ 
+     struct Name
+     {
+@@ -135,7 +136,7 @@ PadControls ps2PadDefaultControls()
+         "l3 = pad:ls\n" "r3 = pad:rs\n" "start = ENTER, pad:start\n" "select = TAB, pad:back\n"
+         "move_up = W, pad:ly-\n" "move_down = S, pad:ly+\n" "move_left = A, pad:lx-\n" "move_right = D, pad:lx+\n"
+         "look_up = UP, pad:ry-\n" "look_down = DOWN, pad:ry+\n" "look_left = LEFT, pad:rx-\n" "look_right = RIGHT, pad:rx+\n"
+-        "skip_movie = ESCAPE, BACKSPACE\n",
++        "skip_movie = ESCAPE, BACKSPACE\n" "fast_forward = F\n",
+         controls);
+     return controls;
+ }
+@@ -260,6 +261,21 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    std::atomic<bool> g_fastForward{false};
++}
++
++bool ps2PadPollFastForward()
++{
++    static const bool always = std::getenv("PS2X_FAST_FORWARD") != nullptr;
++    const bool held = always || (IsWindowReady() && targetStrength(ps2PadControls(), PadFastForward, 1.0f) > 0.5f);
++    g_fastForward.store(held, std::memory_order_relaxed);
++    return held;
++}
++
++bool ps2PadFastForward() { return g_fastForward.load(std::memory_order_relaxed); }
++
+ bool ps2PadSkipMoviePressed(int &held, uint32_t picturesShown)
+ {
+     // PS2X_SKIP_MOVIES=<n>: skip every movie after n pictures (for unattended runs).
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 04e3cf3..16e1f8d 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -837,8 +837,15 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_memory.setGifArbiter(&m_gifArbiter);
+     // VIF1 MSCAL/MSCNT: the run goes to the GIF/VU worker. VPU_STAT's D/T stop bits come from the run only when
+     // FBRST enables D/T stops (execute/resume clear them otherwise), and only then does the EE wait for it.
+-    const auto runVu1 = [this](bool resume, uint32_t startPC, uint32_t top, uint32_t itop)
+-    {
++    // Fast forward: the microprograms (all 3D drawing, most of a frame's host time) are not run. Decided at an
++    // MSCAL, so the MSCNTs that continue it are skipped or run with it.
++    const auto vu1Skipped = std::make_shared<bool>(false);
++    const auto runVu1 = [this, vu1Skipped](bool resume, uint32_t startPC, uint32_t top, uint32_t itop)
++    {
++        if (!resume)
++            *vu1Skipped = ps2PadFastForward();
++        if (*vu1Skipped)
++            return;
+         R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+         if (!cpuContext)
+         {

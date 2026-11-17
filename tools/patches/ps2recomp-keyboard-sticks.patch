@@ -1,0 +1,133 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_pad_keys.h b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+@@ -0,0 +1,33 @@
++#ifndef PS2_PAD_KEYS_H
++#define PS2_PAD_KEYS_H
++
++#include <cstdint>
++#include <cstdlib>
++
++// Stick byte for a pair of opposing digital keys: full deflection (0x00 / 0xFF), 0x80 when
++// neither or both are held. Own header so ps2_runtime.h users don't rebuild on changes.
++inline uint8_t ps2PadKeyAxis(bool negative, bool positive)
++{
++    return negative == positive ? 0x80 : (negative ? 0x00 : 0xFF);
++}
++
++// PS2X_MOUSE_LOOK=<sensitivity> turns on mouse look: stick units per pixel of mouse motion per
++// host frame (e.g. 8). Unset or 0 = off.
++inline float ps2PadMouseLookScale()
++{
++    static const float scale = []
++    {
++        const char *env = std::getenv("PS2X_MOUSE_LOOK");
++        return env ? std::strtof(env, nullptr) : 0.0f;
++    }();
++    return scale;
++}
++
++// Stick byte for one frame of mouse motion, clamped to the stick range.
++inline uint8_t ps2PadMouseAxis(float delta, float scale)
++{
++    const float v = 128.0f + delta * scale;
++    return v <= 0.0f ? 0x00 : (v >= 255.0f ? 0xFF : static_cast<uint8_t>(v + 0.5f));
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ps2_pad.h"
++#include "runtime/ps2_pad_keys.h"
+ #include "ps2_host_backend.h"
+ #include <cstring>
+ 
+@@ -89,13 +90,26 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     }
+     else
+     {
+-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
++        // WASD = left stick (move), arrows (or mouse, PS2X_MOUSE_LOOK) = right stick (look), IJKL = D-pad.
++        data[6] = ps2PadKeyAxis(IsKeyDown(KEY_A), IsKeyDown(KEY_D));
++        data[7] = ps2PadKeyAxis(IsKeyDown(KEY_W), IsKeyDown(KEY_S));
++        data[4] = ps2PadKeyAxis(IsKeyDown(KEY_LEFT), IsKeyDown(KEY_RIGHT));
++        data[5] = ps2PadKeyAxis(IsKeyDown(KEY_UP), IsKeyDown(KEY_DOWN));
++        if (const float mouseLook = ps2PadMouseLookScale(); mouseLook > 0.0f && data[4] == 0x80 && data[5] == 0x80)
++        {
++            // ponytail: samples only the last host frame's motion; if the game polls slower than
++            // the host frame rate, motion in between is lost. Accumulate between polls if that bites.
++            const Vector2 delta = GetMouseDelta(); // arrows win while held
++            data[4] = ps2PadMouseAxis(delta.x, mouseLook);
++            data[5] = ps2PadMouseAxis(delta.y, mouseLook);
++        }
++        if (IsKeyDown(KEY_I))
+             clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
++        if (IsKeyDown(KEY_K))
+             clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
++        if (IsKeyDown(KEY_J))
+             clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
++        if (IsKeyDown(KEY_L))
+             clearBit(PAD_RIGHT);
+         if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+             clearBit(PAD_CROSS);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -9,6 +9,7 @@
+ #include "ps2_runtime_macros.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ps2_pad_keys.h"
+ #include "ThreadNaming.h"
+ #include "Kernel/Stubs/Audio.h"
+ #include "Kernel/Stubs/GS.h"
+@@ -927,6 +928,9 @@ bool PS2Runtime::initialize(const char *title)
+                                              { m_audioBackend.onSpuStreamBlock(madr, data, size); });
+ #endif
+         SetTargetFPS(60);
++        SetExitKey(KEY_NULL); // Esc is the keyboard Circle button, not quit (close the window instead)
++        if (ps2PadMouseLookScale() > 0.0f)
++            DisableCursor(); // capture the mouse so look motion never runs into the screen edge
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
+--- a/ps2xTest/src/pad_input_tests.cpp
++++ b/ps2xTest/src/pad_input_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "Stubs/Pad.h"
++#include "runtime/ps2_pad_keys.h"
+ 
+ #include <vector>
+ #include <cstdint>
+@@ -529,5 +530,22 @@ void register_pad_input_tests()
+             const char *reqStr = reinterpret_cast<const char *>(rdram.data() + kPadDataAddr + 64);
+             t.IsTrue(std::string(reqStr).find("COMPLETE") != std::string::npos, "req string should include COMPLETE");
+         });
++
++        tc.Run("keyboard stick axis is full deflection or centre", [](TestCase &t)
++               {
++            t.Equals(ps2PadKeyAxis(false, false), static_cast<uint8_t>(0x80), "no key centres the stick");
++            t.Equals(ps2PadKeyAxis(true, false), static_cast<uint8_t>(0x00), "negative key is full left/up");
++            t.Equals(ps2PadKeyAxis(false, true), static_cast<uint8_t>(0xFF), "positive key is full right/down");
++            t.Equals(ps2PadKeyAxis(true, true), static_cast<uint8_t>(0x80), "opposing keys cancel");
++        });
++
++        tc.Run("mouse look axis scales motion and clamps to the stick range", [](TestCase &t)
++               {
++            t.Equals(ps2PadMouseAxis(0.0f, 8.0f), static_cast<uint8_t>(0x80), "no motion centres the stick");
++            t.Equals(ps2PadMouseAxis(4.0f, 8.0f), static_cast<uint8_t>(0xA0), "right motion deflects right");
++            t.Equals(ps2PadMouseAxis(-4.0f, 8.0f), static_cast<uint8_t>(0x60), "left motion deflects left");
++            t.Equals(ps2PadMouseAxis(100.0f, 8.0f), static_cast<uint8_t>(0xFF), "fast motion clamps high");
++            t.Equals(ps2PadMouseAxis(-100.0f, 8.0f), static_cast<uint8_t>(0x00), "fast motion clamps low");
++        });
+     });
+ }

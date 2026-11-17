@@ -1,0 +1,692 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9e..95ffbda 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -4,6 +4,7 @@
+ #include "runtime/gs/gs_texture_page_cache.h"
+ 
+ #include <array>
++#include <functional>
+ #include <mutex>
+ #include <vector>
+ 
+@@ -37,15 +38,29 @@ private:
+     void ResetUnlocked();
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+-    uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
++    uint32_t ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
++    // Where SampleTexture gets texels from: a page cache, or a texture decoded
++    // up front for rows that were proven unable to see stale cached pages.
++    struct TexelSource
++    {
++        GSMem::TexturePageCache *cache = nullptr;
++        const uint32_t *decoded = nullptr;
++        uint32_t decodedWidth = 0;
++        int lastU = -1; // last decoded texel read, to rebuild the shared cache
++        int lastV = -1;
++    };
++    using RowRasterFn = std::function<void(int y0, int y1, TexelSource &texels)>;
++    void RasterRows(const GSDrawState &state, int minX, int minY, int maxX, int maxY, const RowRasterFn &rows);
++    bool CanRasterRowsInParallel(const GSDrawState &state, int minX, int minY, int maxX, int maxY) const;
+     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
+-    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
++    uint32_t FetchTexel(GSMem::TexturePageCache &cache, const GSDrawState &state, int u, int v);
++    uint32_t SampleTexture(TexelSource &texels, const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+ 
+     void PerformLocalToLocalTransfer();
+diff --git a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+index 1cb1540..5b64ff9 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
++++ b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+@@ -30,6 +30,18 @@ namespace GSMem
+             return m_bytes.data() + (byteAddress & (kPageSize - 1u));
+         }
+ 
++        // True when the cached copy (if any) still equals VRAM, so reads
++        // through this cache cannot differ from direct VRAM reads.
++        bool MatchesVram(const uint8_t* vram) const noexcept
++        {
++            return m_pageBase == UINT32_MAX || std::memcmp(m_bytes.data(), vram + m_pageBase, kPageSize) == 0;
++        }
++
++        uint32_t PageBase() const noexcept
++        {
++            return m_pageBase;
++        }
++
+     private:
+         alignas(64) std::array<uint8_t, kPageSize> m_bytes{};
+         uint32_t m_pageBase = UINT32_MAX;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..5b1ef9f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -9,11 +9,17 @@
+ #include <atomic>
+ #include <algorithm>
+ #include <cmath>
++#include <condition_variable>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <iostream>
+ #include <stdexcept>
++#include <thread>
++#if defined(__SSE2__) || defined(_M_X64)
++#include <emmintrin.h>
++#endif
+ 
+ using namespace GSInternal;
+ 
+@@ -298,6 +304,183 @@ namespace
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+         return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+     }
++
++    // lerpChannel on all four channels at once. Each lane does the same float
++    // operations, and lround is rebuilt from truncation (v - trunc(v) is exact),
++    // so results match lerpChannel bit for bit while the weights lie in [0, 1).
++    uint32_t lerpTexels(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, float fx, float fy)
++    {
++#if defined(__SSE2__) || defined(_M_X64)
++        if (fx >= 0.0f && fx < 1.0f && fy >= 0.0f && fy < 1.0f)
++        {
++            const __m128i zero = _mm_setzero_si128();
++            auto expand = [&](uint32_t c)
++            {
++                return _mm_cvtepi32_ps(_mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(static_cast<int>(c)), zero), zero));
++            };
++            const __m128 a00 = expand(c00), a10 = expand(c10), a01 = expand(c01), a11 = expand(c11);
++            const __m128 wx = _mm_set1_ps(fx), wy = _mm_set1_ps(fy);
++            const __m128 top = _mm_add_ps(a00, _mm_mul_ps(_mm_sub_ps(a10, a00), wx));
++            const __m128 bottom = _mm_add_ps(a01, _mm_mul_ps(_mm_sub_ps(a11, a01), wx));
++            const __m128 v = _mm_add_ps(top, _mm_mul_ps(_mm_sub_ps(bottom, top), wy));
++            __m128i i = _mm_cvttps_epi32(v);
++            const __m128 frac = _mm_sub_ps(v, _mm_cvtepi32_ps(i));
++            // Compare masks are -1 per true lane: subtract to round up, add to round down.
++            i = _mm_sub_epi32(i, _mm_castps_si128(_mm_cmpge_ps(frac, _mm_set1_ps(0.5f))));
++            i = _mm_add_epi32(i, _mm_castps_si128(_mm_cmple_ps(frac, _mm_set1_ps(-0.5f))));
++            return static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_packus_epi16(_mm_packs_epi32(i, i), zero)));
++        }
++#endif
++        uint32_t out = 0u;
++        for (uint32_t shift = 0u; shift < 32u; shift += 8u)
++            out |= static_cast<uint32_t>(lerpChannel(static_cast<uint8_t>(c00 >> shift), static_cast<uint8_t>(c10 >> shift),
++                                                     static_cast<uint8_t>(c01 >> shift), static_cast<uint8_t>(c11 >> shift), fx, fy))
++                   << shift;
++        return out;
++    }
++
++    // Runs fn(0..count-1) on worker threads and the calling thread, returning when all are done.
++    class RowWorkerPool
++    {
++    public:
++        static RowWorkerPool &instance()
++        {
++            static RowWorkerPool pool;
++            return pool;
++        }
++
++        size_t workers() const { return m_threads.size(); }
++
++        void run(int count, const std::function<void(int)> &fn)
++        {
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_fn = &fn;
++                m_count = count;
++                m_next.store(0, std::memory_order_relaxed);
++                m_active = static_cast<int>(m_threads.size());
++                ++m_generation;
++            }
++            m_wake.notify_all();
++            drain();
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_done.wait(lock, [this] { return m_active == 0; });
++        }
++
++        ~RowWorkerPool()
++        {
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_stop = true;
++            }
++            m_wake.notify_all();
++            for (std::thread &t : m_threads)
++                t.join();
++        }
++
++    private:
++        RowWorkerPool()
++        {
++            // PS2X_GS_THREADS caps the threads rasterising one primitive (1 = serial).
++            unsigned threads = std::thread::hardware_concurrency();
++            if (const char *env = std::getenv("PS2X_GS_THREADS"))
++                threads = static_cast<unsigned>(std::strtoul(env, nullptr, 10));
++            for (unsigned i = 1; i < threads; ++i)
++                m_threads.emplace_back([this] { loop(); });
++        }
++
++        void drain()
++        {
++            for (int i = m_next.fetch_add(1); i < m_count; i = m_next.fetch_add(1))
++                (*m_fn)(i);
++        }
++
++        void loop()
++        {
++            uint64_t seen = 0;
++            std::unique_lock<std::mutex> lock(m_mutex);
++            for (;;)
++            {
++                m_wake.wait(lock, [&] { return m_stop || m_generation != seen; });
++                if (m_stop)
++                    return;
++                seen = m_generation;
++                lock.unlock();
++                drain();
++                lock.lock();
++                if (--m_active == 0)
++                    m_done.notify_one();
++            }
++        }
++
++        std::vector<std::thread> m_threads;
++        std::mutex m_mutex;
++        std::condition_variable m_wake;
++        std::condition_variable m_done;
++        const std::function<void(int)> *m_fn = nullptr;
++        int m_count = 0;
++        std::atomic<int> m_next{0};
++        int m_active = 0;
++        uint64_t m_generation = 0;
++        bool m_stop = false;
++    };
++
++    struct PageSpan
++    {
++        uint32_t first = 0;
++        uint32_t last = 0;
++
++        bool overlaps(const PageSpan &o) const { return first <= o.last && o.first <= last; }
++    };
++
++    // Conservative range of 8 KiB pages that pixels (minX..maxX, minY..maxY) of a
++    // buffer at block bp / width bw can touch. Mirrors PixelStorageTraits::Address:
++    // a base that is not page aligned carries into the next page. False when the
++    // range reaches the 4 MiB wrap.
++    bool pageSpan(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t minX, uint32_t minY, uint32_t maxX, uint32_t maxY, PageSpan &out)
++    {
++        uint32_t pw = 64u, ph = 32u;
++        if (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S || psm == GS_PSM_Z16 || psm == GS_PSM_Z16S)
++            ph = 64u;
++        else if (psm == GS_PSM_T8)
++            pw = 128u, ph = 64u;
++        else if (psm == GS_PSM_T4)
++            pw = 128u, ph = 128u;
++        const uint32_t perRow = (bw * 64u) / pw;
++        out.first = bp / 32u + (minY / ph) * perRow + minX / pw;
++        out.last = bp / 32u + (maxY / ph) * perRow + maxX / pw + ((bp % 32u) != 0u ? 1u : 0u);
++        return out.last < 512u;
++    }
++
++    // Narrows [begin, end] to the x where pass(x) holds, for a pass() that flips
++    // at most once along the row: false to true when direction > 0, true to
++    // false when direction < 0, and never when direction == 0.
++    template <typename Pass>
++    void clipSpan(int &begin, int &end, int direction, Pass pass)
++    {
++        if (begin > end)
++            return;
++        if (direction == 0)
++        {
++            if (!pass(begin))
++                end = begin - 1;
++            return;
++        }
++        int lo = begin;
++        int hi = end + 1;
++        while (lo < hi)
++        {
++            const int mid = lo + (hi - lo) / 2;
++            if (pass(mid) == (direction > 0))
++                hi = mid;
++            else
++                lo = mid + 1;
++        }
++        if (direction > 0)
++            begin = lo;
++        else
++            end = lo - 1;
++    }
+ }
+ 
+ namespace
+@@ -622,7 +805,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+             sourceY = static_cast<uint32_t>(texclut.cov);
+         }
+ 
+-        const uint32_t raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY); 
++        const uint32_t raw = ReadTextureVramUnlocked(m_texturePageCache, tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
+         const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
+         if (sixteenBit)
+         {
+@@ -665,12 +848,12 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+     return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
+ }
+ 
+-uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
++uint32_t GSCpuBackend::ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+ {
+     if (!m_vram)
+         return 0u;
+ 
+-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
++    return GSMem::ReadTexture(cache, m_vram, psm, base, bw, x, y);
+ }
+ 
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+@@ -1055,10 +1238,37 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+     return 0xFFFF00FFu;
+ }
+ 
+-uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
++uint32_t GSCpuBackend::FetchTexel(GSMem::TexturePageCache &cache, const GSDrawState &state, int sampleU, int sampleV)
++{
++    const auto &tex = state.context.tex0;
++    u32 out = ReadTextureVramUnlocked(cache, tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
++
++    switch (tex.psm)
++    {
++    case GS_PSM_CT32:
++    case GS_PSM_Z32:
++    case GS_PSM_CT24:
++    case GS_PSM_Z24:
++        return applyTexa(state.texa, tex.psm, out);
++    case GS_PSM_CT16:
++    case GS_PSM_CT16S:
++    case GS_PSM_Z16:
++    case GS_PSM_Z16S:
++        return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
++    case GS_PSM_T8:
++    case GS_PSM_T8H:
++    case GS_PSM_T4:
++    case GS_PSM_T4HL:
++    case GS_PSM_T4HH:
++        return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
++    }
++
++    return 0xFFFF00FFu;
++}
++
++uint32_t GSCpuBackend::SampleTexture(TexelSource &texels, const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
+ {
+     const auto &ctx = state.context;
+-    const auto &tex = ctx.tex0;
+ 
+     const int texW = state.textureWidth;
+     const int texH = state.textureHeight;
+@@ -1087,30 +1297,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+     {
+         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
+         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
+-
+-        u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+-
+-        switch (tex.psm)
++        if (texels.decoded)
+         {
+-        case GS_PSM_CT32:
+-        case GS_PSM_Z32:
+-        case GS_PSM_CT24:
+-        case GS_PSM_Z24:
+-            return applyTexa(state.texa, tex.psm, out);
+-        case GS_PSM_CT16:
+-        case GS_PSM_CT16S:
+-        case GS_PSM_Z16:
+-        case GS_PSM_Z16S:
+-            return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
+-        case GS_PSM_T8:
+-        case GS_PSM_T8H:
+-        case GS_PSM_T4:
+-        case GS_PSM_T4HL:
+-        case GS_PSM_T4HH:
+-            return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
++            texels.lastU = sampleU;
++            texels.lastV = sampleV;
++            return texels.decoded[static_cast<uint32_t>(sampleV) * texels.decodedWidth + static_cast<uint32_t>(sampleU)];
+         }
+-
+-        return 0xFFFF00FFu;
++        return FetchTexel(*texels.cache, state, sampleU, sampleV);
+     };
+ 
+     if (!state.linearFilter)
+@@ -1132,31 +1325,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+     const uint32_t c01 = samplePoint(u0, v1);
+     const uint32_t c11 = samplePoint(u1, v1);
+ 
+-    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
+-                                  static_cast<uint8_t>(c10 & 0xFFu),
+-                                  static_cast<uint8_t>(c01 & 0xFFu),
+-                                  static_cast<uint8_t>(c11 & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
+-                                  fx, fy);
+-
+-    return static_cast<uint32_t>(r) |
+-           (static_cast<uint32_t>(g) << 8) |
+-           (static_cast<uint32_t>(b) << 16) |
+-           (static_cast<uint32_t>(a) << 24);
++    return lerpTexels(c00, c10, c01, c11, fx, fy);
+ }
+ 
+ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1234,7 +1403,9 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+         if (spriteH < 1.0f)
+             spriteH = 1.0f;
+ 
+-        for (int y = drawY0; y <= drawY1; ++y)
++        RasterRows(state, drawX0, drawY0, drawX1, drawY1, [&](int rowBegin, int rowEnd, TexelSource &texels)
++        {
++        for (int y = rowBegin; y <= rowEnd; ++y)
+         {
+             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+             float texVf = v0f + (v1f - v0f) * ty;
+@@ -1250,11 +1421,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+                     const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
+                     const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
+                     const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
+-                    texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
++                    texel = SampleTexture(texels, state, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
+                 }
+                 else
+                 {
+-                    texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
++                    texel = SampleTexture(texels, state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
+                 }
+ 
+                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+@@ -1266,12 +1437,16 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+                 WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+             }
+         }
++        });
+     }
+     else
+     {
+-        for (int y = drawY0; y <= drawY1; ++y)
+-            for (int x = drawX0; x <= drawX1; ++x)
+-                WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
++        RasterRows(state, drawX0, drawY0, drawX1, drawY1, [&](int rowBegin, int rowEnd, TexelSource &)
++        {
++            for (int y = rowBegin; y <= rowEnd; ++y)
++                for (int x = drawX0; x <= drawX1; ++x)
++                    WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
++        });
+     }
+ }
+ 
+@@ -1310,16 +1485,42 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
++    auto edge0 = [&](float px, float py) { return (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom; };
++    auto edge1 = [&](float px, float py) { return (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom; };
++
++    // Along a row every step of edge0/edge1 is a monotone float operation in px,
++    // so each edge passes on one interval that binary search finds exactly; w2 is
++    // monotone too unless w0 and w1 move in opposite directions.
++    const bool finiteEdges = std::isfinite(fx0) && std::isfinite(fy0) && std::isfinite(fx1) &&
++                             std::isfinite(fy1) && std::isfinite(fx2) && std::isfinite(fy2);
++    auto direction = [&](float slope) { return slope == 0.0f ? 0 : ((slope > 0.0f) == (winding > 0.0f) ? 1 : -1); };
++    const int dir0 = direction(fy1 - fy2);
++    const int dir1 = direction(fy2 - fy0);
++    const bool w2Monotone = dir0 * dir1 >= 0;
++    const int dir2 = -(dir0 != 0 ? dir0 : dir1);
+ 
+-    for (int y = minY; y <= maxY; ++y)
++    RasterRows(state, minX, minY, maxX, maxY, [&](int rowBegin, int rowEnd, TexelSource &texels)
++    {
++    for (int y = rowBegin; y <= rowEnd; ++y)
+     {
+         float py = static_cast<float>(y) + 0.5f;
+-        for (int x = minX; x <= maxX; ++x)
++        int spanBegin = minX;
++        int spanEnd = maxX;
++        if (finiteEdges)
++        {
++            auto pixel = [](int x) { return static_cast<float>(x) + 0.5f; };
++            clipSpan(spanBegin, spanEnd, dir0, [&](int x) { return !(edge0(pixel(x), py) < -kEdgeEpsilon); });
++            clipSpan(spanBegin, spanEnd, dir1, [&](int x) { return !(edge1(pixel(x), py) < -kEdgeEpsilon); });
++            if (w2Monotone)
++                clipSpan(spanBegin, spanEnd, dir2, [&](int x)
++                         { return !(1.0f - edge0(pixel(x), py) - edge1(pixel(x), py) < -kEdgeEpsilon); });
++        }
++        for (int x = spanBegin; x <= spanEnd; ++x)
+         {
+             float px = static_cast<float>(x) + 0.5f;
+ 
+-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
++            float w0 = edge0(px, py);
++            float w1 = edge1(px, py);
+             float w2 = 1.0f - w0 - w1;
+ 
+             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+@@ -1367,7 +1568,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+                     iv = 0;
+                 }
+ 
+-                uint32_t texel = SampleTexture(state, is, it, iq, iu, iv);
++                uint32_t texel = SampleTexture(texels, state, is, it, iq, iu, iv);
+ 
+                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+@@ -1391,6 +1592,123 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+         }
+     }
++    });
++}
++
++bool GSCpuBackend::CanRasterRowsInParallel(const GSDrawState &state, int minX, int minY, int maxX, int maxY) const
++{
++    // Below this many pixels, waking the workers costs more than it saves.
++    constexpr int64_t kMinParallelPixels = 16384;
++    if (RowWorkerPool::instance().workers() == 0 ||
++        static_cast<int64_t>(maxX - minX + 1) * (maxY - minY + 1) < kMinParallelPixels)
++        return false;
++
++    // Rows may run in any order only if every pixel owns its framebuffer and
++    // depth words and nothing the primitive writes is read as a texel.
++    const auto &ctx = state.context;
++    const uint32_t fbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
++    if (static_cast<uint32_t>(maxX) >= fbw * 64u)
++        return false; // wider rows alias other rows of the buffer
++
++    PageSpan frame, depth;
++    if (!pageSpan(ctx.frame.psm, framePageBaseToBlock(ctx.frame.fbp), fbw, minX, minY, maxX, maxY, frame))
++        return false;
++    const uint32_t ztest = static_cast<uint32_t>((ctx.test >> 17) & 3u);
++    const bool depthAccess = ztest >= 2u || !ctx.zbuf.zmask;
++    if (depthAccess && (!pageSpan(ctx.zbuf.psm, framePageBaseToBlock(ctx.zbuf.zbp), fbw, minX, minY, maxX, maxY, depth) ||
++                        depth.overlaps(frame)))
++        return false;
++
++    if (!state.prim.tme)
++        return true;
++    const auto &tex = ctx.tex0;
++    const bool regionU = (ctx.clamp & 0x2u) != 0u;
++    const bool regionV = ((ctx.clamp >> 2) & 0x2u) != 0u;
++    const uint32_t maxU = regionU ? 1023u : std::max<uint32_t>(state.textureWidth, 1u) - 1u;
++    const uint32_t maxV = regionV ? 1023u : std::max<uint32_t>(state.textureHeight, 1u) - 1u;
++    PageSpan texture;
++    if (!pageSpan(tex.psm, tex.tbp0, tex.tbw, 0u, 0u, maxU, maxV, texture) ||
++        texture.overlaps(frame) || (depthAccess && texture.overlaps(depth)))
++        return false;
++
++    // Rows use their own caches, which see current VRAM; a stale cached copy
++    // of a texture page would make the serial result order dependent.
++    const uint32_t cachedPage = m_texturePageCache.PageBase() / GSMem::TexturePageCache::kPageSize;
++    return cachedPage < texture.first || cachedPage > texture.last || m_texturePageCache.MatchesVram(m_vram);
++}
++
++void GSCpuBackend::RasterRows(const GSDrawState &state, int minX, int minY, int maxX, int maxY, const RowRasterFn &rows)
++{
++    if (!CanRasterRowsInParallel(state, minX, minY, maxX, maxY))
++    {
++        TexelSource texels;
++        texels.cache = &m_texturePageCache;
++        rows(minY, maxY, texels);
++        return;
++    }
++
++    // The rows cannot see stale texels, so a small texture is decoded once
++    // instead of being swizzled and looked up again for every tap.
++    const auto &tex = state.context.tex0;
++    const uint32_t texW = (state.context.clamp & 0x2u) != 0u ? 1024u : std::max<uint32_t>(state.textureWidth, 1u);
++    const uint32_t texH = ((state.context.clamp >> 2) & 0x2u) != 0u ? 1024u : std::max<uint32_t>(state.textureHeight, 1u);
++    const int64_t pixels = static_cast<int64_t>(maxX - minX + 1) * (maxY - minY + 1);
++    thread_local std::vector<uint32_t> decoded;
++    const bool decode = state.prim.tme && static_cast<int64_t>(texW) * texH * 4 <= pixels;
++    if (decode)
++    {
++        GSMem::TexturePageCache cache;
++        decoded.resize(static_cast<size_t>(texW) * texH);
++        for (uint32_t v = 0; v < texH; ++v)
++            for (uint32_t u = 0; u < texW; ++u)
++                decoded[v * texW + u] = FetchTexel(cache, state, static_cast<int>(u), static_cast<int>(v));
++    }
++
++    RowWorkerPool &pool = RowWorkerPool::instance();
++    const int rowCount = maxY - minY + 1;
++    const int rowsPerChunk = std::max(1, rowCount / static_cast<int>(4u * (pool.workers() + 1u)));
++    const int chunks = (rowCount + rowsPerChunk - 1) / rowsPerChunk;
++    // What each chunk read last: the serial raster leaves the page of the
++    // last texel it read in the shared cache.
++    struct ChunkEnd
++    {
++        uint32_t page;
++        int u;
++        int v;
++    };
++    thread_local std::vector<ChunkEnd> ends;
++    std::vector<ChunkEnd> &chunkEnds = ends;
++    chunkEnds.assign(static_cast<size_t>(chunks), ChunkEnd{UINT32_MAX, -1, -1});
++    // Lambdas do not capture thread_locals: hand the workers the caller's buffer.
++    const uint32_t *decodedTexels = decode ? decoded.data() : nullptr;
++    pool.run(chunks, [&](int chunk)
++    {
++        thread_local GSMem::TexturePageCache cache;
++        cache.Invalidate();
++        TexelSource texels;
++        texels.cache = &cache;
++        texels.decoded = decodedTexels;
++        texels.decodedWidth = texW;
++        const int y0 = minY + chunk * rowsPerChunk;
++        rows(y0, std::min(maxY, y0 + rowsPerChunk - 1), texels);
++        chunkEnds[static_cast<size_t>(chunk)] = ChunkEnd{cache.PageBase(), texels.lastU, texels.lastV};
++    });
++    for (int chunk = chunks - 1; chunk >= 0; --chunk)
++    {
++        const ChunkEnd &end = chunkEnds[static_cast<size_t>(chunk)];
++        if (end.page != UINT32_MAX)
++        {
++            m_texturePageCache.Invalidate();
++            m_texturePageCache.Resolve(m_vram, end.page);
++            break;
++        }
++        if (end.u >= 0)
++        {
++            m_texturePageCache.Invalidate();
++            ReadTextureVramUnlocked(m_texturePageCache, tex.psm, tex.tbp0, tex.tbw, end.u, end.v);
++            break;
++        }
++    }
+ }
+ 
+ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+diff --git a/ps2xTest/gs_cache/CMakeLists.txt b/ps2xTest/gs_cache/CMakeLists.txt
+index 6b7210a..fc339a2 100644
+--- a/ps2xTest/gs_cache/CMakeLists.txt
++++ b/ps2xTest/gs_cache/CMakeLists.txt
+@@ -44,7 +44,7 @@ endfunction()
+ add_gs_cache_suite(ps2_gs_texture_cache_tests gs_texture_cache_tests.cpp texture
+     unaligned_texture unaligned_wrap stale_mirror page_alternation
+     flush_visibility upload_visibility local_copy_visibility raster_visibility
+-    reset_and_rebind invalid_vram_size reserved_psm)
++    reset_and_rebind parallel_raster invalid_vram_size reserved_psm)
+ 
+ add_gs_cache_suite(ps2_gs_clut_cache_tests gs_clut_cache_tests.cpp clut
+     unaligned_csm1_ct32 unaligned_csm1_ct16 unaligned_csm1_ct16s wrapped_clut unaligned_csm2
+diff --git a/ps2xTest/gs_cache/gs_texture_cache_tests.cpp b/ps2xTest/gs_cache/gs_texture_cache_tests.cpp
+index efd10e7..0d45347 100644
+--- a/ps2xTest/gs_cache/gs_texture_cache_tests.cpp
++++ b/ps2xTest/gs_cache/gs_texture_cache_tests.cpp
+@@ -138,6 +138,33 @@ namespace
+         expectEqual(f.sample(tex), kBlue, "initialize invalidates the previous VRAM allocation");
+     }
+ 
++    void parallelRaster()
++    {
++        // Large enough to be split across worker threads with the texture decoded up front.
++        BackendFixture f;
++        auto tex = texture();
++        auto texel = [](uint32_t u, uint32_t v) { return 0x80000000u | (v << 8) | u; };
++        for (uint32_t v = 0; v < 64; ++v)
++            for (uint32_t u = 0; u < 64; ++u)
++                f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, u, v, texel(u, v));
++        auto batch = sprite(tex, 0, 0);
++        batch.state.textureWidth = batch.state.textureHeight = 64;
++        batch.state.context.frame.fbw = 4;
++        batch.state.context.scissor = {0, 255, 0, 255};
++        batch.vertices[1].x = batch.vertices[1].y = 256;
++        batch.vertices[1].u = batch.vertices[1].v = 64 * 16;
++        f.backend.Submit(batch);
++        for (uint32_t y = 0; y < 256; y += 5)
++            for (uint32_t x = 0; x < 256; x += 3)
++                expectEqual(f.backend.ReadVram(GS_PSM_CT32, kOutputPage * 32u, 4u, x, y), texel(x / 4u, y / 4u), "parallel sprite texel");
++
++        // Like the serial raster, the page of the last texel read stays cached until TEXFLUSH.
++        f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, 63, 63, kGreen);
++        expectEqual(f.sample(tex, 63, 63), texel(63, 63), "last page read by the rows stays cached");
++        f.backend.TextureFlush();
++        expectEqual(f.sample(tex, 63, 63), kGreen, "TEXFLUSH after a parallel draw");
++    }
++
+     void invalidVramSize()
+     {
+         BackendFixture f;
+@@ -171,7 +198,8 @@ int main(int argc, char** argv)
+         {"stale_mirror", staleMirror}, {"page_alternation", pageAlternation},
+         {"flush_visibility", flushVisibility}, {"upload_visibility", uploadVisibility},
+         {"local_copy_visibility", localCopyVisibility}, {"raster_visibility", rasterVisibility},
+-        {"reset_and_rebind", resetAndRebind}, {"invalid_vram_size", invalidVramSize},
++        {"reset_and_rebind", resetAndRebind}, {"parallel_raster", parallelRaster},
++        {"invalid_vram_size", invalidVramSize},
+         {"reserved_psm", reservedPsm}
+     });
+ }

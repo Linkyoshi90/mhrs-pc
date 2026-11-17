@@ -1,0 +1,146 @@
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..adf5709 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -111,14 +111,28 @@ namespace ps2recomp
+                            inst.rt, inst.rt);
+     }
+ 
++    // VU0 data memory word selected by the single dest field (x, y, z or w) of VILWR/VISWR.
++    static uint32_t vu0FieldByteOffset(uint8_t destMask)
++    {
++        if (destMask & 0x8)
++            return 0u;
++        if (destMask & 0x4)
++            return 4u;
++        if (destMask & 0x2)
++            return 8u;
++        return 12u;
++    }
++
+     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}", inst.rd, inst.rt); // VILWR.<f> vit, (vis)
++        return fmt::format("{{ uint32_t addr = 0x11004000u + (((uint32_t)ctx->vi[{}] & 0xFFu) << 4) + {}u; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}",
++                           inst.rd, vu0FieldByteOffset(inst.vectorInfo.vectorField), inst.rt); // VILWR.<f> vit, (vis)
+     }
+ 
+     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}", inst.rd, inst.rt); // VISWR.<f> vit, (vis)
++        return fmt::format("{{ uint32_t addr = 0x11004000u + (((uint32_t)ctx->vi[{}] & 0xFFu) << 4) + {}u; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}",
++                           inst.rd, vu0FieldByteOffset(inst.vectorInfo.vectorField), inst.rt); // VISWR.<f> vit, (vis)
+     }
+ 
+     std::string CodeGenerator::translateVU_VIADD(const Instruction &inst)
+@@ -769,7 +783,7 @@ namespace ps2recomp
+     {
+         uint8_t vis = inst.rd;
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
++        return fmt::format("{{ uint32_t addr = 0x11004000u + (((uint32_t)ctx->vi[{}] & 0xFFu) << 4); "
+                            "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
+@@ -783,18 +797,19 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
++        uint8_t vit = inst.rt; // address register
++        uint8_t vfs = inst.rd; // stored register
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
++        return fmt::format("{{ uint32_t addr = 0x11004000u + (((uint32_t)ctx->vi[{}] & 0xFFu) << 4); "
+                            "__m128i old_val = READ128(addr); "
+                            "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+                            "WRITE128(addr, _mm_castps_si128(res)); "
+                            "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           inst.rt,
++                           vit,
++                           vfs,
+                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           vis, vis);
++                           vit, vit);
+     }
+ 
+     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
+@@ -802,7 +817,7 @@ namespace ps2recomp
+         uint8_t vis = inst.rd;
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+         return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
++                           "uint32_t addr = 0x11004000u + (((uint32_t)ctx->vi[{}] & 0xFFu) << 4); "
+                            "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+@@ -815,16 +830,17 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
++        uint8_t vit = inst.rt; // address register
++        uint8_t vfs = inst.rd; // stored register
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+         return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
++                           "uint32_t addr = 0x11004000u + (((uint32_t)ctx->vi[{}] & 0xFFu) << 4); "
+                            "__m128i old_val = READ128(addr); "
+                            "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+                            "WRITE128(addr, _mm_castps_si128(res)); }}",
+-                           vis, vis,
+-                           vis,
+-                           inst.rt,
++                           vit, vit,
++                           vit,
++                           vfs,
+                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
+     }
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 463b6cf..5d1c945 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1464,6 +1464,40 @@ void register_code_generator_tests()
+             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
+         });
+ 
++        tc.Run("VU0 macro VI memory ops address VU0 data memory, not EE RAM", [](TestCase &t) {
++            auto translate = [](uint32_t op, uint8_t field) {
++                Instruction inst{};
++                inst.opcode = OPCODE_COP2;
++                inst.rs = COP2_CO | 0x4;
++                inst.rt = 6;
++                inst.rd = 14;
++                inst.function = 0x3C;
++                inst.vectorInfo.vectorField = field;
++                inst.raw = (((op >> 2) & 0x1F) << 6) | (op & 0x3);
++                CodeGenerator gen({}, {});
++                return gen.translateInstruction(inst);
++            };
++            for (uint32_t op : {static_cast<uint32_t>(VU0_S2_VLQI), static_cast<uint32_t>(VU0_S2_VLQD)})
++            {
++                const std::string out = translate(op, 0xF);
++                t.IsTrue(out.find("0x11004000u + (((uint32_t)ctx->vi[14] & 0xFFu) << 4)") != std::string::npos,
++                         "LQI/LQD ft, (is): address from is (rd) in VU0 data memory");
++                t.IsTrue(out.find("ctx->vu0_vf[6] = ") != std::string::npos, "LQI/LQD load into ft (rt)");
++            }
++            for (uint32_t op : {static_cast<uint32_t>(VU0_S2_VSQI), static_cast<uint32_t>(VU0_S2_VSQD)})
++            {
++                const std::string out = translate(op, 0xF);
++                t.IsTrue(out.find("0x11004000u + (((uint32_t)ctx->vi[6] & 0xFFu) << 4)") != std::string::npos,
++                         "SQI/SQD fs, (it): address from it (rt) in VU0 data memory");
++                t.IsTrue(out.find("ctx->vu0_vf[14]") != std::string::npos, "SQI/SQD store fs (rd)");
++                t.IsTrue(out.find("ctx->vi[6] = (ctx->vi[6]") != std::string::npos, "SQI/SQD step it");
++            }
++            t.IsTrue(translate(VU0_S2_VILWR, 0x4).find("0x11004000u + (((uint32_t)ctx->vi[14] & 0xFFu) << 4) + 4u") != std::string::npos,
++                     "VILWR.y reads the y word of the VU0 quadword");
++            t.IsTrue(translate(VU0_S2_VISWR, 0x1).find("0x11004000u + (((uint32_t)ctx->vi[14] & 0xFFu) << 4) + 12u") != std::string::npos,
++                     "VISWR.w writes the w word of the VU0 quadword");
++        });
++
+         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
+             Function func;
+             func.name = "jal_test";

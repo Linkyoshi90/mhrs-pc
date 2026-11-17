@@ -1,0 +1,143 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+index 7dda4b8..9112e45 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_async_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -60,8 +60,14 @@ private:
+     {
+     };
+     using ImageData = std::vector<uint8_t>;
++    // Draws [first, first + count) of m_pendingDraws.
++    struct DrawRange
++    {
++        uint32_t first;
++        uint32_t count;
++    };
+     // Kept small: a frame queues ~100k of these.
+-    using Command = std::variant<GSPrimitiveBatch, ClutLoad, GSTransferCommand, ImageData, FlushCmd, TextureFlushCmd, GSSyncReason, Clear>;
++    using Command = std::variant<DrawRange, ClutLoad, GSTransferCommand, ImageData, FlushCmd, TextureFlushCmd, GSSyncReason, Clear>;
+ 
+     // wakeNow: wake the worker even if it has less than kWakeDraws commands queued (anything but a draw).
+     template <class T>
+@@ -74,6 +80,8 @@ private:
+     mutable std::mutex m_mutex;
+     mutable std::condition_variable m_cv;
+     std::vector<Command> m_pending;
++    std::vector<GSPrimitiveBatch> m_pendingDraws; // what the DrawRanges in m_pending refer to
++    size_t QueuedLocked() const { return m_pending.size() + m_pendingDraws.size(); }
+     uint64_t m_submitted = 0;
+     uint64_t m_completed = 0;
+     bool m_stop = false;
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index ff593af..fa88ac3 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -31,17 +31,17 @@ template <class T>
+ void GSAsyncBackend::Enqueue(T &&command, bool wakeNow)
+ {
+     std::unique_lock<std::mutex> lock(m_mutex);
+-    if (m_pending.size() >= kMaxPendingCommands)
++    if (QueuedLocked() >= kMaxPendingCommands)
+     {
+         m_wakeNow = true;
+         m_cv.notify_all();
+-        m_cv.wait(lock, [this]() { return m_pending.size() < kMaxPendingCommands; });
++        m_cv.wait(lock, [this]() { return QueuedLocked() < kMaxPendingCommands; });
+     }
+     m_pending.emplace_back(std::in_place_type<std::decay_t<T>>, std::forward<T>(command));
+     ++m_submitted;
+     if (wakeNow)
+         m_wakeNow = true;
+-    const bool wake = wakeNow || m_pending.size() == kWakeDraws;
++    const bool wake = wakeNow || QueuedLocked() == kWakeDraws;
+     lock.unlock();
+     if (wake)
+         m_cv.notify_all();
+@@ -63,7 +63,7 @@ void GSAsyncBackend::Run(Command &command)
+     struct Visitor
+     {
+         GSRasterBackend &b;
+-        void operator()(const GSPrimitiveBatch &batch) { b.Submit(batch); }
++        void operator()(const DrawRange &) {} // WorkerLoop hands draws over itself
+         void operator()(const ClutLoad &c) { b.LoadClut(c.tex0, c.texclut); }
+         void operator()(const GSTransferCommand &t) { b.BeginTransfer(t); }
+         void operator()(const ImageData &d) { b.UploadImage(d.data(), static_cast<uint32_t>(d.size())); }
+@@ -78,25 +78,28 @@ void GSAsyncBackend::Run(Command &command)
+ void GSAsyncBackend::WorkerLoop()
+ {
+     std::vector<Command> batch;
++    std::vector<GSPrimitiveBatch> draws;
+     std::vector<GSDrawStep> run; // consecutive draws and CLUT loads, handed over together
+     for (;;)
+     {
+         {
+             std::unique_lock<std::mutex> lock(m_mutex);
+             m_cv.wait(lock, [this]()
+-                      { return m_stop || (!m_pending.empty() && (m_wakeNow || m_drainWaiters > 0 || m_pending.size() >= kWakeDraws)); });
++                      { return m_stop || (!m_pending.empty() && (m_wakeNow || m_drainWaiters > 0 || QueuedLocked() >= kWakeDraws)); });
+             if (m_pending.empty())
+                 return; // stopping
+             batch.swap(m_pending);
++            draws.swap(m_pendingDraws);
+             m_wakeNow = false;
+         }
+         m_cv.notify_all(); // the queue has room again
+ 
+         for (Command &command : batch)
+         {
+-            if (const auto *draw = std::get_if<GSPrimitiveBatch>(&command))
++            if (const auto *range = std::get_if<DrawRange>(&command))
+             {
+-                run.push_back(GSDrawStep{draw, {}, {}});
++                for (uint32_t k = 0; k < range->count; ++k)
++                    run.push_back(GSDrawStep{&draws[range->first + k], {}, {}});
+                 continue;
+             }
+             if (const auto *clut = std::get_if<ClutLoad>(&command))
+@@ -119,6 +122,7 @@ void GSAsyncBackend::WorkerLoop()
+         }
+         m_cv.notify_all();
+         batch.clear();
++        draws.clear();
+     }
+ }
+ 
+@@ -136,24 +140,29 @@ void GSAsyncBackend::Reset()
+ 
+ void GSAsyncBackend::Submit(const GSPrimitiveBatch &batch)
+ {
+-    Enqueue(batch, false);
++    SubmitBatch(&batch, 1u);
+ }
+ 
+ void GSAsyncBackend::SubmitBatch(const GSPrimitiveBatch *batches, size_t count)
+ {
+     std::unique_lock<std::mutex> lock(m_mutex);
+-    for (size_t i = 0; i < count; ++i)
++    if (QueuedLocked() + count > kMaxPendingCommands && !m_pending.empty())
+     {
+-        if (m_pending.size() >= kMaxPendingCommands)
+-        {
+-            m_wakeNow = true;
+-            m_cv.notify_all();
+-            m_cv.wait(lock, [this]() { return m_pending.size() < kMaxPendingCommands; });
+-        }
+-        m_pending.emplace_back(std::in_place_type<GSPrimitiveBatch>, batches[i]);
++        m_wakeNow = true;
++        m_cv.notify_all();
++        m_cv.wait(lock, [this, count]() { return m_pending.empty() || QueuedLocked() + count <= kMaxPendingCommands; });
++    }
++    const size_t first = m_pendingDraws.size();
++    m_pendingDraws.insert(m_pendingDraws.end(), batches, batches + count);
++    DrawRange *last = m_pending.empty() ? nullptr : std::get_if<DrawRange>(&m_pending.back());
++    if (last && last->first + last->count == first)
++        last->count += static_cast<uint32_t>(count);
++    else
++    {
++        m_pending.emplace_back(std::in_place_type<DrawRange>, DrawRange{static_cast<uint32_t>(first), static_cast<uint32_t>(count)});
+         ++m_submitted;
+     }
+-    const bool wake = m_pending.size() >= kWakeDraws;
++    const bool wake = QueuedLocked() >= kWakeDraws;
+     lock.unlock();
+     if (wake)
+         m_cv.notify_all();

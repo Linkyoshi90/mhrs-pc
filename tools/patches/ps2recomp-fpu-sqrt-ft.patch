@@ -1,0 +1,38 @@
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 435db3a..3a2e454 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -58,7 +58,8 @@ namespace ps2recomp
+                                    "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
+                                    ft, fd, fs, ft);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // R5900 SQRT.S fd, ft takes its operand from ft; the fs field is always 0.
++                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index f4dcafa..ed5335b 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -992,6 +992,19 @@ void register_code_generator_tests()
+             t.IsTrue(mtc0Code.find("Unhandled COP0") == std::string::npos, "MTC0 should not hit unhandled COP0 path");
+         });
+ 
++        tc.Run("SQRT.S reads its operand from ft", [](TestCase &t) {
++            CodeGenerator gen({}, {});
++            Instruction inst{};
++            inst.opcode = OPCODE_COP1;
++            inst.rs = COP1_S;
++            inst.function = COP1_S_SQRT;
++            inst.rt = 3; // ft
++            inst.rd = 0; // fs (always 0 for SQRT.S)
++            inst.sa = 1; // fd
++            const std::string code = gen.translateInstruction(inst);
++            t.IsTrue(code.find("ctx->f[1] = FPU_SQRT_S(ctx->f[3])") != std::string::npos, "sqrt.s $f1, $f3 should read f3 but got: " + code);
++        });
++
+         tc.Run("FCR access uses CFC1/CTC1", [](TestCase &t) {
+             CodeGenerator gen({}, {});
+ 

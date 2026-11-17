@@ -1,0 +1,321 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index fb4b2cc..f0d8263 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -31,6 +31,8 @@ namespace ps2x::iop
+         void registerNativeFunction(NativeFunction function);
+         // Host pad input for the SIO2 DualShock 2 device; survives reset().
+         void setPadInputProvider(IopPadInputProvider provider);
++        // SNDDRV PCM stream DMAed toward SPU2 (audio output tap); survives reset().
++        void setSpuStreamSink(SpuStreamSink sink);
+         // Loaded module id for an IRX's internal (IOPMOD) name, or -1 (LOADFILE SearchModuleByName).
+         [[nodiscard]] int32_t searchModuleByName(std::string_view name) const;
+         // EE sceSifSendCmd: runs the IOP handler registered for cid; false if none.
+diff --git a/ps2xIOP/include/ps2x/iop/iop_types.h b/ps2xIOP/include/ps2x/iop/iop_types.h
+index bed8f9e..aa952fd 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_types.h
++++ b/ps2xIOP/include/ps2x/iop/iop_types.h
+@@ -23,6 +23,9 @@ namespace ps2x::iop
+         std::function<uint32_t(uint32_t entry, uint32_t *gpr, std::span<uint8_t> ram)> call;
+     };
+ 
++    // PCM the game DMAs to an SPU2 core from IOP RAM (SNDDRV software-mixed output stream).
++    using SpuStreamSink = std::function<void(uint32_t madr, const uint8_t *data, uint32_t sizeBytes)>;
++
+     // FNV-1a over (word & mask) for each word, as used by NativeFunction::maskedHash.
+     inline uint32_t nativeMaskedHash(const uint32_t *words, const uint32_t *masks, size_t count)
+     {
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 902b5bb..8ea0bda 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -1,7 +1,10 @@
+ #include "iop_memory.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -242,6 +245,10 @@ namespace ps2x::iop::detail
+ 
+     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
+     {
++        static const bool spu2Log = std::getenv("MHRS_SPU2_LOG") != nullptr; // TEMP-DEBUG(mhrs): SPU2/DMA tracing
++        if (spu2Log && address >= 0x1F900000u && address < 0x1F901000u)
++            std::fprintf(stderr, "[spu2] W %08x = %08x\n", address, value);
++
+         switch (address)
+         {
+         case 0x1F801070u:
+@@ -271,6 +278,54 @@ namespace ps2x::iop::detail
+ 
+         const bool secondCore = address == kDmaSpu1Chcr;
+         m_hardware[address] = value & ~kDmaStart;
++        if (spu2Log) // TEMP-DEBUG(mhrs)
++        {
++            const uint32_t madrIt = m_hardware.count(address - 8u) ? m_hardware[address - 8u] : 0u;
++            const uint32_t bcrIt = m_hardware.count(address - 4u) ? m_hardware[address - 4u] : 0u;
++            std::fprintf(stderr, "[spu2] SDMA core%d madr=%08x bcr=%08x(%ux%u) chcr=%08x dir=%s\n",
++                         secondCore ? 1 : 0, madrIt, bcrIt, bcrIt & 0xFFFFu, bcrIt >> 16u, value,
++                         (value & 1u) ? "ram->spu" : "spu->ram");
++        }
++        // TEMP-DEBUG(mhrs): MHRS_SPU_PCM=<path> captures the mixed PCM stream the game
++        // DMAs to SPU2 core0 (fixed double buffers, 2048 B per transfer).
++        static FILE *pcmCap = []()
++        {
++            if (const char *p = std::getenv("MHRS_SPU_PCM"))
++                return std::fopen(p, "wb");
++            return static_cast<FILE *>(nullptr);
++        }();
++        if (pcmCap && !secondCore && (value & 1u))
++        {
++            const uint32_t madr = m_hardware.count(address - 8u) ? m_hardware[address - 8u] : 0u;
++            const uint32_t bcr = m_hardware.count(address - 4u) ? m_hardware[address - 4u] : 0u;
++            const uint64_t bytes = static_cast<uint64_t>(std::max<uint32_t>(bcr & 0xFFFFu, 1u)) *
++                                   std::max<uint32_t>(bcr >> 16u, 1u) * 4u;
++            const uint32_t src = madr & (RamSize - 1u);
++            if (bytes > 0u && src + bytes <= RamSize)
++            {
++                // The fake instant-DMA makes SNDDRV re-send the same buffer until its next
++                // mix tick refills it (~97% duplicates); collapse consecutive repeats.
++                static std::vector<uint8_t> lastBuf;
++                const uint8_t *p = m_ram.data() + src;
++                if (lastBuf.size() != bytes || std::memcmp(lastBuf.data(), p, bytes) != 0)
++                {
++                    lastBuf.assign(p, p + bytes);
++                    std::fwrite(p, 1, bytes, pcmCap);
++                }
++            }
++        }
++        // SNDDRV's software-mixed PCM stream reaches the "SPU2" as core0 ram->spu DMA; hand
++        // it to the runtime audio backend (which does its own dedupe/rate handling).
++        if (m_spuStreamSink && !secondCore && (value & 1u))
++        {
++            const uint32_t madr = m_hardware.count(address - 8u) ? m_hardware[address - 8u] : 0u;
++            const uint32_t bcr = m_hardware.count(address - 4u) ? m_hardware[address - 4u] : 0u;
++            const uint64_t bytes = static_cast<uint64_t>(std::max<uint32_t>(bcr & 0xFFFFu, 1u)) *
++                                   std::max<uint32_t>(bcr >> 16u, 1u) * 4u;
++            const uint32_t src = madr & (RamSize - 1u);
++            if (bytes > 0u && bytes <= 0x10000u && src + bytes <= RamSize)
++                m_spuStreamSink(madr, m_ram.data() + src, static_cast<uint32_t>(bytes));
++        }
+ 
+         const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
+         const uint32_t alignedStatus = statusAddress & ~3u;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 3833127..e3b746a 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "iop_sio2.h"
++#include "ps2x/iop/iop_types.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -8,6 +9,7 @@
+ #include <span>
+ #include <string>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -72,6 +74,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+         // SIO2 serial bus (pads/memcards); exposed so the subsystem can set the pad input provider.
+         [[nodiscard]] IopSio2 &sio2() noexcept { return m_sio2; }
++        // SNDDRV's software-mixed PCM stream is DMAed to SPU2 through here.
++        void setSpuStreamSink(SpuStreamSink sink) { m_spuStreamSink = std::move(sink); }
+         [[nodiscard]] bool hasDmaStart() const noexcept { return m_dmaStart.has_value(); }
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+         [[nodiscard]] std::span<uint8_t> ramMutable() noexcept { return m_ram; }
+@@ -94,5 +98,6 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
+         IopSio2 m_sio2;
++        SpuStreamSink m_spuStreamSink;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index d037df9..6b72cd5 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1005,6 +1005,11 @@ namespace ps2x::iop::detail
+         m_impl->memory.sio2().setPadInputProvider(std::move(provider));
+     }
+ 
++    void IopEmulator::setSpuStreamSink(SpuStreamSink sink)
++    {
++        m_impl->memory.setSpuStreamSink(std::move(sink));
++    }
++
+     void IopEmulator::registerNativeFunction(NativeFunction function)
+     {
+         m_impl->nativeFunctions.push_back(std::move(function));
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 48ad06b..2720e07 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -28,6 +28,8 @@ namespace ps2x::iop::detail
+         void registerNativeFunction(NativeFunction function);
+         // Host pad input for the SIO2 DualShock 2 device (nullptr = no pad connected).
+         void setPadInputProvider(IopPadInputProvider provider);
++        // SNDDRV PCM stream DMAed toward SPU2 (audio output tap).
++        void setSpuStreamSink(SpuStreamSink sink);
+         [[nodiscard]] int32_t searchModuleByName(std::string_view name) const;
+         bool deliverSifCommand(uint32_t cid, const void *packet, uint32_t size);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 2b3ee2c..aaa77ec 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -102,6 +102,11 @@ namespace ps2x::iop
+         m_impl->emulator.setPadInputProvider(std::move(provider));
+     }
+ 
++    void IopSubsystem::setSpuStreamSink(SpuStreamSink sink)
++    {
++        m_impl->emulator.setSpuStreamSink(std::move(sink));
++    }
++
+     void IopSubsystem::reset()
+     {
+         m_impl->moduleManager.reset();
+diff --git a/ps2xRuntime/include/runtime/ps2_audio.h b/ps2xRuntime/include/runtime/ps2_audio.h
+index a8c2a55..a394cbb 100644
+--- a/ps2xRuntime/include/runtime/ps2_audio.h
++++ b/ps2xRuntime/include/runtime/ps2_audio.h
+@@ -21,6 +21,11 @@ public:
+ 
+     void play(uint32_t sampleAddr, float pitch = 1.0f, float volume = 1.0f,
+               uint32_t voiceIndex = 0xFFFFFFFFu);
++    // Streaming PCM the game mixes in software and DMAs to SPU2 core0 (SNDDRV).
++    // A block is 512 stereo frames at 48 kHz stored as [L256 R256 L256 R256] s16.
++    void onSpuStreamBlock(uint32_t madr, const uint8_t *data, uint32_t sizeBytes);
++    // Creates the 48 kHz stereo output stream; call once on the main thread after InitAudioDevice.
++    void startSpuStream();
+     void stop(uint32_t voiceId);
+     void stopAll();
+     void setAudioReady(bool ready) { m_audioReady = ready; }
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+index 6bb6494..d6b3dc5 100644
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -326,3 +326,96 @@ void PS2AudioBackend::stopAll()
+     m_impl->activeSounds.clear();
+ #endif
+ }
++
++// ---- SNDDRV software-mixed PCM stream (SPU2 core0 DMA tap) -------------------
++// The game mixes everything in IOP RAM and DMAs 2048-byte blocks (512 stereo frames at
++// 48 kHz, laid out [L x256][R x256][L x256][R x256]) toward SPU2 core0. The runtime's
++// instant DMA completion makes it re-send the current block until the next mix tick, so
++// only fresh blocks advance the stream. SPSC lock-free ring: producer = IOP thread
++// (onSpuStreamBlock), consumer = the miniaudio callback thread.
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <atomic>
++
++namespace
++{
++    constexpr uint32_t kSpuStreamRate = 48000u;
++    constexpr uint32_t kSpuRingFrames = 1u << 15u; // ~0.68 s of stereo
++
++    struct SpuStreamState
++    {
++        std::atomic<uint32_t> head{0}; // frames written (monotonic, wraps via mask)
++        std::atomic<uint32_t> tail{0}; // frames read
++        std::array<int16_t, kSpuRingFrames * 2u> pcm{};
++        AudioStream stream{};
++        bool live = false;
++        std::vector<uint8_t> lastBlock;
++        bool hasLast = false;
++    };
++    SpuStreamState g_spuStream;
++
++    void spuStreamCallback(void *buffer, unsigned int frames)
++    {
++        int16_t *out = static_cast<int16_t *>(buffer);
++        const uint32_t tail = g_spuStream.tail.load(std::memory_order_relaxed);
++        const uint32_t head = g_spuStream.head.load(std::memory_order_acquire);
++        const uint32_t got = std::min<uint32_t>(frames, head - tail);
++        for (uint32_t i = 0; i < got; ++i)
++        {
++            const uint32_t slot = (tail + i) & (kSpuRingFrames - 1u);
++            out[i * 2] = g_spuStream.pcm[slot * 2];
++            out[i * 2 + 1] = g_spuStream.pcm[slot * 2 + 1];
++        }
++        for (uint32_t i = got; i < frames; ++i)
++            out[i * 2] = out[i * 2 + 1] = 0; // underrun: silence
++        g_spuStream.tail.store(tail + got, std::memory_order_release);
++    }
++}
++
++void PS2AudioBackend::startSpuStream()
++{
++#if defined(PLATFORM_VITA)
++    return;
++#else
++    if (!m_audioReady || g_spuStream.live)
++        return;
++    g_spuStream.stream = LoadAudioStream(kSpuStreamRate, 16u, 2u);
++    if (!IsAudioStreamValid(g_spuStream.stream))
++        return;
++    SetAudioStreamCallback(g_spuStream.stream, spuStreamCallback);
++    SetAudioStreamVolume(g_spuStream.stream, 1.0f);
++    PlayAudioStream(g_spuStream.stream);
++    g_spuStream.live = true;
++    std::fprintf(stderr, "[audio] SPU stream live (48 kHz stereo)\n");
++#endif
++}
++
++void PS2AudioBackend::onSpuStreamBlock(uint32_t madr, const uint8_t *data, uint32_t sizeBytes)
++{
++    (void)madr;
++    if (!g_spuStream.live || !data || sizeBytes != 2048u)
++        return;
++
++    if (g_spuStream.hasLast && std::memcmp(g_spuStream.lastBlock.data(), data, sizeBytes) == 0)
++        return;
++    g_spuStream.lastBlock.assign(data, data + sizeBytes);
++    g_spuStream.hasLast = true;
++
++    const int16_t *in = reinterpret_cast<const int16_t *>(data);
++    uint32_t head = g_spuStream.head.load(std::memory_order_relaxed);
++    const uint32_t tail = g_spuStream.tail.load(std::memory_order_acquire);
++    if (head - tail + 512u > kSpuRingFrames)
++        return; // emulation outran playback: drop the block rather than overwrite unread audio
++    for (uint32_t half = 0u; half < 2u; ++half)
++    {
++        for (uint32_t i = 0; i < 256u; ++i)
++        {
++            const uint32_t slot = head & (kSpuRingFrames - 1u);
++            g_spuStream.pcm[slot * 2] = in[half * 512u + i];
++            g_spuStream.pcm[slot * 2 + 1] = in[half * 512u + 256u + i];
++            ++head;
++        }
++    }
++    g_spuStream.head.store(head, std::memory_order_release);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c1aea2a..1247b41 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -876,6 +876,10 @@ bool PS2Runtime::initialize(const char *title)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
++        m_audioBackend.startSpuStream();
++        if (m_iopSubsystem) // SNDDRV's software-mixed PCM arrives as SPU2 core0 DMA
++            m_iopSubsystem->setSpuStreamSink([this](uint32_t madr, const uint8_t *data, uint32_t size)
++                                             { m_audioBackend.onSpuStreamBlock(madr, data, size); });
+ #endif
+         SetTargetFPS(60);
+         if (m_debugUiInitCallback)

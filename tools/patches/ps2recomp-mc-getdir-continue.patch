@@ -1,0 +1,81 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 564d873..0055aad 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -89,6 +89,8 @@ namespace ps2_stubs
+         int32_t g_mcLastResult = 0;
+         std::unordered_map<int32_t, McOpenFile> g_mcFiles;
+         std::array<McPortState, 2> g_mcPorts{};
++        // sceMcGetDir continuation: entries already returned by the current listing, per port.
++        std::array<size_t, 2> g_mcDirCursor{};
+         int32_t g_cvMcFileCursor = 0;
+ 
+         constexpr int32_t kCvMcSaveFileBytes = 0x838;
+@@ -699,6 +701,7 @@ namespace ps2_stubs
+         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
+         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
++        const int32_t mode = static_cast<int32_t>(getRegU32(ctx, 7)); // 0 = new listing, else continue
+         const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
+         const uint32_t tableAddr = getRegU32(ctx, 9);
+ 
+@@ -821,8 +824,14 @@ namespace ps2_stubs
+                             entries.push_back(tableEntry);
+                         }
+ 
++                        // Games list a directory one entry at a time (maxent=1, mode=1 to continue) until 0.
++                        size_t &cursor = g_mcDirCursor[static_cast<size_t>(port)];
++                        if (mode == 0)
++                            cursor = 0u;
++                        entries.erase(entries.begin(), entries.begin() + static_cast<std::ptrdiff_t>(std::min(cursor, entries.size())));
+                         const size_t entryCount =
+                             std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
++                        cursor += entryCount;
+                         if (entryCount == 0u || tableAddr == 0u)
+                         {
+                             result = static_cast<int32_t>(entryCount);
+diff --git a/ps2xTest/src/ps2_runtime_io_tests.cpp b/ps2xTest/src/ps2_runtime_io_tests.cpp
+index 4f979be..c93c339 100644
+--- a/ps2xTest/src/ps2_runtime_io_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_io_tests.cpp
+@@ -543,6 +543,40 @@ void register_ps2_runtime_io_tests()
+             t.IsTrue(std::filesystem::exists(hostPath), "sceMcOpen/sceMcWrite should create the host file under mcRoot");
+         });
+ 
++        tc.Run("sceMcGetDir mode 1 continues the previous listing", [](TestCase &t)
++        {
++            TestContext test;
++            std::filesystem::create_directories(test.paths.mcRoot / "SAVEDATA");
++            std::ofstream(test.paths.mcRoot / "SAVEDATA" / "game.dat", std::ios::binary) << "x";
++
++            const uint32_t patternAddr = GUEST_STRING_AREA_START + 0x700;
++            writeGuestString(test.rdram.data(), patternAddr, "/SAVEDATA/*");
++            const char *expected[] = {".", "..", "game.dat"};
++            for (int call = 0; call < 4; ++call)
++            {
++                clearContext(test.ctx);
++                setRegU32(test.ctx, 4, 0u);
++                setRegU32(test.ctx, 5, 0u);
++                setRegU32(test.ctx, 6, patternAddr);
++                setRegU32(test.ctx, 7, call == 0 ? 0u : 1u); // mode
++                setRegU32(test.ctx, 8, 1u);                  // maxent
++                setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
++                ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
++                int32_t cmd = 0;
++                const int32_t count = syncMc(test.rdram, &cmd);
++                if (call < 3)
++                {
++                    t.Equals(count, 1, "each continued call should return the next entry");
++                    const char *name = reinterpret_cast<const char *>(test.rdram.data() + GUEST_MC_TABLE_ADDR + 0x20u);
++                    t.Equals(std::string(name), std::string(expected[call]), "entries should come back in listing order");
++                }
++                else
++                {
++                    t.Equals(count, 0, "the listing should end with 0 entries instead of restarting");
++                }
++            }
++        });
++
+         tc.Run("sceMcGetDir includes dot entries and file metadata", [](TestCase &t)
+         {
+             TestContext test;

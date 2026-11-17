@@ -1,0 +1,263 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..5d2535d 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -20,7 +20,7 @@ namespace ps2x::iop::detail
+     }
+ 
+     IopMemory::IopMemory()
+-        : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize)
++        : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize), m_hardwareWords((Spu2End - HardwareBase) / 4u)
+     {
+         reset();
+     }
+@@ -30,6 +30,7 @@ namespace ps2x::iop::detail
+         std::fill(m_ram.begin(), m_ram.end(), uint8_t{0});
+         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
+         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
++        std::fill(m_hardwareWords.begin(), m_hardwareWords.end(), 0u);
+         m_hardware.clear();
+         m_allocations.clear();
+         m_heapCursor = HeapBase;
+@@ -39,12 +40,7 @@ namespace ps2x::iop::detail
+         m_dmaStart.reset();
+     }
+ 
+-    uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
+-    {
+-        return address & 0x1FFFFFFFu;
+-    }
+-
+-    uint8_t IopMemory::read8(uint32_t address) const
++    uint8_t IopMemory::read8Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys < RamSize)
+@@ -55,7 +51,7 @@ namespace ps2x::iop::detail
+         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
+     }
+ 
+-    uint16_t IopMemory::read16(uint32_t address) const
++    uint16_t IopMemory::read16Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys + 1u < RamSize)
+@@ -67,7 +63,7 @@ namespace ps2x::iop::detail
+         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
+     }
+ 
+-    uint32_t IopMemory::read32(uint32_t address) const
++    uint32_t IopMemory::read32Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+@@ -91,7 +87,7 @@ namespace ps2x::iop::detail
+                (static_cast<uint32_t>(read8(address + 3u)) << 24u);
+     }
+ 
+-    void IopMemory::write8(uint32_t address, uint8_t value)
++    void IopMemory::write8Slow(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys < RamSize)
+@@ -112,7 +108,7 @@ namespace ps2x::iop::detail
+         writeHardware32(aligned, current);
+     }
+ 
+-    void IopMemory::write16(uint32_t address, uint16_t value)
++    void IopMemory::write16Slow(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys + 1u < RamSize)
+@@ -125,7 +121,7 @@ namespace ps2x::iop::detail
+         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
+     }
+ 
+-    void IopMemory::write32(uint32_t address, uint32_t value)
++    void IopMemory::write32Slow(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+@@ -211,11 +207,24 @@ namespace ps2x::iop::detail
+                (phys >= SifBase && phys < SifEnd);
+     }
+ 
+-    uint32_t IopMemory::readHardware32(uint32_t address) const
++    uint32_t IopMemory::hardwareValue(uint32_t address) const
+     {
++        if (address - HardwareBase < Spu2End - HardwareBase)
++            return m_hardwareWords[(address - HardwareBase) >> 2u];
+         const auto value = m_hardware.find(address);
+-        if (value != m_hardware.end())
+-            return value->second;
++        return value != m_hardware.end() ? value->second : 0u;
++    }
++
++    uint32_t &IopMemory::hardwareSlot(uint32_t address)
++    {
++        if (address - HardwareBase < Spu2End - HardwareBase)
++            return m_hardwareWords[(address - HardwareBase) >> 2u];
++        return m_hardware[address];
++    }
++
++    uint32_t IopMemory::readHardware32(uint32_t address) const
++    {
++        // The interrupt registers are never stored (writeHardware32 handles them first).
+         switch (address)
+         {
+         case 0x1F801070u:
+@@ -225,7 +234,7 @@ namespace ps2x::iop::detail
+         case 0x1F801078u:
+             return m_interruptControl;
+         default:
+-            return 0u;
++            return hardwareValue(address);
+         }
+     }
+ 
+@@ -246,26 +255,20 @@ namespace ps2x::iop::detail
+             break;
+         }
+ 
+-        m_hardware[address] = value;
++        hardwareSlot(address) = value;
+         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
+             return;
+ 
+         const bool secondCore = address == kDmaSpu1Chcr;
+-        m_hardware[address] = value & ~kDmaStart;
++        hardwareSlot(address) = value & ~kDmaStart;
+ 
+         const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
+         const uint32_t alignedStatus = statusAddress & ~3u;
+         const uint32_t shift = (statusAddress & 2u) * 8u;
+-        uint32_t status = 0u;
+-        if (const auto current = m_hardware.find(alignedStatus); current != m_hardware.end())
+-            status = current->second;
+-        status |= 0x80u << shift;
+-        m_hardware[alignedStatus] = status;
++        hardwareSlot(alignedStatus) = hardwareValue(alignedStatus) | (0x80u << shift);
+ 
+         const uint32_t blockControlAddress = address - sizeof(uint32_t);
+-        uint32_t blockControl = 0u;
+-        if (const auto current = m_hardware.find(blockControlAddress); current != m_hardware.end())
+-            blockControl = current->second;
++        const uint32_t blockControl = hardwareValue(blockControlAddress);
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 992bd21..1d9ee95 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -41,12 +42,67 @@ namespace ps2x::iop::detail
+ 
+         void reset();
+ 
+-        [[nodiscard]] uint8_t read8(uint32_t address) const;
+-        [[nodiscard]] uint16_t read16(uint32_t address) const;
+-        [[nodiscard]] uint32_t read32(uint32_t address) const;
+-        void write8(uint32_t address, uint8_t value);
+-        void write16(uint32_t address, uint16_t value);
+-        void write32(uint32_t address, uint32_t value);
++        // RAM accesses inline; everything else (and the RAM edge cases) goes to the *Slow versions.
++        [[nodiscard]] uint8_t read8(uint32_t address) const
++        {
++            const uint32_t phys = physicalAddress(address);
++            return phys < RamSize ? m_ram[phys] : read8Slow(address);
++        }
++        [[nodiscard]] uint16_t read16(uint32_t address) const
++        {
++            const uint32_t phys = physicalAddress(address);
++            if (phys + 1u < RamSize)
++            {
++                uint16_t value;
++                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
++                return value;
++            }
++            return read16Slow(address);
++        }
++        [[nodiscard]] uint32_t read32(uint32_t address) const
++        {
++            const uint32_t phys = physicalAddress(address);
++            if ((phys & 3u) == 0u && phys < RamSize)
++            {
++                uint32_t value;
++                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
++                return value;
++            }
++            return read32Slow(address);
++        }
++        void write8(uint32_t address, uint8_t value)
++        {
++            const uint32_t phys = physicalAddress(address);
++            if (phys < RamSize)
++            {
++                m_ram[phys] = value;
++                m_owned[phys] = 1u;
++                return;
++            }
++            write8Slow(address, value);
++        }
++        void write16(uint32_t address, uint16_t value)
++        {
++            const uint32_t phys = physicalAddress(address);
++            if (phys + 1u < RamSize)
++            {
++                std::memcpy(m_ram.data() + phys, &value, sizeof(value));
++                std::memset(m_owned.data() + phys, 1, sizeof(value));
++                return;
++            }
++            write16Slow(address, value);
++        }
++        void write32(uint32_t address, uint32_t value)
++        {
++            const uint32_t phys = physicalAddress(address);
++            if ((phys & 3u) == 0u && phys < RamSize)
++            {
++                std::memcpy(m_ram.data() + phys, &value, sizeof(value));
++                std::memset(m_owned.data() + phys, 1, sizeof(value));
++                return;
++            }
++            write32Slow(address, value);
++        }
+ 
+         [[nodiscard]] bool readRam(uint32_t address, void *destination, size_t size) const;
+         [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);
+@@ -72,17 +128,26 @@ namespace ps2x::iop::detail
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+         [[nodiscard]] std::span<uint8_t> ramMutable() noexcept { return m_ram; }
+ 
+-        [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
++        [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept { return address & 0x1FFFFFFFu; }
+ 
+     private:
++        [[nodiscard]] uint8_t read8Slow(uint32_t address) const;
++        [[nodiscard]] uint16_t read16Slow(uint32_t address) const;
++        [[nodiscard]] uint32_t read32Slow(uint32_t address) const;
++        void write8Slow(uint32_t address, uint8_t value);
++        void write16Slow(uint32_t address, uint16_t value);
++        void write32Slow(uint32_t address, uint32_t value);
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
++        [[nodiscard]] uint32_t hardwareValue(uint32_t address) const;
++        [[nodiscard]] uint32_t &hardwareSlot(uint32_t address);
+ 
+         std::vector<uint8_t> m_ram;
+         std::vector<uint8_t> m_owned;
+         std::vector<uint8_t> m_scratch;
+-        std::unordered_map<uint32_t, uint32_t> m_hardware;
++        std::vector<uint32_t> m_hardwareWords; // registers in [HardwareBase, Spu2End), by word
++        std::unordered_map<uint32_t, uint32_t> m_hardware; // any other address
+         std::vector<Allocation> m_allocations;
+         uint32_t m_heapCursor = HeapBase;
+         uint32_t m_interruptStatus = 0;

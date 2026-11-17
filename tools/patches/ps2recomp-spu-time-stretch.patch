@@ -1,0 +1,334 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_audio_stretch.h b/ps2xRuntime/include/runtime/ps2_audio_stretch.h
+new file mode 100755
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_audio_stretch.h
+@@ -0,0 +1,141 @@
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++
++// WSOLA time stretch for the SNDDRV PCM stream. Below real time the game mixes audio slower than
++// the device plays it; instead of playing what arrived and then silence (choppy), the stream is
++// stretched to the arrival rate at unchanged pitch. At real time it is a near-transparent copy.
++// Reads a stereo int16 ring (frames head/tail counters, mask = ring frames - 1); advances tail.
++// Frames up to kSearch behind tail are read too, so the ring must keep them: the producer stays
++// within kMaxQueue of tail (dropping blocks beyond it) and the ring is far larger than that.
++class SpuTimeStretch
++{
++public:
++    static constexpr uint32_t kGrain = 1024u;                // frames per grain (~21 ms at 48 kHz)
++    static constexpr uint32_t kHop = kGrain / 2u;            // output hop: periodic Hann at 50% overlap sums to 1
++    static constexpr uint32_t kOverlap = kGrain - kHop;
++    static constexpr uint32_t kSearch = 192u;                // +- frames searched for the best splice
++    // The game mixes in bursts (FMV: swings of ~65 ms): the queue needs room above the target
++    // or blocks get dropped, which skips audio and runs it ahead of the video.
++    static constexpr uint32_t kTargetQueue = 4096u;          // input frames kept ahead of the read point (~85 ms)
++    static constexpr uint32_t kMaxQueue = 8192u;             // producer drops blocks beyond this (~170 ms)
++    static constexpr uint32_t kMinQueue = kSearch + kGrain;  // below this the input is starved
++
++    SpuTimeStretch()
++    {
++        for (uint32_t i = 0; i < kGrain; ++i)
++            m_window[i] = 0.5f - 0.5f * std::cos(6.283185307f * static_cast<float>(i) / kGrain);
++    }
++
++    // produced: frames the game has mixed so far, dropped blocks included (head counts only kept ones;
++    // measuring from head would let drops slow playback, which keeps the queue full and drops more).
++    void render(const int16_t *ring, uint32_t mask, uint32_t head, uint32_t produced, uint32_t &tail,
++                int16_t *out, uint32_t frames)
++    {
++        if (frames == 0u)
++            return;
++        // Arrival rate (input frames per output frame), averaged over ~0.5 s of bursty 512-frame blocks.
++        const float alpha = std::min(1.0f, static_cast<float>(frames) / 24000.0f);
++        m_rate += alpha * (static_cast<float>(produced - m_lastProduced) / static_cast<float>(frames) - m_rate);
++        m_lastProduced = produced;
++        for (uint32_t i = 0; i < frames; ++i)
++        {
++            if (m_hopPos == kHop)
++            {
++                makeHop(ring, mask, head, tail);
++                m_hopPos = 0u;
++            }
++            out[i * 2u] = m_hopOut[m_hopPos * 2u];
++            out[i * 2u + 1u] = m_hopOut[m_hopPos * 2u + 1u];
++            ++m_hopPos;
++        }
++    }
++
++private:
++    static float mono(const int16_t *ring, uint32_t mask, uint32_t frame)
++    {
++        const uint32_t slot = frame & mask;
++        return static_cast<float>(ring[slot * 2u]) + static_cast<float>(ring[slot * 2u + 1u]);
++    }
++
++    void makeHop(const int16_t *ring, uint32_t mask, uint32_t head, uint32_t &tail)
++    {
++        const int32_t queued = static_cast<int32_t>(head - tail);
++        const bool starved = queued < static_cast<int32_t>(kMinQueue);
++        // Starved: splice from the newest input (repeats it) while fading out.
++        const uint32_t nominal = starved ? head - kMinQueue : tail;
++
++        uint32_t best = nominal;
++        if (m_havePrev)
++        {
++            // Pick the start whose first kOverlap frames best continue the previous grain
++            // (normalized cross-correlation against the previous grain's natural continuation).
++            std::array<float, kOverlap> ref;
++            std::array<float, kOverlap + 2u * kSearch> cand;
++            const uint32_t refStart = m_prevStart + kHop;
++            for (uint32_t i = 0; i < kOverlap; ++i)
++                ref[i] = mono(ring, mask, refStart + i);
++            const uint32_t candStart = nominal - kSearch;
++            for (uint32_t i = 0; i < cand.size(); ++i)
++                cand[i] = mono(ring, mask, candStart + i);
++            float energy = 0.0f;
++            for (uint32_t i = 0; i < kOverlap; ++i)
++                energy += cand[i] * cand[i];
++            float bestScore = -1e30f;
++            for (uint32_t k = 0; k <= 2u * kSearch; ++k)
++            {
++                float dot = 0.0f;
++                for (uint32_t i = 0; i < kOverlap; ++i)
++                    dot += ref[i] * cand[k + i];
++                const float score = dot / std::sqrt(std::max(energy, 0.0f) + 1.0f);
++                if (score > bestScore)
++                {
++                    bestScore = score;
++                    best = candStart + k;
++                }
++                if (k < 2u * kSearch)
++                    energy += cand[k + kOverlap] * cand[k + kOverlap] - cand[k] * cand[k];
++            }
++        }
++
++        m_gain += std::clamp((starved ? 0.0f : 1.0f) - m_gain, -0.25f, 0.25f);
++        for (uint32_t i = 0; i < kGrain; ++i)
++        {
++            const float w = m_window[i] * m_gain;
++            const uint32_t slot = (best + i) & mask;
++            m_acc[i * 2u] += w * static_cast<float>(ring[slot * 2u]);
++            m_acc[i * 2u + 1u] += w * static_cast<float>(ring[slot * 2u + 1u]);
++        }
++        for (uint32_t i = 0; i < kHop * 2u; ++i)
++            m_hopOut[i] = static_cast<int16_t>(std::clamp(std::lround(m_acc[i]), -32768l, 32767l));
++        std::memmove(m_acc.data(), m_acc.data() + kHop * 2u, kOverlap * 2u * sizeof(float));
++        std::fill(m_acc.begin() + kOverlap * 2u, m_acc.end(), 0.0f);
++        m_prevStart = best;
++        m_havePrev = true;
++
++        if (!starved)
++        {
++            // Consume at the arrival rate, steered toward kTargetQueue frames queued.
++            const float ratio = std::clamp(m_rate * (0.5f + 0.5f * static_cast<float>(queued) / kTargetQueue), 0.25f, 1.5f);
++            m_frac += static_cast<float>(kHop) * ratio;
++            const uint32_t advance = static_cast<uint32_t>(m_frac);
++            m_frac -= static_cast<float>(advance);
++            tail += advance;
++        }
++    }
++
++    std::array<float, kGrain> m_window{};
++    std::array<float, kGrain * 2u> m_acc{};
++    std::array<int16_t, kHop * 2u> m_hopOut{};
++    uint32_t m_hopPos = kHop;
++    uint32_t m_prevStart = 0u;
++    bool m_havePrev = false;
++    uint32_t m_lastProduced = 0u;
++    float m_rate = 1.0f;
++    float m_gain = 0.0f;
++    float m_frac = 0.0f;
++};
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -333,7 +333,8 @@ void PS2AudioBackend::stopAll()
+ // buffers. The runtime's instant DMA completion makes it re-send each buffer until the next mix
+ // tick, so only a buffer whose content changed since it was last sent advances the stream.
+ // SPSC lock-free ring: producer = IOP thread (onSpuStreamBlock), consumer = the miniaudio
+-// callback thread.
++// callback thread, which time-stretches the stream to its arrival rate (SpuTimeStretch).
++#include "runtime/ps2_audio_stretch.h"
+ #include <algorithm>
+ #include <array>
+ #include <cstdio>
+@@ -343,39 +344,31 @@ namespace
+ {
+     constexpr uint32_t kSpuStreamRate = 48000u;
+     constexpr uint32_t kSpuRingFrames = 1u << 15u; // ~0.68 s of stereo
+-    // Most audio queued ahead of playback (~85 ms): when the mixer runs ahead of real time, newer blocks are
+-    // dropped instead of letting the ring fill, which kept everything ~0.7 s late.
+-    constexpr uint32_t kSpuMaxQueuedFrames = 4096u;
+     constexpr size_t kSpuSourceBuffers = 4u;
+ 
+     struct SpuStreamState
+     {
+         std::atomic<uint32_t> head{0}; // frames written (monotonic, wraps via mask)
+         std::atomic<uint32_t> tail{0}; // frames read
++        std::atomic<uint32_t> produced{0}; // fresh frames from the mixer, dropped ones included
+         std::array<int16_t, kSpuRingFrames * 2u> pcm{};
+         AudioStream stream{};
+         bool live = false;
+         // What each source buffer (DMA address) last sent.
+         std::array<std::pair<uint32_t, std::vector<uint8_t>>, kSpuSourceBuffers> lastByMadr{};
+         size_t sources = 0;
++        SpuTimeStretch stretch; // consumer-side only
+     };
+     SpuStreamState g_spuStream;
+ 
+     void spuStreamCallback(void *buffer, unsigned int frames)
+     {
+-        int16_t *out = static_cast<int16_t *>(buffer);
+-        const uint32_t tail = g_spuStream.tail.load(std::memory_order_relaxed);
++        uint32_t tail = g_spuStream.tail.load(std::memory_order_relaxed);
+         const uint32_t head = g_spuStream.head.load(std::memory_order_acquire);
+-        const uint32_t got = std::min<uint32_t>(frames, head - tail);
+-        for (uint32_t i = 0; i < got; ++i)
+-        {
+-            const uint32_t slot = (tail + i) & (kSpuRingFrames - 1u);
+-            out[i * 2] = g_spuStream.pcm[slot * 2];
+-            out[i * 2 + 1] = g_spuStream.pcm[slot * 2 + 1];
+-        }
+-        for (uint32_t i = got; i < frames; ++i)
+-            out[i * 2] = out[i * 2 + 1] = 0; // underrun: silence
+-        g_spuStream.tail.store(tail + got, std::memory_order_release);
++        g_spuStream.stretch.render(g_spuStream.pcm.data(), kSpuRingFrames - 1u, head,
++                                   g_spuStream.produced.load(std::memory_order_relaxed), tail,
++                                   static_cast<int16_t *>(buffer), frames);
++        g_spuStream.tail.store(tail, std::memory_order_release);
+     }
+ }
+ 
+@@ -417,12 +410,13 @@ void PS2AudioBackend::onSpuStreamBlock(uint32_t madr, const uint8_t *data, uint3
+     if (last->second.size() == sizeBytes && std::memcmp(last->second.data(), data, sizeBytes) == 0)
+         return; // a resend: this buffer has not been mixed again yet
+     last->second.assign(data, data + sizeBytes);
++    g_spuStream.produced.fetch_add(512u, std::memory_order_relaxed);
+ 
+     const int16_t *in = reinterpret_cast<const int16_t *>(data);
+     uint32_t head = g_spuStream.head.load(std::memory_order_relaxed);
+     const uint32_t tail = g_spuStream.tail.load(std::memory_order_acquire);
+-    if (head - tail + 512u > kSpuMaxQueuedFrames)
+-        return; // the mixer ran ahead of playback: drop the block to keep latency low
++    if (head - tail + 512u > SpuTimeStretch::kMaxQueue)
++        return; // the mixer ran far ahead of playback: drop the block to bound latency
+     for (uint32_t half = 0u; half < 2u; ++half)
+     {
+         for (uint32_t i = 0; i < 256u; ++i)
+diff --git a/ps2xTest/src/ps2_runtime_io_tests.cpp b/ps2xTest/src/ps2_runtime_io_tests.cpp
+--- a/ps2xTest/src/ps2_runtime_io_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_io_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_runtime.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_stubs.h"
++#include "runtime/ps2_audio_stretch.h"
+ 
+ #include <filesystem>
+ #include <fstream>
+@@ -10,6 +11,8 @@
+ #include <vector>
+ #include <cstring>
+ #include <chrono>
++#include <algorithm>
++#include <cmath>
+ 
+ using namespace ps2_syscalls;
+ 
+@@ -795,4 +798,91 @@ void register_ps2_runtime_io_tests()
+                      "sceCdRead should copy sector data from the configured image");
+         });
+     });
++
++    MiniTest::Case("SpuTimeStretch", [](TestCase &tc)
++    {
++        struct Played
++        {
++            std::vector<int16_t> left; // left channel played after the first second
++            uint32_t dropped = 0u;     // blocks dropped by onSpuStreamBlock's queue cap
++        };
++        // Feeds a 440 Hz tone at `arrival` x real time in bursts of `burst` 512-frame blocks (with
++        // onSpuStreamBlock's drop rule), stops feeding after `feedSeconds`, and plays 480-frame
++        // device callbacks for `seconds`.
++        auto play = [](float arrival, float seconds, float feedSeconds, uint32_t burst = 1u)
++        {
++            constexpr uint32_t kRing = 1u << 15u;
++            std::vector<int16_t> ring(kRing * 2u), buf(480u * 2u);
++            Played played;
++            SpuTimeStretch stretch;
++            uint32_t head = 0u, tail = 0u, produced = 0u;
++            uint64_t toneFrame = 0u;
++            float credit = 0.0f;
++            const uint32_t callbacks = static_cast<uint32_t>(seconds * 100.0f);
++            for (uint32_t c = 0; c < callbacks; ++c)
++            {
++                if (c < feedSeconds * 100.0f)
++                    credit += 480.0f * arrival;
++                for (; credit >= 512.0f * burst; credit -= 512.0f * burst)
++                {
++                    for (uint32_t b = 0; b < burst; ++b)
++                    {
++                        produced += 512u;
++                        if (head - tail + 512u > SpuTimeStretch::kMaxQueue)
++                        {
++                            toneFrame += 512u;
++                            played.dropped += c >= 100u ? 1u : 0u;
++                            continue;
++                        }
++                        for (uint32_t i = 0; i < 512u; ++i, ++head, ++toneFrame)
++                        {
++                            const auto v = static_cast<int16_t>(8000.0 * std::sin(6.283185307179586 * 440.0 * toneFrame / 48000.0));
++                            ring[(head & (kRing - 1u)) * 2u] = ring[(head & (kRing - 1u)) * 2u + 1u] = v;
++                        }
++                    }
++                }
++                stretch.render(ring.data(), kRing - 1u, head, produced, tail, buf.data(), 480u);
++                for (uint32_t i = 0; c >= 100u && i < 480u; ++i)
++                    played.left.push_back(buf[i * 2u]);
++            }
++            return played;
++        };
++        auto expectTone = [](TestCase &t, const Played &played)
++        {
++            const std::vector<int16_t> &left = played.left;
++            uint32_t quietWindows = 0u, crossings = 0u;
++            for (size_t w = 0; w + 480u <= left.size(); w += 480u)
++            {
++                double sum = 0.0;
++                for (size_t i = w; i < w + 480u; ++i)
++                    sum += static_cast<double>(left[i]) * left[i];
++                quietWindows += std::sqrt(sum / 480.0) < 0.5 * 8000.0 / std::sqrt(2.0) ? 1u : 0u;
++            }
++            for (size_t i = 1; i < left.size(); ++i)
++                crossings += (left[i - 1] < 0) != (left[i] < 0) ? 1u : 0u;
++            const double hz = crossings / 2.0 / (left.size() / 48000.0);
++            t.Equals(quietWindows, 0u, "no 10 ms window should drop out");
++            t.IsTrue(std::abs(hz - 440.0) < 440.0 * 0.02, "pitch should stay 440 Hz, got " + std::to_string(hz));
++            t.Equals(played.dropped, 0u, "no block should be dropped");
++        };
++
++        tc.Run("stretches a stream arriving at 0.45x real time without gaps at the original pitch", [&](TestCase &t)
++        {
++            expectTone(t, play(0.45f, 6.0f, 6.0f));
++        });
++        tc.Run("plays a real-time stream continuously", [&](TestCase &t)
++        {
++            expectTone(t, play(1.0f, 4.0f, 4.0f));
++        });
++        tc.Run("plays a real-time stream arriving in 60 ms bursts without dropping blocks", [&](TestCase &t)
++        {
++            expectTone(t, play(1.0f, 6.0f, 6.0f, 6u));
++        });
++        tc.Run("fades to silence once the stream stops", [&](TestCase &t)
++        {
++            const std::vector<int16_t> left = play(1.0f, 3.0f, 2.0f).left;
++            t.IsTrue(std::all_of(left.end() - 4800, left.end(), [](int16_t s) { return s == 0; }),
++                     "the last 100 ms should be silent");
++        });
++    });
+ }

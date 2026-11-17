@@ -1,0 +1,402 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index b00fc49..f267634 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -384,6 +384,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
++    src/lib/gs/gs_async_backend.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+new file mode 100644
+index 0000000..2dcf71f
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -0,0 +1,78 @@
++#pragma once
++
++#include "runtime/gs/gs_backend.h"
++
++#include <condition_variable>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <variant>
++#include <vector>
++
++// Runs another backend on its own thread, so drawing overlaps the EE and VU1 that produce it.
++// Commands run in submission order on one worker; every call that reads GS memory or backend
++// state first waits for the commands queued before it, so results match the inner backend
++// called directly.
++class GSAsyncBackend final : public GSRasterBackend
++{
++public:
++    explicit GSAsyncBackend(std::unique_ptr<GSRasterBackend> inner);
++    ~GSAsyncBackend() override;
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++private:
++    struct ClutLoad
++    {
++        GSTex0Reg tex0;
++        GSTexClutReg texclut;
++    };
++    struct Clear
++    {
++        GSContext context;
++        uint32_t rgba;
++    };
++    struct FlushCmd
++    {
++    };
++    struct TextureFlushCmd
++    {
++    };
++    using ImageData = std::vector<uint8_t>;
++    // Kept small: a frame queues ~100k of these.
++    using Command = std::variant<GSPrimitiveBatch, ClutLoad, GSTransferCommand, ImageData, FlushCmd, TextureFlushCmd, GSSyncReason, Clear>;
++
++    void Enqueue(Command &&command);
++    void Drain() const;
++    void Run(Command &command);
++    void WorkerLoop();
++
++    std::unique_ptr<GSRasterBackend> m_inner;
++    mutable std::mutex m_mutex;
++    mutable std::condition_variable m_cv;
++    std::vector<Command> m_pending;
++    uint64_t m_submitted = 0;
++    uint64_t m_completed = 0;
++    bool m_stop = false;
++    std::thread m_worker;
++};
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+new file mode 100644
+index 0000000..869dca4
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -0,0 +1,179 @@
++#include "runtime/gs/gs_async_backend.h"
++
++#include <utility>
++
++namespace
++{
++    // Bounds the queue so a producer far ahead of the rasteriser cannot use unbounded memory.
++    constexpr size_t kMaxPendingCommands = 1u << 18u; // a few frames
++}
++
++GSAsyncBackend::GSAsyncBackend(std::unique_ptr<GSRasterBackend> inner)
++    : m_inner(std::move(inner))
++{
++    m_worker = std::thread([this]() { WorkerLoop(); });
++}
++
++GSAsyncBackend::~GSAsyncBackend()
++{
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_stop = true;
++    }
++    m_cv.notify_all();
++    m_worker.join();
++}
++
++void GSAsyncBackend::Enqueue(Command &&command)
++{
++    std::unique_lock<std::mutex> lock(m_mutex);
++    m_cv.wait(lock, [this]() { return m_pending.size() < kMaxPendingCommands; });
++    const bool wasEmpty = m_pending.empty();
++    m_pending.push_back(std::move(command));
++    ++m_submitted;
++    lock.unlock();
++    if (wasEmpty)
++        m_cv.notify_all();
++}
++
++void GSAsyncBackend::Drain() const
++{
++    std::unique_lock<std::mutex> lock(m_mutex);
++    const uint64_t target = m_submitted;
++    m_cv.wait(lock, [this, target]() { return m_completed >= target; });
++}
++
++void GSAsyncBackend::Run(Command &command)
++{
++    struct Visitor
++    {
++        GSRasterBackend &b;
++        void operator()(const GSPrimitiveBatch &batch) { b.Submit(batch); }
++        void operator()(const ClutLoad &c) { b.LoadClut(c.tex0, c.texclut); }
++        void operator()(const GSTransferCommand &t) { b.BeginTransfer(t); }
++        void operator()(const ImageData &d) { b.UploadImage(d.data(), static_cast<uint32_t>(d.size())); }
++        void operator()(FlushCmd) { b.Flush(); }
++        void operator()(TextureFlushCmd) { b.TextureFlush(); }
++        void operator()(GSSyncReason reason) { b.Sync(reason); }
++        void operator()(const Clear &c) { b.ClearFramebuffer(c.context, c.rgba); }
++    };
++    std::visit(Visitor{*m_inner}, command);
++}
++
++void GSAsyncBackend::WorkerLoop()
++{
++    std::vector<Command> batch;
++    for (;;)
++    {
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_cv.wait(lock, [this]() { return m_stop || !m_pending.empty(); });
++            if (m_pending.empty())
++                return; // stopping
++            batch.swap(m_pending);
++        }
++        m_cv.notify_all(); // the queue has room again
++
++        for (Command &command : batch)
++            Run(command);
++
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_completed += batch.size();
++        }
++        m_cv.notify_all();
++        batch.clear();
++    }
++}
++
++void GSAsyncBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    Drain();
++    m_inner->Initialize(vram, vramSize);
++}
++
++void GSAsyncBackend::Reset()
++{
++    Drain();
++    m_inner->Reset();
++}
++
++void GSAsyncBackend::Submit(const GSPrimitiveBatch &batch)
++{
++    Enqueue(batch);
++}
++
++void GSAsyncBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    Enqueue(ClutLoad{tex0, texclut});
++}
++
++void GSAsyncBackend::BeginTransfer(const GSTransferCommand &transfer)
++{
++    Enqueue(transfer);
++}
++
++void GSAsyncBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    Enqueue(ImageData(data, data + sizeBytes));
++}
++
++void GSAsyncBackend::Flush()
++{
++    Enqueue(FlushCmd{});
++}
++
++void GSAsyncBackend::TextureFlush()
++{
++    Enqueue(TextureFlushCmd{});
++}
++
++void GSAsyncBackend::Sync(GSSyncReason reason)
++{
++    // Nothing the guest can observe needs the drawing done here (FINISH only raises a CSR bit);
++    // the readback calls below drain the queue themselves.
++    Enqueue(reason);
++}
++
++PresentationFrame GSAsyncBackend::Present(const GSPresentationRequest &request)
++{
++    Drain();
++    return m_inner->Present(request);
++}
++
++bool GSAsyncBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    Enqueue(Clear{context, rgba});
++    // ponytail: mirrors GSCpuBackend's own early-out (it also fails without VRAM); callers ignore the result today.
++    return context.frame.fbw != 0u;
++}
++
++uint32_t GSAsyncBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    Drain();
++    return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
++}
++
++uint32_t GSAsyncBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    Drain();
++    return m_inner->ReadVram(psm, base, bw, x, y);
++}
++
++void GSAsyncBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    Drain();
++    m_inner->WriteVram(psm, base, bw, x, y, value);
++}
++
++void GSAsyncBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    Drain();
++    m_inner->SnapshotVram(out);
++}
++
++GSTransferSnapshot GSAsyncBackend::GetTransferSnapshot() const
++{
++    Drain();
++    return m_inner->GetTransferSnapshot();
++}
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 98ffeb9..a774e13 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -1,5 +1,7 @@
+ #include "ps2_runtime.h"
+ #include "games_database.h"
++#include "runtime/gs/gs_async_backend.h"
++#include "runtime/gs/gs_cpu_backend.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+ #endif
+@@ -220,6 +222,11 @@ int main(int argc, char *argv[])
+             return 1;
+         }
+ 
++        // Rasterise on a worker thread so drawing overlaps the EE/VU1 work that produces it.
++        // PS2X_GS_SYNC=1 keeps it on the calling thread (for A/B checks).
++        if (!std::getenv("PS2X_GS_SYNC"))
++            runtime.gs().setRasterBackend(std::make_unique<GSAsyncBackend>(std::make_unique<GSCpuBackend>()));
++
+         if (!runtime.loadELF(filePathStr))
+         {
+             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
+diff --git a/ps2xTest/gs_cache/CMakeLists.txt b/ps2xTest/gs_cache/CMakeLists.txt
+index fc339a2..af36821 100644
+--- a/ps2xTest/gs_cache/CMakeLists.txt
++++ b/ps2xTest/gs_cache/CMakeLists.txt
+@@ -13,6 +13,7 @@ option(PS2_GS_CACHE_BUILD_MEMORY_TESTS "Build tests for the new shared cached-re
+ find_package(Threads REQUIRED)
+ add_library(ps2_gs_cache_backend_under_test STATIC
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_cpu_backend.cpp"
++    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_async_backend.cpp"
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_frontend.cpp"
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gs_memory.cpp"
+ )
+@@ -57,3 +58,5 @@ if(PS2_GS_CACHE_BUILD_MEMORY_TESTS)
+         ct32 ct24 ct16 ct16s t8 t4 t8h t4hl t4hh z32 z24 z16 z16s
+         alias_lanes physical_tag_aliases)
+ endif()
++
++add_gs_cache_suite(ps2_gs_async_backend_tests gs_async_backend_tests.cpp async readback_waits)
+diff --git a/ps2xTest/gs_cache/gs_async_backend_tests.cpp b/ps2xTest/gs_cache/gs_async_backend_tests.cpp
+new file mode 100644
+index 0000000..96f825c
+--- /dev/null
++++ b/ps2xTest/gs_cache/gs_async_backend_tests.cpp
+@@ -0,0 +1,73 @@
++#include "gs_test_support.h"
++#include "runtime/gs/gs_async_backend.h"
++
++#include <memory>
++
++using namespace GSTest;
++
++namespace
++{
++    // Runs the same calls on a direct backend and on one behind GSAsyncBackend.
++    struct AsyncFixture
++    {
++        std::vector<uint8_t> directVram = std::vector<uint8_t>(kVramSize);
++        std::vector<uint8_t> asyncVram = std::vector<uint8_t>(kVramSize);
++        GSCpuBackend direct;
++        GSAsyncBackend async{std::make_unique<GSCpuBackend>()};
++
++        AsyncFixture()
++        {
++            direct.Initialize(directVram.data(), kVramSize);
++            async.Initialize(asyncVram.data(), kVramSize);
++        }
++
++        template <typename Fn>
++        void both(Fn &&fn)
++        {
++            fn(static_cast<GSRasterBackend &>(direct));
++            fn(static_cast<GSRasterBackend &>(async));
++        }
++    };
++
++    void readbackWaitsForQueuedWork()
++    {
++        AsyncFixture f;
++        const auto tex = texture();
++        f.both([&](GSRasterBackend &b) { b.WriteVram(tex.psm, tex.tbp0, tex.tbw, 0, 0, kRed); });
++        // Many draws then an upload: a readback must see all of them, in order.
++        for (uint32_t i = 0; i < 2000u; ++i)
++        {
++            auto batch = sprite(tex, 0, 0);
++            batch.state.prim.tme = false;
++            for (auto &vertex : batch.vertices)
++            {
++                vertex.r = static_cast<uint8_t>(i);
++                vertex.g = static_cast<uint8_t>(i >> 8);
++            }
++            f.both([&](GSRasterBackend &b) { b.Submit(batch); });
++        }
++        GSTransferCommand transfer{};
++        transfer.direction = 0;
++        transfer.bitbltbuf.dbp = tex.tbp0;
++        transfer.bitbltbuf.dbw = tex.tbw;
++        transfer.bitbltbuf.dpsm = tex.psm;
++        transfer.trxreg.rrw = transfer.trxreg.rrh = 1;
++        uint32_t pixel = kGreen;
++        f.both([&](GSRasterBackend &b) { b.BeginTransfer(transfer); });
++        f.both([&](GSRasterBackend &b) { b.UploadImage(reinterpret_cast<const uint8_t *>(&pixel), sizeof(pixel)); });
++        pixel = kBlue; // the queued upload must have taken its own copy
++
++        expectEqual(f.async.ReadVram(GS_PSM_CT32, kOutputPage * 32u, 1u, 0u, 0u),
++                    f.direct.ReadVram(GS_PSM_CT32, kOutputPage * 32u, 1u, 0u, 0u), "last draw visible");
++        expectEqual(f.async.ReadVram(tex.psm, tex.tbp0, tex.tbw, 0, 0), kGreen, "upload visible");
++        std::vector<uint8_t> a, d;
++        f.async.SnapshotVram(a);
++        f.direct.SnapshotVram(d);
++        require(a == d, "same GS memory as the direct backend");
++    }
++}
++
++int main(int argc, char **argv)
++{
++    return run(argc, argv, {{"readback_waits", readbackWaitsForQueuedWork}});
++}

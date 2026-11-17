@@ -1,0 +1,176 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_pad_keys.h b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+index dab5481..4258824 100755
+--- a/ps2xRuntime/include/runtime/ps2_pad_keys.h
++++ b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+@@ -39,7 +39,8 @@ inline uint8_t ps2PadMouseAxis(float delta, float scale)
+ // One line per target, replacing the default bindings of that target ("#" starts a comment):
+ //   <target> = <input>[, <input>...]
+ // targets:  up down left right cross circle square triangle l1 r1 l2 r2 l3 r3 start select (buttons),
+-//           move_up move_down move_left move_right (left stick), look_up look_down look_left look_right (right stick)
++//           move_up move_down move_left move_right (left stick), look_up look_down look_left look_right (right stick),
++//           skip_movie (not a pad button: ends the movie that is playing)
+ // inputs:   a key name (W, SPACE, LEFT_SHIFT, F1, KP_0, UP ...), mouse:left|right|middle|side|extra,
+ //           pad:<button> (a b x y lb rb lt rt back start ls rs dpad_up dpad_down dpad_left dpad_right),
+ //           pad:<axis><+|-> (lx ly rx ry; + is right/down)
+@@ -85,6 +86,7 @@ enum PadTarget : uint8_t
+     PadLookDown,
+     PadLookLeft,
+     PadLookRight,
++    PadSkipMovie,
+     PadTargetCount
+ };
+ 
+@@ -105,6 +107,11 @@ std::vector<std::string> ps2PadParseControls(std::string_view text, PadControls
+ // The defaults with the controls file applied, loaded on first use.
+ const PadControls &ps2PadControls();
+ 
++// True once per press of the skip_movie input (polled while a movie plays), or once the movie has shown
++// PS2X_SKIP_MOVIES=<n> pictures.
++// held: the caller's memory of the input (-1 before its first poll, so a key held from before does not count).
++bool ps2PadSkipMoviePressed(int &held, uint32_t picturesShown);
++
+ // Stick byte for a deflection in [-1, 1].
+ inline uint8_t ps2PadStickByte(float v)
+ {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index f959e1a..3cc89b8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -2,6 +2,7 @@
+ #include "Common.h"
+ #include "MPEG.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ps2_pad_keys.h"
+ 
+ #if !defined(PS2X_HAS_FFMPEG)
+ #define PS2X_HAS_FFMPEG 1
+@@ -497,6 +498,8 @@ namespace ps2_stubs
+             bool sawSequenceEnd = false;
+             bool streamEnded = false;
+             bool decoderFailed = false;
++            bool skipped = false;  // the player pressed skip_movie: report the end from here on
++            int skipKeyHeld = -1;  // ps2PadSkipMoviePressed's memory
+             uint64_t cdStreamGeneration = 0u;
+             bool waitingForVideoSequenceHeader = true;
+             std::vector<uint8_t> videoSequenceSyncBuffer;
+@@ -2365,10 +2368,15 @@ namespace ps2_stubs
+         {
+             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
++            if (ps2PadSkipMoviePressed(playback.skipKeyHeld, playback.picturesServed))
++                playback.skipped = true;
++            if (playback.skipped)
++                playback.decodedFrames.clear();
+             if (playback.decodedFrames.empty() &&
+                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
+                 !playback.streamEnded &&
+-                !playback.decoderFailed)
++                !playback.decoderFailed &&
++                !playback.skipped)
+             {
+                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
+                 {
+@@ -2460,8 +2468,9 @@ namespace ps2_stubs
+                 width = playback.width;
+                 height = playback.height;
+                 frameCount = playback.picturesServed;
+-                reachedEnd = mpegProducerEnded(playback) &&
+-                             (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
++                reachedEnd = playback.skipped ||
++                             (mpegProducerEnded(playback) &&
++                              (playback.streamEnded || (playback.decoderFailed && playback.sawInput)));
+             }
+         }
+ 
+@@ -2561,7 +2570,7 @@ namespace ps2_stubs
+             ++g_mpeg_stub_state.isEndTraceCount;
+         }
+ 
+-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
++        setReturnS32(ctx, (playback.skipped || (ended && playback.decodedFrames.empty() && presentationComplete)) ? 1 : 0);
+     }
+ 
+     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index c93828a..d2634b6 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -23,7 +23,8 @@ namespace
+     constexpr const char *kTargetNames[PadTargetCount] = {
+         "up", "down", "left", "right", "cross", "circle", "square", "triangle",
+         "l1", "r1", "l2", "r2", "l3", "r3", "start", "select",
+-        "move_up", "move_down", "move_left", "move_right", "look_up", "look_down", "look_left", "look_right"};
++        "move_up", "move_down", "move_left", "move_right", "look_up", "look_down", "look_left", "look_right",
++        "skip_movie"};
+ 
+     struct Name
+     {
+@@ -133,7 +134,8 @@ PadControls ps2PadDefaultControls()
+         "l1 = Q, mouse:right, pad:lb\n" "r1 = E, mouse:left, pad:rb\n" "l2 = LEFT_SHIFT, pad:lt\n" "r2 = RIGHT_SHIFT, pad:rt\n"
+         "l3 = pad:ls\n" "r3 = pad:rs\n" "start = ENTER, pad:start\n" "select = TAB, pad:back\n"
+         "move_up = W, pad:ly-\n" "move_down = S, pad:ly+\n" "move_left = A, pad:lx-\n" "move_right = D, pad:lx+\n"
+-        "look_up = UP, pad:ry-\n" "look_down = DOWN, pad:ry+\n" "look_left = LEFT, pad:rx-\n" "look_right = RIGHT, pad:rx+\n",
++        "look_up = UP, pad:ry-\n" "look_down = DOWN, pad:ry+\n" "look_left = LEFT, pad:rx-\n" "look_right = RIGHT, pad:rx+\n"
++        "skip_movie = ESCAPE, BACKSPACE\n",
+         controls);
+     return controls;
+ }
+@@ -231,20 +233,12 @@ const PadControls &ps2PadControls()
+     return controls;
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++namespace
+ {
+-    if (!data || size < 32)
+-        return false;
+-
+-    std::memset(data, 0, 32);
+-    data[0] = 0x01;
+-    data[1] = kPadAnalogMarker;
+-
+-    const PadControls &controls = ps2PadControls();
+-    const bool gamepad = IsGamepadAvailable(controls.gamepad);
+     // How far a target is pressed, 0..1: the strongest of its inputs.
+-    const auto strength = [&](PadTarget target, float sensitivity)
++    float targetStrength(const PadControls &controls, PadTarget target, float sensitivity)
+     {
++        const bool gamepad = IsGamepadAvailable(controls.gamepad);
+         float best = 0.0f;
+         for (const PadInput &input : controls.bind[target])
+         {
+@@ -263,7 +257,33 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             best = std::max(best, v);
+         }
+         return best;
+-    };
++    }
++}
++
++bool ps2PadSkipMoviePressed(int &held, uint32_t picturesShown)
++{
++    // PS2X_SKIP_MOVIES=<n>: skip every movie after n pictures (for unattended runs).
++    static const long autoSkip = std::getenv("PS2X_SKIP_MOVIES") ? std::atol(std::getenv("PS2X_SKIP_MOVIES")) : -1;
++    const bool always = autoSkip >= 0 && static_cast<long>(picturesShown) >= autoSkip;
++    const int down = IsWindowReady() && targetStrength(ps2PadControls(), PadSkipMovie, 1.0f) > 0.5f ? 1 : 0;
++    // ponytail: ending a movie before it has properly started hangs the game (seen at picture 0; 60 is the
++    // tested value), so a press in its first 2 s is ignored. Find what the game waits for if that matters.
++    const bool pressed = held == 0 && down == 1 && picturesShown >= 60u;
++    held = down;
++    return pressed || always;
++}
++
++bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++{
++    if (!data || size < 32)
++        return false;
++
++    std::memset(data, 0, 32);
++    data[0] = 0x01;
++    data[1] = kPadAnalogMarker;
++
++    const PadControls &controls = ps2PadControls();
++    const auto strength = [&](PadTarget target, float sensitivity) { return targetStrength(controls, target, sensitivity); };
+ 
+     uint16_t btns = 0xFFFFu;
+     for (size_t button = 0; button < 16u; ++button)

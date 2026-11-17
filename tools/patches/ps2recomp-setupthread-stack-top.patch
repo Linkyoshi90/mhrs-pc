@@ -1,0 +1,58 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..aa7f26f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -489,24 +489,13 @@ namespace ps2_syscalls
+         const uint32_t stackSize = stackSizeSigned > 0
+                                        ? static_cast<uint32_t>(stackSizeSigned)
+                                        : 0u;
++        // stack == -1: the region is [RAM_SIZE - size, RAM_SIZE). Stacks grow down, so $sp starts at
++        // its top, same as the explicit-stack case below. Games size their heap to end at the region base.
++        const uint32_t autoStackBase = (stackSize != 0u && stackSize < PS2_RAM_SIZE) ? PS2_RAM_SIZE - stackSize
++                                                                                       : PS2_RAM_SIZE;
+         if (stack == 0xFFFFFFFFu)
+         {
+-            if (stackSizeSigned > 0)
+-            {
+-                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
+-                if (requestedSize < PS2_RAM_SIZE)
+-                {
+-                    sp = PS2_RAM_SIZE - requestedSize;
+-                }
+-                else
+-                {
+-                    sp = PS2_RAM_SIZE;
+-                }
+-            }
+-            else
+-            {
+-                sp = PS2_RAM_SIZE;
+-            }
++            sp = PS2_RAM_SIZE;
+         }
+         else if (stack != 0u)
+         {
+@@ -523,7 +512,7 @@ namespace ps2_syscalls
+         sp &= ~0xFu;
+         if (stack == 0xFFFFFFFFu)
+         {
+-            initialStack = sp;
++            initialStack = autoStackBase;
+         }
+         else if (stack != 0u)
+         {
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..972fbbe 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -1094,8 +1094,8 @@ void register_ps2_runtime_kernel_tests()
+             setRegU32(env.ctx, 6, kMainStackSize);
+             t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
+                      "SetupThread syscall should dispatch");
+-            t.Equals(::getRegU32(&env.ctx, 2), kExpectedStack,
+-                     "automatic main stack should start below the reserved top-of-RDRAM area");
++            t.Equals(::getRegU32(&env.ctx, 2), PS2_RAM_SIZE,
++                     "automatic main stack pointer should start at the top of its region (stacks grow down)");
+ 
+             // ReferThreadStatus can be called after many nested frames have moved $sp.
+             // It must report the initial stack recorded by SetupThread, not this live snapshot.

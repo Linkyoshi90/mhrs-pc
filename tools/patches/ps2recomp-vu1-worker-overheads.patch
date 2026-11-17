@@ -1,0 +1,469 @@
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+index 2012083..783c1ac 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -33,6 +33,12 @@ public:
+     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+ 
+     void drain();
++    // What submit + drain do for one packet when nothing is queued.
++    void process(const uint8_t *data, uint32_t sizeBytes)
++    {
++        if (data && sizeBytes >= 16 && m_processFn)
++            m_processFn(data, sizeBytes);
++    }
+     bool empty() const { return m_queue.empty(); }
+ 
+ private:
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 24fdff7..7e38fbc 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -351,10 +351,31 @@ public:
+     // worker, so it can run beside the EE; the EE keeps VIF1 parsing, DMA registers and interrupts. The EE
+     // drains it before it observes GS or VU1 state. PS2_GIFVU_WORKER=inline|lockstep|async picks the mode
+     // (inline: the old synchronous behaviour).
+-    void startGifVuWorker(OrderedWorker::Mode mode) { m_gifVuWorker.start(mode); }
+-    void stopGifVuWorker() { m_gifVuWorker.stop(); }
++    void startGifVuWorker(OrderedWorker::Mode mode)
++    {
++        m_gsWorker.start(mode, "GsFrontend");
++        m_gifVuWorker.start(mode, "GifVuWorker");
++    }
++    void stopGifVuWorker()
++    {
++        m_gifVuWorker.stop(); // it posts to the GS stage
++        m_gsWorker.stop();
++    }
+     void postGifVu(std::function<void()> job) { m_gifVuWorker.post(std::move(job)); }
+-    void drainGifVu() const { m_gifVuWorker.drain(); }
++    // The GS frontend (packets reaching the GS, native GS uploads) runs as a second ordered stage after the
++    // GIF/VU worker, so the worker does not wait for it. postGs from the GIF/VU worker keeps their order;
++    // postGsAfterGifVu orders an EE request after the GIF/VU work the EE issued before it.
++    void postGs(std::function<void()> job) { m_gsWorker.post(std::move(job)); }
++    void postGsAfterGifVu(std::function<void()> job)
++    {
++        postGifVu([this, job = std::move(job)]() mutable { postGs(std::move(job)); });
++    }
++    bool gsStageInline() const { return m_gsWorker.mode() == OrderedWorker::Mode::Inline; }
++    void drainGifVu() const
++    {
++        m_gifVuWorker.drain(); // what it posted to the GS stage is queued there now
++        m_gsWorker.drain();
++    }
+     bool onGifVuWorker() const { return m_gifVuWorker.onWorkerThread(); }
+     // Testing: run every VIF1 UNPACK through the loop that reads VU1 memory (what the EE-side one must match).
+     void setVif1UnpackReference(bool on) { m_vif1UnpackReference = on; }
+@@ -481,7 +502,9 @@ public:
+     void queueIntcCause(uint32_t cause);
+     void issuePath3Mask(bool masked);
+ 
+-    // Last member: destroyed first, so no job outlives what it uses.
++    // Last members: destroyed first (the GIF/VU worker before the GS stage it posts to), so no job outlives what
++    // it uses.
++    mutable OrderedWorker m_gsWorker;
+     mutable OrderedWorker m_gifVuWorker;
+ };
+ 
+diff --git a/ps2xRuntime/include/runtime/ps2_ordered_worker.h b/ps2xRuntime/include/runtime/ps2_ordered_worker.h
+index f830474..6d1f4bf 100644
+--- a/ps2xRuntime/include/runtime/ps2_ordered_worker.h
++++ b/ps2xRuntime/include/runtime/ps2_ordered_worker.h
+@@ -7,6 +7,9 @@
+ #include <exception>
+ #include <functional>
+ #include <mutex>
++#if defined(__linux__)
++#include <pthread.h>
++#endif
+ #include <string>
+ #include <thread>
+ #include <utility>
+@@ -30,7 +33,8 @@ public:
+     OrderedWorker &operator=(const OrderedWorker &) = delete;
+     ~OrderedWorker() { stop(); }
+ 
+-    void start(Mode mode)
++    // name: the thread's name (Linux, at most 15 characters), for profilers and affinity tools.
++    void start(Mode mode, const char *name = nullptr)
+     {
+         stop();
+         if (mode == Mode::Inline)
+@@ -40,6 +44,12 @@ public:
+         m_mode = mode;
+         m_thread = std::thread([this] { loop(); });
+         m_threadId = m_thread.get_id();
++#if defined(__linux__)
++        if (name)
++            pthread_setname_np(m_thread.native_handle(), name);
++#else
++        (void)name;
++#endif
+     }
+ 
+     // Runs what is still queued, then ends the thread; later jobs run inline.
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 055d9d5..a746bf9 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -2,6 +2,8 @@
+ #define PS2_VU1_H
+ 
+ #include <array>
++#include <memory>
++#include <vector>
+ #include <bit>
+ #include <cstddef>
+ #include <cstdint>
+@@ -283,17 +285,29 @@ private:
+ 
+     Unit m_unit;
+     VU1State m_state;
+-    std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
+     DecodedInstructionPair m_uncachedPair{};
+     const uint8_t *m_cachedVuCode = nullptr;
+     const PS2Memory *m_cachedMemory = nullptr;
+     uint32_t m_cachedCodeSize = 0;
+     uint64_t m_cachedCodeGeneration = 0;
+     bool m_decodedCodeCacheValid = false;
+-    std::array<CompiledBlockFn, kMaxDecodedPairs> m_compiledBlocks{}; // by pair index, for the cached code
+-    bool m_hasCompiledBlocks = false;
+-    bool m_compiledBlocksBound = false; // compiled blocks were enabled when the cache was built
+-    uint64_t m_cachedCodeHash = 0;     // of the cached code, set when PS2_VU1_DUMP_DIR is
++    uint64_t m_cachedCodeHash = 0; // of the cached code, set when PS2_VU1_DUMP_DIR is
++    // A code image decoded and bound to compiled blocks. Games swap a few microprograms in and out, so the last
++    // kMaxDecodedImages images are kept (found by content) instead of decoding and binding every upload anew.
++    struct DecodedImage
++    {
++        std::vector<uint8_t> code;
++        uint64_t hash = 0;
++        uint64_t lastUse = 0;
++        bool blocksEnabled = false; // compiled blocks were enabled when it was bound
++        bool hasCompiledBlocks = false;
++        std::array<DecodedInstructionPair, kMaxDecodedPairs> decoded{};
++        std::array<CompiledBlockFn, kMaxDecodedPairs> compiledBlocks{}; // by pair index
++    };
++    static constexpr size_t kMaxDecodedImages = 16u;
++    std::vector<std::unique_ptr<DecodedImage>> m_decodedImages;
++    DecodedImage *m_image = nullptr; // the cached code's, valid with m_decodedCodeCacheValid
++    uint64_t m_imageUses = 0;
+ 
+     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+     ScalarPipelineEntry m_fdiv{};
+@@ -362,7 +376,7 @@ private:
+     static constexpr void decodeScoreboardSlots(DecodedInstructionPair &decoded);
+     bool prepareDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
+     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+-    void bindCompiledBlocks(const uint8_t *vuCode, uint32_t codeSize);
++    void bindCompiledBlocks(DecodedImage &image, const uint8_t *vuCode, uint32_t codeSize);
+     void dumpCodeForCompiler(const uint8_t *vuCode, uint32_t codeSize);
+ 
+     void execUpper(uint32_t instr);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 42b06f1..3ef016b 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -247,6 +247,7 @@ PS2Memory::PS2Memory()
+ PS2Memory::~PS2Memory()
+ {
+     m_gifVuWorker.stop();
++    m_gsWorker.stop();
+     if (m_rdram)
+     {
+         delete[] m_rdram;
+@@ -298,7 +299,7 @@ bool PS2Memory::initialize(size_t ramSize)
+ {
+     // PS2Runtime starts the GIF/VU worker itself; this lets a bare PS2Memory (tests) use it too.
+     if (const char *mode = std::getenv("PS2_GIFVU_WORKER"))
+-        m_gifVuWorker.start(OrderedWorker::modeFromName(mode, OrderedWorker::Mode::Inline));
++        startGifVuWorker(OrderedWorker::modeFromName(mode, OrderedWorker::Mode::Inline));
+     auto cleanup = [this]()
+     {
+         delete[] m_rdram;
+@@ -2028,6 +2029,13 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+         flushMaskedPath3Packets(false);
+     }
+ 
++    // A lone packet drained at once goes straight through, as queueing and draining it would.
++    if (m_gifArbiter && drainImmediately && m_gifArbiter->empty())
++    {
++        m_gifArbiter->process(data, sizeBytes);
++        return;
++    }
++
+     if (m_gifArbiter)
+         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
+     else if (m_gifPacketCallback)
+@@ -2241,9 +2249,9 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
+     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+     m_seenGifCopy = true;
+     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+-    postGifVu([&gs, regs = std::array<uint64_t, 4>{setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3]},
+-               image = std::vector<uint8_t>(imageData, imageData + imageBytes)]
+-              { gs.uploadImageNative(regs[0], regs[1], regs[2], regs[3], image.data(), static_cast<uint32_t>(image.size())); });
++    postGsAfterGifVu([&gs, regs = std::array<uint64_t, 4>{setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3]},
++                      image = std::vector<uint8_t>(imageData, imageData + imageBytes)]
++                     { gs.uploadImageNative(regs[0], regs[1], regs[2], regs[3], image.data(), static_cast<uint32_t>(image.size())); });
+ 
+     m_ioRegisters[GIF_CHANNEL + 0x30u] = finalTadr;
+     m_ioRegisters[GIF_CHANNEL + 0x40u] = 0u;
+@@ -2319,8 +2327,8 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
+         return false;
+     if (!gs.canProcessNativePackedGIFPacket(payload, payloadBytes))
+         return false;
+-    postGifVu([&gs, packet = std::vector<uint8_t>(payload, payload + payloadBytes)]
+-              { gs.processNativePackedGIFPacket(packet.data(), static_cast<uint32_t>(packet.size())); });
++    postGsAfterGifVu([&gs, packet = std::vector<uint8_t>(payload, payload + payloadBytes)]
++                     { gs.processNativePackedGIFPacket(packet.data(), static_cast<uint32_t>(packet.size())); });
+ 
+     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+     m_seenGifCopy = true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b168be2..156d745 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -682,7 +682,15 @@ bool PS2Runtime::syncCoreSubsystems()
+ 
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+-                                    { m_gs.processGIFPacket(data, size); });
++                                    {
++                                        if (m_memory.gsStageInline())
++                                        {
++                                            m_gs.processGIFPacket(data, size);
++                                            return;
++                                        }
++                                        m_memory.postGs([this, packet = std::vector<uint8_t>(data, data + size)]
++                                                        { m_gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size())); });
++                                    });
+     m_memory.setGifArbiter(&m_gifArbiter);
+     // VIF1 MSCAL/MSCNT: the run goes to the GIF/VU worker. VPU_STAT's D/T stop bits come from the run only when
+     // FBRST enables D/T stops (execute/resume clear them otherwise), and only then does the EE wait for it.
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 551cf63..9086b2e 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -868,9 +868,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         postGifVu([this, writes = std::move(writes)]
+                                   {
+                                       for (const LaneWrite &w : writes)
++                                      {
++                                          if (w.mask == 0xFu)
++                                          {
++                                              std::memcpy(m_vu1Data + w.offset, w.lanes, sizeof(w.lanes));
++                                              continue;
++                                          }
+                                           for (uint32_t field = 0u; field < 4u; ++field)
+                                               if ((w.mask >> field) & 1u)
+-                                                  std::memcpy(m_vu1Data + w.offset + field * 4u, &w.lanes[field], sizeof(uint32_t)); });
++                                                  std::memcpy(m_vu1Data + w.offset + field * 4u, &w.lanes[field], sizeof(uint32_t));
++                                      } });
+                 }
+             }
+             pos += totalBytes;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index c32e468..f95a8e4 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -381,14 +381,16 @@ void VU1Interpreter::progressXgkick()
+         }
+ 
+         const uint32_t qwordOffset = m_xgkick.copiedBytes;
+-        const uint32_t firstSource = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++        const uint32_t dataSize = m_activeVuDataSize;
++        const auto wrap = [dataSize](uint32_t address) { return (dataSize & (dataSize - 1u)) == 0u ? address & (dataSize - 1u) : address % dataSize; };
++        const uint32_t firstSource = wrap(m_xgkick.sourceAddress + m_xgkick.copiedBytes);
+         if (firstSource + 16u <= m_activeVuDataSize)
+             std::memcpy(m_xgkickPacket.data() + m_xgkick.copiedBytes, m_activeVuData + firstSource, 16u);
+         else
+         {
+             for (uint32_t i = 0; i < 16u; ++i)
+             {
+-                const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
++                const uint32_t source = wrap(m_xgkick.sourceAddress + m_xgkick.copiedBytes + i);
+                 m_xgkickPacket[m_xgkick.copiedBytes + i] = m_activeVuData[source];
+             }
+         }
+@@ -524,10 +526,41 @@ void VU1Interpreter::registerCompiledBlocks(const CompiledBlock *blocks, size_t
+ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+                                              const PS2Memory *memory, uint64_t generation)
+ {
+-    const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
+-    for (uint32_t i = 0; i < pairCount; ++i)
+-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+-    bindCompiledBlocks(vuCode, codeSize);
++    uint64_t contentHash = codeSize;
++    for (uint32_t i = 0; i + 8u <= codeSize; i += 8u)
++    {
++        uint64_t word = 0;
++        std::memcpy(&word, vuCode + i, sizeof(word));
++        contentHash = (contentHash ^ word) * 0x9E3779B97F4A7C15ull;
++        contentHash ^= contentHash >> 29;
++    }
++    const bool blocksEnabled = compiledBlocksEnabled();
++    DecodedImage *image = nullptr;
++    for (const auto &candidate : m_decodedImages)
++        if (candidate->hash == contentHash && candidate->blocksEnabled == blocksEnabled && candidate->code.size() == codeSize &&
++            std::memcmp(candidate->code.data(), vuCode, codeSize) == 0)
++        {
++            image = candidate.get();
++            break;
++        }
++    if (!image)
++    {
++        if (m_decodedImages.size() < kMaxDecodedImages)
++            image = m_decodedImages.emplace_back(std::make_unique<DecodedImage>()).get();
++        else
++            image = std::min_element(m_decodedImages.begin(), m_decodedImages.end(),
++                                     [](const auto &a, const auto &b) { return a->lastUse < b->lastUse; })
++                        ->get();
++        image->code.assign(vuCode, vuCode + codeSize);
++        image->hash = contentHash;
++        image->blocksEnabled = blocksEnabled;
++        const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
++        for (uint32_t i = 0; i < pairCount; ++i)
++            image->decoded[i] = decodeInstructionPair(vuCode, i * 8u);
++        bindCompiledBlocks(*image, vuCode, codeSize);
++    }
++    image->lastUse = ++m_imageUses;
++    m_image = image;
+     if (vu1DumpDir() != nullptr)
+     {
+         uint64_t hash = 1469598103934665603ull;
+@@ -549,21 +582,20 @@ void VU1Interpreter::setCompiledBlocksEnabled(bool enabled)
+ }
+ 
+ // A block is only valid for code whose words match the ones it was compiled from.
+-void VU1Interpreter::bindCompiledBlocks(const uint8_t *vuCode, uint32_t codeSize)
++void VU1Interpreter::bindCompiledBlocks(DecodedImage &image, const uint8_t *vuCode, uint32_t codeSize)
+ {
+-    m_compiledBlocks.fill(nullptr);
+-    m_hasCompiledBlocks = false;
+-    m_compiledBlocksBound = compiledBlocksEnabled();
+-    if (!m_compiledBlocksBound || m_unit != Unit::VU1 || codeSize != kCompiledCodeSize)
++    image.compiledBlocks.fill(nullptr);
++    image.hasCompiledBlocks = false;
++    if (!image.blocksEnabled || m_unit != Unit::VU1 || codeSize != kCompiledCodeSize)
+         return;
+     for (const CompiledBlock *block : compiledBlockRegistry())
+     {
+         const uint32_t pairIndex = block->pc / 8u;
+-        if ((block->pc & 7u) != 0u || block->pc + block->pairCount * 8u > codeSize || m_compiledBlocks[pairIndex] ||
++        if ((block->pc & 7u) != 0u || block->pc + block->pairCount * 8u > codeSize || image.compiledBlocks[pairIndex] ||
+             std::memcmp(vuCode + block->pc, block->words, block->pairCount * 8u) != 0)
+             continue;
+-        m_compiledBlocks[pairIndex] = block->fn;
+-        m_hasCompiledBlocks = true;
++        image.compiledBlocks[pairIndex] = block->fn;
++        image.hasCompiledBlocks = true;
+     }
+ }
+ 
+@@ -631,7 +663,7 @@ bool VU1Interpreter::prepareDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+         m_cachedMemory != memory ||
+         m_cachedCodeSize != codeSize ||
+         m_cachedCodeGeneration != generation ||
+-        m_compiledBlocksBound != compiledBlocksEnabled())
++        m_image->blocksEnabled != compiledBlocksEnabled())
+     {
+         rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
+     }
+@@ -710,9 +742,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+-        if (m_hasCompiledBlocks && codeCached && (m_state.pc & 7u) == 0u)
++        if (codeCached && m_image->hasCompiledBlocks && (m_state.pc & 7u) == 0u)
+         {
+-            if (const CompiledBlockFn block = m_compiledBlocks[m_state.pc / 8u])
++            if (const CompiledBlockFn block = m_image->compiledBlocks[m_state.pc / 8u])
+             {
+                 const int exit = block(*this, budgetEnd);
+                 if (exit == CompiledAccess::kLeave)
+@@ -731,7 +763,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         const uint32_t pairIndex = m_state.pc / 8u;
+         const DecodedInstructionPair &decoded =
+             codeCached && (m_state.pc & 7u) == 0u && pairIndex < kMaxDecodedPairs
+-                ? m_decodedCodeCache[pairIndex]
++                ? m_image->decoded[pairIndex]
+                 : (m_uncachedPair = decodeInstructionPair(vuCode, m_state.pc));
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 7050d4e..fbf663c 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -741,6 +741,28 @@ void register_ps2_memory_tests()
+             }
+         });
+ 
++        tc.Run("GS stage work runs after the GIF/VU work issued before it, in order, and drain waits for both", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            mem.startGifVuWorker(OrderedWorker::Mode::Async);
++            std::vector<int> order;
++            bool gsOffWorker = true;
++            for (int i = 0; i < 300; ++i)
++            {
++                if (i % 3 == 0) // from the EE, after what the EE issued before
++                    mem.postGsAfterGifVu([&, i] { order.push_back(i); gsOffWorker = gsOffWorker && !mem.onGifVuWorker(); });
++                else // from GIF/VU work, as the arbiter does
++                    mem.postGifVu([&, i] { mem.postGs([&, i] { order.push_back(i); gsOffWorker = gsOffWorker && !mem.onGifVuWorker(); }); });
++            }
++            mem.drainGifVu();
++            bool inOrder = order.size() == 300u;
++            for (size_t i = 0; inOrder && i < order.size(); ++i)
++                inOrder = order[i] == static_cast<int>(i);
++            t.IsTrue(inOrder, "GS stage jobs run in issue order and all are done after drainGifVu");
++            t.IsTrue(gsOffWorker, "GS stage jobs run off the GIF/VU worker");
++        });
++
+         tc.Run("VIF1 UNPACK lanes computed on the EE match the loop that reads VU1 memory", [](TestCase &t)
+         {
+             std::mt19937 rng(12345u);
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 90c9b30..49827e9 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -1,3 +1,6 @@
++#include <bit>
++#include <cfenv>
++#include <random>
+ #include "MiniTest.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -1863,6 +1866,33 @@ void register_ps2_vu1_tests()
+             }
+         });
+ 
++        tc.Run("VU1 runs the uploaded program when more programs come and go than decoded images are kept", [](TestCase &t)
++        {
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++            VU1Interpreter vu1;
++            int wrong = 0;
++            for (int round = 0; round < 2; ++round)
++            {
++                for (uint32_t program = 0; program < 20u; ++program)
++                {
++                    // MPG at 0: IADDIU vi1, vi0, program | NOP; NOP | NOP with the E bit; NOP | NOP.
++                    std::vector<uint8_t> packet;
++                    const uint32_t words[] = {0x10010000u | program, kVuUpperNop, 0x8000033Cu, kVuUpperNop | 0x40000000u, 0x8000033Cu, kVuUpperNop};
++                    const uint32_t mpg = makeVifCmd(0x4Au, 3u, 0u);
++                    packet.insert(packet.end(), reinterpret_cast<const uint8_t *>(&mpg), reinterpret_cast<const uint8_t *>(&mpg) + 4);
++                    packet.insert(packet.end(), reinterpret_cast<const uint8_t *>(words), reinterpret_cast<const uint8_t *>(words) + sizeof(words));
++                    fx.mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
++                    fx.mem.drainGifVu();
++                    vu1.state().vi[1] = -1;
++                    vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 100u);
++                    if (vu1.state().vi[1] != static_cast<int32_t>(program))
++                        ++wrong;
++                }
++            }
++            t.Equals(wrong, 0, "every run executes the code that is in VU1 memory");
++        });
++
+         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
+         {
+             Vu1Fixture fx;

@@ -1,0 +1,268 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 1ddb6d5..7e5b318 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -29,6 +29,8 @@ namespace ps2x::iop
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         // Applies to modules loaded after registration; survives reset().
+         void registerNativeFunction(NativeFunction function);
++        // Loaded module id for an IRX's internal (IOPMOD) name, or -1 (LOADFILE SearchModuleByName).
++        [[nodiscard]] int32_t searchModuleByName(std::string_view name) const;
+ 
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index dba6c57..1def833 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -74,6 +74,7 @@ namespace ps2x::iop::detail
+             int id = 0;
+             std::string path;
+             std::string name;
++            std::string moduleName; // IOPMOD name, used by SearchModuleByName
+             uint32_t base = 0;
+             uint32_t size = 0;
+             uint32_t entry = 0;
+@@ -617,6 +618,7 @@ namespace ps2x::iop::detail
+             module.size = loaded.size;
+             module.entry = loaded.entry;
+             module.gp = loaded.gp;
++            module.moduleName = loaded.moduleName;
+ 
+             uint32_t args = 0u;
+             if (arguments && argumentSize)
+@@ -724,6 +726,14 @@ namespace ps2x::iop::detail
+             return name;
+         }
+ 
++        int32_t searchModuleByName(std::string_view name) const
++        {
++            for (const auto &[id, module] : modules)
++                if (!module.moduleName.empty() && module.moduleName == name)
++                    return id;
++            return -1;
++        }
++
+         void installNativeFunctions(const std::string &moduleName, uint32_t base)
+         {
+             const std::string key = moduleKey(moduleName);
+@@ -872,6 +882,11 @@ namespace ps2x::iop::detail
+         return m_impl->stopModule(moduleId, result);
+     }
+ 
++    int32_t IopEmulator::searchModuleByName(std::string_view name) const
++    {
++        return m_impl->searchModuleByName(name);
++    }
++
+     void IopEmulator::registerNativeFunction(NativeFunction function)
+     {
+         m_impl->nativeFunctions.push_back(std::move(function));
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 32f1cae..225bee1 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -26,6 +26,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         void registerNativeFunction(NativeFunction function);
++        [[nodiscard]] int32_t searchModuleByName(std::string_view name) const;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+         void onSifTransfer(const SifTransfer &transfer);
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 80e59d6..5ad692d 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -522,6 +522,14 @@ namespace ps2x::iop::detail
+                 result.gp = gp != 0u
+                                 ? static_cast<uint32_t>(static_cast<int64_t>(gp) + delta)
+                                 : 0u;
++                constexpr uint32_t kNameOffset = 0x1Au; // moduleinfo, entry, gp, text/data/bss sizes, u16 version
++                for (uint32_t i = kNameOffset; i < program.filesz && checkedRange(image.size(), program.offset, i + 1u); ++i)
++                {
++                    const char c = static_cast<char>(image[program.offset + i]);
++                    if (c == '\0')
++                        break;
++                    result.moduleName.push_back(c);
++                }
+                 break;
+             }
+         }
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.h b/ps2xIOP/src/emulator/services/iop_module_loader.h
+index 6cd9ef6..84ad7ae 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.h
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <string>
++
+ #include <cstdint>
+ #include <span>
+ #include <string_view>
+@@ -30,6 +32,7 @@ namespace ps2x::iop::detail
+         uint32_t entry = 0;
+         uint32_t gp = 0;
+         uint32_t nextModuleCursor = 0;
++        std::string moduleName; // from PT_SCE_IOPMOD, e.g. "sio2man"; empty if absent
+         bool relocationsComplete = true;
+ 
+         [[nodiscard]] explicit operator bool() const noexcept
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 153c23c..416c148 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -249,6 +249,11 @@ namespace ps2x::iop
+         return m_impl->emulator.isMemoryRange(address, size);
+     }
+ 
++    int32_t IopSubsystem::searchModuleByName(std::string_view name) const
++    {
++        return m_impl->emulator.searchModuleByName(name);
++    }
++
+     void IopSubsystem::registerNativeFunction(NativeFunction function)
+     {
+         m_impl->emulator.registerNativeFunction(std::move(function));
+diff --git a/ps2xIOP/tests/iop_emulator_tests.cpp b/ps2xIOP/tests/iop_emulator_tests.cpp
+index 56fa953..e8c07fd 100644
+--- a/ps2xIOP/tests/iop_emulator_tests.cpp
++++ b/ps2xIOP/tests/iop_emulator_tests.cpp
+@@ -183,6 +183,64 @@ namespace
+         std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
+     }
+ 
++    void writeNamedIrx(TestHost &host, uint32_t address, const char *moduleName)
++    {
++        constexpr uint32_t codeOffset = 0x100u;
++        constexpr uint32_t iopModOffset = 0xC0u;
++        constexpr uint32_t loadAddress = 0x00010000u;
++
++        ElfHeader header{};
++        header.ident[0] = 0x7Fu;
++        header.ident[1] = 'E';
++        header.ident[2] = 'L';
++        header.ident[3] = 'F';
++        header.ident[4] = 1u;
++        header.ident[5] = 1u;
++        header.ident[6] = 1u;
++        header.type = 2u;
++        header.machine = 8u;
++        header.version = 1u;
++        header.entry = loadAddress;
++        header.phoff = sizeof(ElfHeader);
++        header.ehsize = sizeof(ElfHeader);
++        header.phentsize = sizeof(ProgramHeader);
++        header.phnum = 2u;
++
++        const uint32_t code[] = {
++            0x03E00008u, // jr   ra
++            0x24020002u, // addiu v0, zero, 2 (REMOVABLE_RESIDENT_END: stays loaded)
++        };
++        // IOPMOD: moduleinfo, entry, gp, text/data/bss sizes, u16 version, then the name.
++        std::vector<uint8_t> iopMod(0x1Au + std::strlen(moduleName) + 1u, 0u);
++        const uint32_t entry = loadAddress;
++        std::memcpy(iopMod.data() + 4u, &entry, sizeof(entry));
++        std::memcpy(iopMod.data() + 0x1Au, moduleName, std::strlen(moduleName));
++
++        ProgramHeader iopModule{};
++        iopModule.type = 0x70000080u; // PT_SCE_IOPMOD
++        iopModule.offset = iopModOffset;
++        iopModule.filesz = static_cast<uint32_t>(iopMod.size());
++        iopModule.memsz = iopModule.filesz;
++        iopModule.align = 4u;
++
++        ProgramHeader program{};
++        program.type = 1u;
++        program.offset = codeOffset;
++        program.vaddr = loadAddress;
++        program.paddr = loadAddress;
++        program.filesz = sizeof(code);
++        program.memsz = sizeof(code);
++        program.flags = 5u;
++        program.align = 4u;
++
++        std::memset(host.guest.data() + address, 0, codeOffset + sizeof(code));
++        std::memcpy(host.guest.data() + address, &header, sizeof(header));
++        std::memcpy(host.guest.data() + address + sizeof(header), &iopModule, sizeof(iopModule));
++        std::memcpy(host.guest.data() + address + sizeof(header) + sizeof(iopModule), &program, sizeof(program));
++        std::memcpy(host.guest.data() + address + iopModOffset, iopMod.data(), iopMod.size());
++        std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
++    }
++
+     void writeRpcServerIrx(TestHost &host,
+                            uint32_t address,
+                            uint32_t sid = 0xF00DCAFEu)
+@@ -1179,6 +1237,20 @@ int main()
+         }
+     }
+ 
++    // SearchModuleByName finds loaded modules by their IOPMOD name, not their file name.
++    {
++        TestHost namedHost(0x20000u);
++        IopSubsystem namedIop(namedHost);
++        writeNamedIrx(namedHost, 0x100u, "sio2man");
++        const ModuleLoadResult sio2man = namedIop.loadModuleBuffer(0x100u);
++        writeNamedIrx(namedHost, 0x100u, "multitap_manager");
++        const ModuleLoadResult mtap = namedIop.loadModuleBuffer(0x100u);
++        if (!expect(sio2man.moduleId > 0 && mtap.moduleId > 0, "named test modules must load")) return 1;
++        if (!expect(namedIop.searchModuleByName("sio2man") == sio2man.moduleId, "search must find sio2man by IOPMOD name")) return 1;
++        if (!expect(namedIop.searchModuleByName("multitap_manager") == mtap.moduleId, "search must find multitap_manager")) return 1;
++        if (!expect(namedIop.searchModuleByName("padman") < 0, "unknown module names must not match")) return 1;
++    }
++
+     std::cout << "ps2xIOP emulator smoke tests passed\n";
+     return 0;
+ }
+diff --git a/ps2xRuntime/include/ps2_call_list.h b/ps2xRuntime/include/ps2_call_list.h
+index 94a6fa1..0dffeca 100644
+--- a/ps2xRuntime/include/ps2_call_list.h
++++ b/ps2xRuntime/include/ps2_call_list.h
+@@ -543,6 +543,7 @@
+     X(sceSifLoadIopHeap)                      \
+     X(sceSifLoadModuleBuffer)                 \
+     X(sceSifRebootIop)                        \
++    X(sceSifSearchModuleByName)               \
+     X(sceSifRegisterRpc)                      \
+     X(sceSifRemoveCmdHandler)                 \
+     X(sceSifRemoveRpc)                        \
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..83b195b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -755,6 +755,22 @@ namespace ps2_stubs
+         setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
+     }
+ 
++    // int sceSifSearchModuleByName(const char *name): IOP module id, or KE_UNKNOWN_MODULE (-202).
++    void sceSifSearchModuleByName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        constexpr int32_t kUnknownModule = -202;
++        std::string name;
++        for (uint32_t address = getRegU32(ctx, 4); name.size() < 64u; ++address)
++        {
++            const uint8_t *c = getConstMemPtr(rdram, address);
++            if (!c || *c == 0u)
++                break;
++            name.push_back(static_cast<char>(*c));
++        }
++        const int32_t id = runtime && !name.empty() ? runtime->iopSubsystem().searchModuleByName(name) : -1;
++        setReturnS32(ctx, id >= 0 ? id : kUnknownModule);
++    }
++
+     void sceSifSetIopAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         setReturnU32(ctx, getRegU32(ctx, 5));
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+index 8673e80..60611c2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+@@ -35,6 +35,7 @@ namespace ps2_stubs
+     void sceSifLoadFileReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifLoadIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifLoadModuleBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++    void sceSifSearchModuleByName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifRebootIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifRemoveCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

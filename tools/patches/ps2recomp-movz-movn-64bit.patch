@@ -1,0 +1,45 @@
+diff --git a/ps2xRecomp/src/lib/special_translator.cpp b/ps2xRecomp/src/lib/special_translator.cpp
+index b01a937..0fa042a 100644
+--- a/ps2xRecomp/src/lib/special_translator.cpp
++++ b/ps2xRecomp/src/lib/special_translator.cpp
+@@ -120,10 +120,11 @@ namespace ps2recomp
+             return fmt::format("SET_GPR_U64(ctx, {}, ((int64_t)GPR_S64(ctx, {}) < (int64_t)GPR_S64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
+         case SPECIAL_SLTU:
+             return fmt::format("SET_GPR_U64(ctx, {}, ((uint64_t)GPR_U64(ctx, {}) < (uint64_t)GPR_U64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
++        // MOVZ/MOVN move the low 64 bits only; the upper half of rd (MMI data) is kept.
+         case SPECIAL_MOVZ:
+-            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
++            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MOVN:
+-            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
++            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MFSA:
+             return fmt::format("SET_GPR_U32(ctx, {}, ctx->sa);", inst.rd);
+         case SPECIAL_MTSA:
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 3451cd9..f4dcafa 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1719,6 +1719,22 @@ void register_code_generator_tests()
+             t.IsTrue(generated.find("if (branch_taken_0x1200)") != std::string::npos, "should generate branch_taken variable and if for likely branch");
+         });
+ 
++        tc.Run("MOVZ and MOVN move only the low 64 bits", [](TestCase &t) {
++            CodeGenerator gen({}, {});
++            for (uint32_t fn : {static_cast<uint32_t>(SPECIAL_MOVZ), static_cast<uint32_t>(SPECIAL_MOVN)})
++            {
++                Instruction inst{};
++                inst.opcode = OPCODE_SPECIAL;
++                inst.function = fn;
++                inst.rs = 4;
++                inst.rt = 5;
++                inst.rd = 2;
++                const std::string code = gen.translateInstruction(inst);
++                t.IsTrue(code.find("SET_GPR_U64(ctx, 2, GPR_U64(ctx, 4))") != std::string::npos, "expected a 64-bit move but got: " + code);
++                t.IsTrue(code.find("GPR_VEC") == std::string::npos, "must not copy the upper 64 bits but got: " + code);
++            }
++        });
++
+         tc.Run("BGEZ, BLTZ, BLEZ and BGTZ test the whole 64-bit register", [](TestCase &t) {
+             const struct { uint32_t opcode; uint32_t rt; const char *expected; } cases[] = {
+                 {OPCODE_REGIMM, REGIMM_BGEZ, "GPR_S64(ctx, 9) >= 0"},

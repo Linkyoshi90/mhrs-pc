@@ -1,0 +1,76 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..ce28119 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1548,10 +1548,23 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             m_pendingVif0Transfers.push_back(std::move(pt));
+                         }
+                     }
+-                    // else if (channelBase == 0x10009000u)
+-                    // {
+-
+-                    // }
++                    else
++                    {
++                        // A chain that moved no data (e.g. a lone END tag, an empty display list) still ends
++                        // the transfer on hardware: STR clears, D_STAT flags the channel and its DMAC interrupt
++                        // fires. Games that count completions in their DMAC handler depend on this.
++                        const uint32_t channel = channelBase == 0x1000A000u ? 2u : (channelBase == 0x10009000u ? 1u : 0u);
++                        constexpr uint32_t kDStat = 0x1000E010u;
++                        uint32_t dstat = m_ioRegisters.count(kDStat) ? m_ioRegisters[kDStat] : 0u;
++                        dstat |= 1u << channel;
++                        if (((dstat & 0x3FFu) & ((dstat >> 16u) & 0x3FFu)) != 0u)
++                            dstat |= 1u << 31u;
++                        else
++                            dstat &= ~(1u << 31u);
++                        m_ioRegisters[kDStat] = dstat;
++                        m_ioRegisters[channelBase + 0x00] &= ~0x100u;
++                        queueCompletedDmacCause(channel);
++                    }
+                 }
+                 else if (qwc > 0)
+                 {
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..7bbc369 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -1912,6 +1912,39 @@ void register_ps2_memory_tests()
+             }
+         });
+ 
++        tc.Run("GIF chain with only an END tag still completes the channel", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kGifCh = 0x1000A000u;
++            constexpr uint32_t kTag = 0x00027800u;
++            const uint64_t endTag = 0x70000000ull; // ID 7 (end) in bits 28-30, QWC 0
++            std::memcpy(mem.getRDRAM() + kTag, &endTag, sizeof(endTag));
++            std::memset(mem.getRDRAM() + kTag + 8u, 0, 8u);
++
++            std::vector<std::vector<uint8_t>> captured;
++            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
++            {
++                captured.emplace_back(data, data + sizeBytes);
++            });
++            (void)mem.consumeCompletedDmacCauses();
++
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kTag), "write TADR should succeed");
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x184u), "start GIF source chain with TIE should succeed");
++            mem.processPendingTransfers();
++
++            t.Equals(captured.size(), static_cast<size_t>(0u), "an empty chain must not emit GIF packets");
++            const uint32_t chcr = mem.readIORegister(kGifCh + 0x00u);
++            t.IsTrue((chcr & 0x100u) == 0u, "empty chain completion should clear CHCR.STR");
++            t.Equals((chcr >> 28u) & 7u, 7u, "CHCR.TAG should hold the END tag ID");
++            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 2u)) != 0u, "empty chain should raise D_STAT channel 2");
++            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
++            t.Equals(causes.size(), static_cast<size_t>(1u), "empty chain should queue one DMAC completion");
++            if (!causes.empty())
++                t.Equals(causes[0], 2u, "GIF completion should use DMAC cause 2");
++        });
++
+         tc.Run("DMAC SPR_FROM copies scratchpad to RDRAM and completes channel 8", [](TestCase &t)
+         {
+             PS2Memory mem;

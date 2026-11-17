@@ -1,0 +1,23 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 3ef016b..7cf9248 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1374,6 +1374,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                     const int kMaxChainTags = 4096;
+                     std::vector<uint8_t> chainBuf;
++                    // Chains of a channel tend to be alike in size: start from the last one's.
++                    static size_t lastChainBytes[3] = {0u, 0u, 0u};
++                    size_t &chainHint = lastChainBytes[channelBase == 0x1000A000u ? 0 : channelBase == 0x10009000u ? 1 : 2];
++                    chainBuf.reserve(chainHint);
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+@@ -1556,6 +1560,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
+                     m_ioRegisters[channelBase + 0x00] = chcr;
+ 
++                    chainHint = chainBuf.size();
+                     if (!chainBuf.empty())
+                     {
+                         PendingTransfer pt;

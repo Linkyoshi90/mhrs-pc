@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -242,6 +242,11 @@ namespace
+         VkPhysicalDeviceMemoryProperties props{};
+         vkGetPhysicalDeviceMemoryProperties(phys, &props);
+         const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++        // The CPU backend rasterizes straight into this mapping: uncached (write-combined)
++        // memory makes every z-test/blend read a bus round trip, so prefer HOST_CACHED.
++        for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
++            if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & (wanted | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (wanted | VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
++                return i;
+         for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
+             if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & wanted) == wanted)
+                 return i;

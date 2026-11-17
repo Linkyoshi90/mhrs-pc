@@ -1,0 +1,21 @@
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 563bcbd..98ffeb9 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -226,6 +226,16 @@ int main(int argc, char *argv[])
+             return 1;
+         }
+ 
++        // Optional argv[2]: disc image for raw sector reads (games that parse ISO9660 themselves).
++        // Set after loadELF, which resets the IO paths from the ELF location.
++        if (argc >= 3 && argv[2] && argv[2][0] != '\0')
++        {
++            PS2Runtime::IoPaths ioPaths = PS2Runtime::getIoPaths();
++            ioPaths.cdImage = argv[2];
++            PS2Runtime::setIoPaths(ioPaths);
++            std::cout << "Using CD image: " << PS2Runtime::getIoPaths().cdImage.string() << std::endl;
++        }
++
+         runtime.run();
+ 
+ #ifdef _DEBUG

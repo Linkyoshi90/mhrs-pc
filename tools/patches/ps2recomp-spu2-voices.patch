@@ -1,0 +1,611 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 5c4d5d6..963909c 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -4,6 +4,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <iterator>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -15,6 +16,8 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kDmaStart = 1u << 24u;
+         constexpr int kDmaSpu0Irq = 0x24;
+         constexpr int kDmaSpu1Irq = 0x28;
++        // The voice and master-volume registers of both SPU2 cores, from Spu2Base.
++        constexpr uint32_t kSpu2RegisterSpan = 0x800u;
+         // SIO2 raises IOP INTC IRQ 17 when a transfer started via CTRL.START completes.
+         constexpr int kSio2Irq = 17;
+         constexpr uint64_t kSio2CompletionDelayCycles = 64u;
+@@ -52,6 +55,7 @@ namespace ps2x::iop::detail
+         m_interruptControl = 1;
+         m_dmaStart.reset();
+         m_sio2.reset();
++        m_spu2.reset();
+     }
+ 
+     uint8_t IopMemory::read8Slow(uint32_t address) const
+@@ -133,6 +137,8 @@ namespace ps2x::iop::detail
+         }
+         write8(address, static_cast<uint8_t>(value));
+         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
++        if ((phys & 1u) == 0u && phys - Spu2Base < kSpu2RegisterSpan)
++            m_spu2.write(phys - Spu2Base, value);
+     }
+ 
+     void IopMemory::write32Slow(uint32_t address, uint32_t value)
+@@ -152,6 +158,11 @@ namespace ps2x::iop::detail
+         if ((phys & 3u) == 0u)
+         {
+             writeHardware32(phys, value);
++            if (phys - Spu2Base < kSpu2RegisterSpan)
++            {
++                m_spu2.write(phys - Spu2Base, static_cast<uint16_t>(value));
++                m_spu2.write(phys - Spu2Base + 2u, static_cast<uint16_t>(value >> 16u));
++            }
+             return;
+         }
+         write8(address, static_cast<uint8_t>(value));
+@@ -250,6 +261,8 @@ namespace ps2x::iop::detail
+         case 0x1F801078u:
+             return m_interruptControl;
+         default:
++            if (address - Spu2Base < kSpu2RegisterSpan)
++                return m_spu2.read(address - Spu2Base, hardwareValue(address));
+             return hardwareValue(address);
+         }
+     }
+@@ -325,17 +338,50 @@ namespace ps2x::iop::detail
+                 }
+             }
+         }
+-        // SNDDRV's software-mixed PCM stream reaches the "SPU2" as core0 ram->spu DMA; hand
+-        // it to the runtime audio backend (which does its own dedupe/rate handling).
+-        if (m_spuStreamSink && !secondCore && (value & 1u))
++        // ADMAS (core base + 0x1B0) is set while a core streams auto-DMA to its sound output.
++        const bool autoDma = (hardwareValue(0x1F9001B0u + (secondCore ? 0x400u : 0u)) & 0xFFFFu) != 0u;
++        const uint32_t madr = hardwareValue(address - 8u);
++        const uint32_t bcr = hardwareValue(address - 4u);
++        const uint64_t bytes = static_cast<uint64_t>(std::max<uint32_t>(bcr & 0xFFFFu, 1u)) *
++                               std::max<uint32_t>(bcr >> 16u, 1u) * 4u;
++        const uint32_t src = madr & (RamSize - 1u);
++        if (!(value & 1u) && src + bytes <= RamSize) // spu -> ram: sound memory read back
++            m_spu2.download(secondCore ? 1 : 0, m_ram.data() + src, static_cast<size_t>(bytes));
++        if ((value & 1u) && src + bytes <= RamSize) // ram -> spu
+         {
+-            const uint32_t madr = hardwareValue(address - 8u);
+-            const uint32_t bcr = hardwareValue(address - 4u);
+-            const uint64_t bytes = static_cast<uint64_t>(std::max<uint32_t>(bcr & 0xFFFFu, 1u)) *
+-                                   std::max<uint32_t>(bcr >> 16u, 1u) * 4u;
+-            const uint32_t src = madr & (RamSize - 1u);
+-            if (bytes > 0u && bytes <= 0x10000u && src + bytes <= RamSize)
+-                m_spuStreamSink(madr, m_ram.data() + src, static_cast<uint32_t>(bytes));
++            {
++                const uint8_t *data = m_ram.data() + src;
++                if (!autoDma) // a voice transfer: sample data for the hardware voices, any size
++                    m_spu2.upload(secondCore ? 1 : 0, data, static_cast<size_t>(bytes));
++                if (!secondCore && bytes <= 0x10000u)
++                {
++                    // SNDDRV's software-mixed PCM stream reaches the SPU2 as core0 ram->spu DMA. A
++                    // 2048-byte block is 512 frames ([L x256][R x256], twice) of sound-chip time, so
++                    // the hardware voices play along with it; silent voices leave it as it was.
++                    int16_t mixed[1024];
++                    if (bytes == sizeof(mixed))
++                    {
++                        int16_t voices[1024] = {};
++                        for (int half = 0; half < 2; ++half)
++                            m_spu2.render(voices + half * 512, voices + half * 512 + 256, 256u);
++                        // TEMP-DEBUG(mhrs): MHRS_SPU_VOICES=<path> captures the voices alone.
++                        static FILE *voiceCap = []()
++                        {
++                            const char *p = std::getenv("MHRS_SPU_VOICES");
++                            return p ? std::fopen(p, "wb") : static_cast<FILE *>(nullptr);
++                        }();
++                        if (voiceCap)
++                            std::fwrite(voices, 1, sizeof(voices), voiceCap);
++                        std::memcpy(mixed, data, sizeof(mixed));
++                        for (size_t i = 0; i < std::size(mixed); ++i)
++                            mixed[i] = static_cast<int16_t>(std::clamp(mixed[i] + voices[i], -32768, 32767));
++                        data = reinterpret_cast<const uint8_t *>(mixed);
++                    }
++                    // The runtime audio backend does its own dedupe/rate handling.
++                    if (m_spuStreamSink)
++                        m_spuStreamSink(madr, data, static_cast<uint32_t>(bytes));
++                }
++            }
+         }
+ 
+         const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
+@@ -348,8 +394,6 @@ namespace ps2x::iop::detail
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
+-        // ADMAS (core base + 0x1B0) is set while a core streams auto-DMA to its sound output.
+-        const bool autoDma = (hardwareValue(0x1F9001B0u + (secondCore ? 0x400u : 0u)) & 0xFFFFu) != 0u;
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+             autoDma ? transferWords * kAutoDmaCyclesPerWord : std::max<uint64_t>(transferWords * 2u, 64u),
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 2f9d851..be147bb 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "iop_sio2.h"
++#include "iop_spu2.h"
+ #include "ps2x/iop/iop_types.h"
+ 
+ #include <cstddef>
+@@ -163,6 +164,7 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
+         IopSio2 m_sio2;
++        Spu2Voices m_spu2;
+         SpuStreamSink m_spuStreamSink;
+     };
+ }
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index f1172e9..6b3e237 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -1,6 +1,7 @@
+ #include "MiniTest.h"
+ #include "ps2x/iop/ps2_path.h"
+ #include "../../ps2xIOP/tests/iop_compat_test_support.h"
++#include "../../ps2xIOP/src/emulator/core/iop_spu2.h"
+ 
+ void register_ps2_iop_tests()
+ {
+@@ -54,6 +55,54 @@ void register_ps2_iop_tests()
+                       "stopping LIBSD should deactivate its RPC endpoint");
+         });
+ 
++        tc.Run("SPU2 voice plays uploaded ADPCM and reports its end", [](TestCase &t)
++        {
++            ps2x::iop::detail::Spu2Voices spu;
++            // Two blocks of 28 samples of 0x7000 at word address 0x1000; the second ends the sample.
++            uint8_t sample[32];
++            std::memset(sample, 0x77, sizeof(sample));
++            sample[0] = sample[1] = sample[16] = 0u;
++            sample[17] = 1u;
++            spu.write(0x1A8u, 0u); // TSA
++            spu.write(0x1AAu, 0x1000u);
++            spu.upload(0, sample, sizeof(sample));
++            spu.write(0x000u, 0x3FFFu); // voice 0: full left, right stays silent
++            spu.write(0x004u, 0x1000u); // one sample per frame
++            spu.write(0x006u, 0x000Fu); // instant attack, sustain at the maximum
++            spu.write(0x008u, 0x0005u);
++            spu.write(0x1C0u, 0u); // SSA
++            spu.write(0x1C2u, 0x1000u);
++            spu.write(0x188u, 1u); // VMIXL, VMIXR
++            spu.write(0x190u, 1u);
++            spu.write(0x760u, 0x3FFFu); // MVOLL, MVOLR
++            spu.write(0x762u, 0x3FFFu);
++            spu.write(0x1A0u, 1u); // KON
++
++            int16_t left[256] = {}, right[256] = {};
++            spu.render(left, right, 256u);
++            t.IsTrue(left[20] > 0x6000, "a keyed voice should play its sample at the voice volume");
++            t.IsTrue(right[20] == 0, "a zero volume side should stay silent");
++            t.IsTrue(left[200] == 0, "the voice should stop after a block that ends without repeat");
++            t.IsTrue((spu.read(0x340u, 0u) & 1u) != 0u, "ENDX should report the voice that reached its end");
++            t.IsTrue((spu.read(0x008u, 0u) >> 16u) == 0u, "ENVX should read zero once the voice stopped");
++
++            spu.write(0x000u, 0x8028u); // sweep up from the current volume
++            spu.render(left, right, 256u);
++            const uint32_t swept = spu.read(0x00Cu, 0u) & 0xFFFFu;
++            t.IsTrue(swept == 0x7FFFu, "a rising sweep should be readable in VOLXL and stop at the maximum");
++
++            // A transfer across the end of sound memory wraps to word 0; reading it back returns the same bytes.
++            const uint8_t wrap[8] = {1, 2, 3, 4, 5, 6, 7, 8};
++            spu.write(0x5A8u, 0xFu); // core1 TSA = 0xFFFFE, two words before the end
++            spu.write(0x5AAu, 0xFFFEu);
++            spu.upload(1, wrap, sizeof(wrap));
++            uint8_t back[8] = {};
++            spu.write(0x5A8u, 0xFu);
++            spu.write(0x5AAu, 0xFFFEu);
++            spu.download(1, back, sizeof(back));
++            t.IsTrue(std::memcmp(wrap, back, sizeof(wrap)) == 0, "sound memory should read back what was uploaded, wrapping at the end");
++        });
++
+         tc.Run("unknown SID remains unhandled without a loaded IRX", [](TestCase &t)
+         {
+             iop_test::Host host;
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+new file mode 100755
+index 0000000..05bc6c6
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -0,0 +1,389 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    // SPU2 hardware voices: 2 cores x 24 ADPCM voices playing from 2 MB of sound RAM at 48 kHz.
++    // Register offsets are relative to 0x1F900000 (core 1 at +0x400, master volumes at 0x760).
++    // ponytail: no reverb, noise, pitch modulation or SPU interrupt, and linear instead of
++    // Gaussian interpolation; add them when a game is heard to need them.
++    class Spu2Voices
++    {
++    public:
++        Spu2Voices() : m_ram(kRamSize) {}
++
++        void reset()
++        {
++            std::fill(m_ram.begin(), m_ram.end(), uint8_t{0});
++            m_cores[0] = Core{};
++            m_cores[1] = Core{};
++        }
++
++        // A 16-bit register write.
++        void write(uint32_t offset, uint16_t value)
++        {
++            if (offset >= 0x760u)
++            {
++                const uint32_t reg = (offset - 0x760u) / 2u; // 20 registers per core, MVOLL and MVOLR first
++                if (reg < 40u && reg % 20u < 2u)
++                    m_cores[reg / 20u].mvol[reg % 20u].set(value);
++                return;
++            }
++            Core &core = m_cores[offset >= 0x400u ? 1 : 0];
++            const uint32_t r = offset & 0x3FEu;
++            const bool second = (r & 2u) != 0u; // second register of a pair
++            if (r < 0x180u)
++            {
++                Voice &v = core.voice[r >> 4u];
++                switch (r & 0xEu)
++                {
++                case 0x0u: v.vol[0].set(value); break;
++                case 0x2u: v.vol[1].set(value); break;
++                case 0x4u: v.pitch = std::min<uint16_t>(value, 0x3FFFu); break;
++                case 0x6u: v.adsr1 = value; break;
++                case 0x8u: v.adsr2 = value; break;
++                default: break;
++                }
++            }
++            else if (r < 0x1C0u)
++            {
++                switch (r & ~2u)
++                {
++                case 0x188u: setBits(core.vmix[0], second, value); break;
++                case 0x190u: setBits(core.vmix[1], second, value); break;
++                case 0x1A0u: keyOn(core, uint32_t{value} << (second ? 16u : 0u)); break;
++                case 0x1A4u: keyOff(core, uint32_t{value} << (second ? 16u : 0u)); break;
++                case 0x1A8u:
++                    setAddress(core.tsa, second, value);
++                    core.tda = core.tsa;
++                    break;
++                case 0x1ACu:
++                    if (!second) // DATA: one word to the transfer address
++                    {
++                        const uint8_t bytes[2] = {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8u)};
++                        upload(static_cast<int>(&core - m_cores), bytes, sizeof(bytes));
++                    }
++                    break;
++                default: break;
++                }
++            }
++            else if (r < 0x2E0u)
++            {
++                Voice &v = core.voice[(r - 0x1C0u) / 12u];
++                const uint32_t reg = (r - 0x1C0u) % 12u; // SSAH, SSAL, LSAXH, LSAXL, NAXH, NAXL
++                if (reg < 4u)
++                    setAddress(v.ssa, second, value);
++                else if (reg < 8u)
++                {
++                    setAddress(v.lsa, second, value);
++                    v.loopFixed = true;
++                }
++            }
++            else if ((r & ~2u) == 0x340u)
++                core.endx = 0u;
++        }
++
++        // The read-only registers (ENVX, VOLX, NAX, ENDX) laid over the stored word at a 4-aligned offset.
++        [[nodiscard]] uint32_t read(uint32_t offset, uint32_t stored) const
++        {
++            if (offset >= 0x760u)
++                return stored;
++            const Core &core = m_cores[offset >= 0x400u ? 1 : 0];
++            const uint32_t r = offset & 0x3FCu;
++            if (r < 0x180u)
++            {
++                const Voice &v = core.voice[r >> 4u];
++                if ((r & 0xCu) == 0x8u)
++                    return (stored & 0xFFFFu) | (static_cast<uint32_t>(v.env) << 16u);
++                if ((r & 0xCu) == 0xCu)
++                    return (static_cast<uint32_t>(v.vol[0].value) & 0xFFFFu) |
++                           ((static_cast<uint32_t>(v.vol[1].value) & 0xFFFFu) << 16u);
++                return stored;
++            }
++            if (r >= 0x1C0u && r < 0x2E0u && (r - 0x1C0u) % 12u == 8u)
++            {
++                const uint32_t words = core.voice[(r - 0x1C0u) / 12u].nax;
++                return (words >> 16u) | ((words & 0xFFFFu) << 16u);
++            }
++            if (r == 0x340u)
++                return core.endx; // ENDX0 in the low half, ENDX1 in the high half
++            return stored;
++        }
++
++        // Voice-transfer DMA: sample data to a core's transfer address.
++        void upload(int core, const uint8_t *data, size_t bytes)
++        {
++            Core &c = m_cores[core];
++            for (size_t done = 0; done < bytes;)
++            {
++                const uint32_t at = c.tda * 2u;
++                const size_t n = std::min<size_t>(bytes - done, kRamSize - at);
++                std::memcpy(m_ram.data() + at, data + done, n);
++                done += n;
++                c.tda = (c.tda + static_cast<uint32_t>((n + 1u) / 2u)) & kAddressMask;
++            }
++        }
++
++        // Voice-transfer DMA the other way: sound memory at the transfer address to `out`.
++        void download(int core, uint8_t *out, size_t bytes)
++        {
++            Core &c = m_cores[core];
++            for (size_t i = 0; i < bytes; i += 2u, c.tda = (c.tda + 1u) & kAddressMask)
++                std::memcpy(out + i, m_ram.data() + c.tda * 2u, std::min<size_t>(2u, bytes - i));
++        }
++
++        // Adds `frames` samples of both cores' voices to left/right, saturating.
++        void render(int16_t *left, int16_t *right, uint32_t frames)
++        {
++            constexpr uint32_t kChunk = 256u;
++            for (; frames != 0u;)
++            {
++                const uint32_t n = std::min(frames, kChunk);
++                int32_t out[2][kChunk] = {};
++                for (Core &core : m_cores)
++                {
++                    int32_t sum[2][kChunk] = {};
++                    for (uint32_t i = 0; i < 24u; ++i)
++                    {
++                        Voice &v = core.voice[i];
++                        if (v.phase == Voice::Off && !((v.vol[0].reg | v.vol[1].reg) & 0x8000u))
++                            continue;
++                        const bool mix[2] = {((core.vmix[0] >> i) & 1u) != 0u, ((core.vmix[1] >> i) & 1u) != 0u};
++                        for (uint32_t f = 0; f < n; ++f)
++                        {
++                            v.vol[0].tick(); // sweeps run whether or not the voice plays
++                            v.vol[1].tick();
++                            if (v.phase == Voice::Off)
++                                continue;
++                            for (v.counter += v.pitch; v.counter >= 0x1000u; v.counter -= 0x1000u)
++                            {
++                                if (v.pos == 28u)
++                                    decodeBlock(core, v, 1u << i);
++                                v.s0 = v.s1;
++                                v.s1 = v.block[v.pos++];
++                            }
++                            v.envelopeTick();
++                            const int32_t s = ((v.s0 + (((v.s1 - v.s0) * static_cast<int32_t>(v.counter)) >> 12)) * v.env) >> 15;
++                            if (mix[0])
++                                sum[0][f] += (s * v.vol[0].value) >> 15;
++                            if (mix[1])
++                                sum[1][f] += (s * v.vol[1].value) >> 15;
++                        }
++                    }
++                    for (uint32_t f = 0; f < n; ++f)
++                        for (int side = 0; side < 2; ++side)
++                        {
++                            core.mvol[side].tick();
++                            out[side][f] += (std::clamp(sum[side][f], -32768, 32767) * core.mvol[side].value) >> 15;
++                        }
++                }
++                for (uint32_t f = 0; f < n; ++f)
++                {
++                    left[f] = static_cast<int16_t>(std::clamp(left[f] + out[0][f], -32768, 32767));
++                    right[f] = static_cast<int16_t>(std::clamp(right[f] + out[1][f], -32768, 32767));
++                }
++                left += n;
++                right += n;
++                frames -= n;
++            }
++        }
++
++    private:
++        static constexpr uint32_t kRamSize = 2u * 1024u * 1024u;
++        static constexpr uint32_t kAddressMask = 0xFFFFFu; // addresses count 16-bit words
++
++        // The PS1 SPU rate scheme, shared by envelopes and volume sweeps: add `step` every `cycles` samples.
++        static void rateStep(uint32_t rate, bool decrease, bool exponential, int32_t level, uint32_t &cycles, int32_t &step)
++        {
++            const int shift = static_cast<int>(rate >> 2u);
++            const int base = decrease ? -8 + static_cast<int>(rate & 3u) : 7 - static_cast<int>(rate & 3u);
++            cycles = 1u << std::max(0, shift - 11);
++            step = base * (1 << std::max(0, 11 - shift));
++            if (exponential && !decrease && level > 0x6000)
++                cycles *= 4u;
++            if (exponential && decrease)
++                step = (step * level) >> 15;
++        }
++
++        struct Volume
++        {
++            uint16_t reg = 0;
++            int32_t value = 0; // -0x8000..0x7FFF; a sweep moves it within 0..0x7FFF
++            uint32_t wait = 0;
++
++            void set(uint16_t v)
++            {
++                reg = v;
++                if (!(v & 0x8000u)) // fixed: 15-bit signed; with bit 15 set the low bits are a sweep from the current value
++                    value = static_cast<int16_t>(v << 1u);
++            }
++            void tick()
++            {
++                if (!(reg & 0x8000u) || (reg & 0x7Fu) == 0x7Fu)
++                    return;
++                if (wait > 1u)
++                {
++                    --wait;
++                    return;
++                }
++                int32_t step = 0;
++                rateStep(reg & 0x7Fu, (reg & 0x2000u) != 0u, (reg & 0x4000u) != 0u, value, wait, step);
++                value = std::clamp(value + step, 0, 0x7FFF);
++            }
++        };
++
++        struct Voice
++        {
++            enum Phase : uint8_t { Off, Attack, Decay, Sustain, Release };
++
++            Volume vol[2];
++            uint16_t pitch = 0, adsr1 = 0, adsr2 = 0;
++            uint32_t ssa = 0, lsa = 0, nax = 0; // word addresses: start, loop, next block
++            bool loopFixed = false;             // the game set LSAX since key on: loop-start flags don't move it
++            Phase phase = Off;
++            int32_t env = 0;
++            uint32_t envWait = 0;
++            uint8_t flags = 0; // of the block being played: 1 end, 2 repeat, 4 loop start
++            uint32_t pos = 28, counter = 0;
++            int32_t hist1 = 0, hist2 = 0;
++            int16_t block[28] = {};
++            int32_t s0 = 0, s1 = 0;
++
++            void envelopeTick()
++            {
++                if (envWait > 1u)
++                {
++                    --envWait;
++                    return;
++                }
++                uint32_t rate = 0;
++                bool decrease = true, exponential = true;
++                switch (phase)
++                {
++                case Attack:
++                    rate = (adsr1 >> 8u) & 0x7Fu;
++                    decrease = false;
++                    exponential = (adsr1 & 0x8000u) != 0u;
++                    break;
++                case Decay:
++                    rate = ((adsr1 >> 4u) & 0xFu) << 2u;
++                    break;
++                case Sustain:
++                    rate = (adsr2 >> 6u) & 0x7Fu;
++                    decrease = (adsr2 & 0x4000u) != 0u;
++                    exponential = (adsr2 & 0x8000u) != 0u;
++                    break;
++                case Release:
++                    rate = (adsr2 & 0x1Fu) << 2u;
++                    exponential = (adsr2 & 0x20u) != 0u;
++                    break;
++                default:
++                    return;
++                }
++                if (rate != 0x7Fu) // the highest rate value never steps
++                {
++                    int32_t step = 0;
++                    rateStep(rate, decrease, exponential, env, envWait, step);
++                    env = std::clamp(env + step, 0, 0x7FFF);
++                }
++                if (phase == Attack && env == 0x7FFF)
++                    phase = Decay, envWait = 0u;
++                if (phase == Decay && env <= static_cast<int32_t>(((adsr1 & 0xFu) + 1u) * 0x800u))
++                    phase = Sustain, envWait = 0u;
++                if (phase == Release && env == 0)
++                    phase = Off;
++            }
++        };
++
++        struct Core
++        {
++            Voice voice[24];
++            Volume mvol[2];
++            uint32_t vmix[2] = {0, 0}; // voices that reach the left/right output
++            uint32_t endx = 0;
++            uint32_t tsa = 0, tda = 0; // transfer start address and the running write position
++        };
++
++        static void setBits(uint32_t &word, bool highHalf, uint16_t value)
++        {
++            word = highHalf ? (word & 0xFFFFu) | (uint32_t{value} << 16u) : (word & 0xFFFF0000u) | value;
++        }
++        // Address pairs store the upper 4 bits first.
++        static void setAddress(uint32_t &words, bool lowPart, uint16_t value)
++        {
++            words = lowPart ? (words & 0xF0000u) | value : (words & 0xFFFFu) | ((uint32_t{value} & 0xFu) << 16u);
++        }
++
++        void keyOn(Core &core, uint32_t bits)
++        {
++            for (uint32_t i = 0; i < 24u; ++i)
++            {
++                if (!((bits >> i) & 1u))
++                    continue;
++                Voice &v = core.voice[i];
++                v.phase = Voice::Attack;
++                v.env = 0;
++                v.envWait = 0u;
++                v.nax = v.ssa & ~7u;
++                v.loopFixed = false;
++                v.flags = 0u;
++                v.pos = 28u;
++                v.counter = 0u;
++                v.hist1 = v.hist2 = 0;
++                v.s0 = v.s1 = 0;
++                core.endx &= ~(1u << i);
++            }
++        }
++
++        void keyOff(Core &core, uint32_t bits)
++        {
++            for (uint32_t i = 0; i < 24u; ++i)
++                if (((bits >> i) & 1u) && core.voice[i].phase != Voice::Off)
++                {
++                    core.voice[i].phase = Voice::Release;
++                    core.voice[i].envWait = 0u;
++                }
++        }
++
++        void decodeBlock(Core &core, Voice &v, uint32_t voiceBit)
++        {
++            if (v.flags & 1u) // the block just played was the last one: loop, or stop
++            {
++                core.endx |= voiceBit;
++                v.nax = v.lsa & ~7u;
++                if (!(v.flags & 2u))
++                {
++                    v.phase = Voice::Off;
++                    v.env = 0;
++                }
++            }
++            static constexpr int kFilter[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
++            const uint8_t *src = m_ram.data() + ((v.nax & kAddressMask) * 2u);
++            const int shift = src[0] & 0xF;
++            const int *filter = kFilter[std::min(src[0] >> 4, 4)];
++            v.flags = src[1];
++            if ((v.flags & 4u) && !v.loopFixed)
++                v.lsa = v.nax;
++            for (int i = 0; i < 28; ++i)
++            {
++                const int nibble = (src[2 + i / 2] >> ((i & 1) * 4)) & 0xF;
++                int32_t s = static_cast<int16_t>(nibble << 12) >> shift;
++                s += (filter[0] * v.hist1 + filter[1] * v.hist2 + 32) >> 6;
++                s = std::clamp(s, -32768, 32767);
++                v.hist2 = v.hist1;
++                v.hist1 = s;
++                v.block[i] = static_cast<int16_t>(s);
++            }
++            v.nax = (v.nax + 8u) & kAddressMask;
++            v.pos = 0u;
++        }
++
++        std::vector<uint8_t> m_ram;
++        Core m_cores[2];
++    };
++}

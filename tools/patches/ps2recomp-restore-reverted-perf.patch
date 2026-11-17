@@ -1,0 +1,1338 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -23,6 +23,8 @@ namespace ps2x::iop::detail
+         {
+             return (phys & 0x1FFE0000u) == 0x1F800000u && (phys & 0xFF00u) == 0x8200u;
+         }
++        // Auto-DMA plays one stereo 16-bit sample (one word) per 1/48000 s = 768 IOP cycles.
++        constexpr uint64_t kAutoDmaCyclesPerWord = 36864000u / 48000u;
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+@@ -31,7 +33,7 @@ namespace ps2x::iop::detail
+     }
+ 
+     IopMemory::IopMemory()
+-        : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize)
++        : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize), m_hardwareWords((Spu2End - HardwareBase) / 4u)
+     {
+         reset();
+     }
+@@ -41,6 +43,7 @@ namespace ps2x::iop::detail
+         std::fill(m_ram.begin(), m_ram.end(), uint8_t{0});
+         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
+         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
++        std::fill(m_hardwareWords.begin(), m_hardwareWords.end(), 0u);
+         m_hardware.clear();
+         m_allocations.clear();
+         m_heapCursor = HeapBase;
+@@ -51,12 +54,7 @@ namespace ps2x::iop::detail
+         m_sio2.reset();
+     }
+ 
+-    uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
+-    {
+-        return address & 0x1FFFFFFFu;
+-    }
+-
+-    uint8_t IopMemory::read8(uint32_t address) const
++    uint8_t IopMemory::read8Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys < RamSize)
+@@ -67,7 +65,7 @@ namespace ps2x::iop::detail
+         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
+     }
+ 
+-    uint16_t IopMemory::read16(uint32_t address) const
++    uint16_t IopMemory::read16Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys + 1u < RamSize)
+@@ -79,7 +77,7 @@ namespace ps2x::iop::detail
+         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
+     }
+ 
+-    uint32_t IopMemory::read32(uint32_t address) const
++    uint32_t IopMemory::read32Slow(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+@@ -103,7 +101,7 @@ namespace ps2x::iop::detail
+                (static_cast<uint32_t>(read8(address + 3u)) << 24u);
+     }
+ 
+-    void IopMemory::write8(uint32_t address, uint8_t value)
++    void IopMemory::write8Slow(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys < RamSize)
+@@ -124,7 +122,7 @@ namespace ps2x::iop::detail
+         writeHardware32(aligned, current);
+     }
+ 
+-    void IopMemory::write16(uint32_t address, uint16_t value)
++    void IopMemory::write16Slow(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys + 1u < RamSize)
+@@ -137,7 +135,7 @@ namespace ps2x::iop::detail
+         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
+     }
+ 
+-    void IopMemory::write32(uint32_t address, uint32_t value)
++    void IopMemory::write32Slow(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+@@ -223,13 +221,26 @@ namespace ps2x::iop::detail
+                (phys >= SifBase && phys < SifEnd);
+     }
+ 
+-    uint32_t IopMemory::readHardware32(uint32_t address) const
++    uint32_t IopMemory::hardwareValue(uint32_t address) const
+     {
+         if (isSio2Address(address))
+             return m_sio2.readRegister(address & 0xFFFFu);
++        if (address - HardwareBase < Spu2End - HardwareBase)
++            return m_hardwareWords[(address - HardwareBase) >> 2u];
+         const auto value = m_hardware.find(address);
+-        if (value != m_hardware.end())
+-            return value->second;
++        return value != m_hardware.end() ? value->second : 0u;
++    }
++
++    uint32_t &IopMemory::hardwareSlot(uint32_t address)
++    {
++        if (address - HardwareBase < Spu2End - HardwareBase)
++            return m_hardwareWords[(address - HardwareBase) >> 2u];
++        return m_hardware[address];
++    }
++
++    uint32_t IopMemory::readHardware32(uint32_t address) const
++    {
++        // The interrupt registers are never stored (writeHardware32 handles them first).
+         switch (address)
+         {
+         case 0x1F801070u:
+@@ -239,7 +250,7 @@ namespace ps2x::iop::detail
+         case 0x1F801078u:
+             return m_interruptControl;
+         default:
+-            return 0u;
++            return hardwareValue(address);
+         }
+     }
+ 
+@@ -272,16 +283,16 @@ namespace ps2x::iop::detail
+             return;
+         }
+ 
+-        m_hardware[address] = value;
++        hardwareSlot(address) = value;
+         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
+             return;
+ 
+         const bool secondCore = address == kDmaSpu1Chcr;
+-        m_hardware[address] = value & ~kDmaStart;
++        hardwareSlot(address) = value & ~kDmaStart;
+         if (spu2Log) // TEMP-DEBUG(mhrs)
+         {
+-            const uint32_t madrIt = m_hardware.count(address - 8u) ? m_hardware[address - 8u] : 0u;
+-            const uint32_t bcrIt = m_hardware.count(address - 4u) ? m_hardware[address - 4u] : 0u;
++            const uint32_t madrIt = hardwareValue(address - 8u);
++            const uint32_t bcrIt = hardwareValue(address - 4u);
+             std::fprintf(stderr, "[spu2] SDMA core%d madr=%08x bcr=%08x(%ux%u) chcr=%08x dir=%s\n",
+                          secondCore ? 1 : 0, madrIt, bcrIt, bcrIt & 0xFFFFu, bcrIt >> 16u, value,
+                          (value & 1u) ? "ram->spu" : "spu->ram");
+@@ -296,8 +307,8 @@ namespace ps2x::iop::detail
+         }();
+         if (pcmCap && !secondCore && (value & 1u))
+         {
+-            const uint32_t madr = m_hardware.count(address - 8u) ? m_hardware[address - 8u] : 0u;
+-            const uint32_t bcr = m_hardware.count(address - 4u) ? m_hardware[address - 4u] : 0u;
++            const uint32_t madr = hardwareValue(address - 8u);
++            const uint32_t bcr = hardwareValue(address - 4u);
+             const uint64_t bytes = static_cast<uint64_t>(std::max<uint32_t>(bcr & 0xFFFFu, 1u)) *
+                                    std::max<uint32_t>(bcr >> 16u, 1u) * 4u;
+             const uint32_t src = madr & (RamSize - 1u);
+@@ -318,8 +329,8 @@ namespace ps2x::iop::detail
+         // it to the runtime audio backend (which does its own dedupe/rate handling).
+         if (m_spuStreamSink && !secondCore && (value & 1u))
+         {
+-            const uint32_t madr = m_hardware.count(address - 8u) ? m_hardware[address - 8u] : 0u;
+-            const uint32_t bcr = m_hardware.count(address - 4u) ? m_hardware[address - 4u] : 0u;
++            const uint32_t madr = hardwareValue(address - 8u);
++            const uint32_t bcr = hardwareValue(address - 4u);
+             const uint64_t bytes = static_cast<uint64_t>(std::max<uint32_t>(bcr & 0xFFFFu, 1u)) *
+                                    std::max<uint32_t>(bcr >> 16u, 1u) * 4u;
+             const uint32_t src = madr & (RamSize - 1u);
+@@ -330,22 +341,18 @@ namespace ps2x::iop::detail
+         const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
+         const uint32_t alignedStatus = statusAddress & ~3u;
+         const uint32_t shift = (statusAddress & 2u) * 8u;
+-        uint32_t status = 0u;
+-        if (const auto current = m_hardware.find(alignedStatus); current != m_hardware.end())
+-            status = current->second;
+-        status |= 0x80u << shift;
+-        m_hardware[alignedStatus] = status;
++        hardwareSlot(alignedStatus) = hardwareValue(alignedStatus) | (0x80u << shift);
+ 
+         const uint32_t blockControlAddress = address - sizeof(uint32_t);
+-        uint32_t blockControl = 0u;
+-        if (const auto current = m_hardware.find(blockControlAddress); current != m_hardware.end())
+-            blockControl = current->second;
++        const uint32_t blockControl = hardwareValue(blockControlAddress);
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
++        // ADMAS (core base + 0x1B0) is set while a core streams auto-DMA to its sound output.
++        const bool autoDma = (hardwareValue(0x1F9001B0u + (secondCore ? 0x400u : 0u)) & 0xFFFFu) != 0u;
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+-            std::max<uint64_t>(transferWords * 2u, 64u),
++            autoDma ? transferWords * kAutoDmaCyclesPerWord : std::max<uint64_t>(transferWords * 2u, 64u),
+         };
+     }
+ 
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -5,6 +5,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -45,12 +46,67 @@ namespace ps2x::iop::detail
+ 
+         void reset();
+ 
+-        [[nodiscard]] uint8_t read8(uint32_t address) const;
+-        [[nodiscard]] uint16_t read16(uint32_t address) const;
+-        [[nodiscard]] uint32_t read32(uint32_t address) const;
+-        void write8(uint32_t address, uint8_t value);
+-        void write16(uint32_t address, uint16_t value);
+-        void write32(uint32_t address, uint32_t value);
++        // RAM accesses inline; everything else (and the RAM edge cases) goes to the *Slow versions.
++        [[nodiscard]] uint8_t read8(uint32_t address) const
++        {
++            const uint32_t phys = physicalAddress(address);
++            return phys < RamSize ? m_ram[phys] : read8Slow(address);
++        }
++        [[nodiscard]] uint16_t read16(uint32_t address) const
++        {
++            const uint32_t phys = physicalAddress(address);
++            if (phys + 1u < RamSize)
++            {
++                uint16_t value;
++                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
++                return value;
++            }
++            return read16Slow(address);
++        }
++        [[nodiscard]] uint32_t read32(uint32_t address) const
++        {
++            const uint32_t phys = physicalAddress(address);
++            if ((phys & 3u) == 0u && phys < RamSize)
++            {
++                uint32_t value;
++                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
++                return value;
++            }
++            return read32Slow(address);
++        }
++        void write8(uint32_t address, uint8_t value)
++        {
++            const uint32_t phys = physicalAddress(address);
++            if (phys < RamSize)
++            {
++                m_ram[phys] = value;
++                m_owned[phys] = 1u;
++                return;
++            }
++            write8Slow(address, value);
++        }
++        void write16(uint32_t address, uint16_t value)
++        {
++            const uint32_t phys = physicalAddress(address);
++            if (phys + 1u < RamSize)
++            {
++                std::memcpy(m_ram.data() + phys, &value, sizeof(value));
++                std::memset(m_owned.data() + phys, 1, sizeof(value));
++                return;
++            }
++            write16Slow(address, value);
++        }
++        void write32(uint32_t address, uint32_t value)
++        {
++            const uint32_t phys = physicalAddress(address);
++            if ((phys & 3u) == 0u && phys < RamSize)
++            {
++                std::memcpy(m_ram.data() + phys, &value, sizeof(value));
++                std::memset(m_owned.data() + phys, 1, sizeof(value));
++                return;
++            }
++            write32Slow(address, value);
++        }
+ 
+         [[nodiscard]] bool readRam(uint32_t address, void *destination, size_t size) const;
+         [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);
+@@ -80,17 +136,26 @@ namespace ps2x::iop::detail
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+         [[nodiscard]] std::span<uint8_t> ramMutable() noexcept { return m_ram; }
+ 
+-        [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
++        [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept { return address & 0x1FFFFFFFu; }
+ 
+     private:
++        [[nodiscard]] uint8_t read8Slow(uint32_t address) const;
++        [[nodiscard]] uint16_t read16Slow(uint32_t address) const;
++        [[nodiscard]] uint32_t read32Slow(uint32_t address) const;
++        void write8Slow(uint32_t address, uint8_t value);
++        void write16Slow(uint32_t address, uint16_t value);
++        void write32Slow(uint32_t address, uint32_t value);
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
++        [[nodiscard]] uint32_t hardwareValue(uint32_t address) const;
++        [[nodiscard]] uint32_t &hardwareSlot(uint32_t address);
+ 
+         std::vector<uint8_t> m_ram;
+         std::vector<uint8_t> m_owned;
+         std::vector<uint8_t> m_scratch;
+-        std::unordered_map<uint32_t, uint32_t> m_hardware;
++        std::vector<uint32_t> m_hardwareWords; // registers in [HardwareBase, Spu2End), by word
++        std::unordered_map<uint32_t, uint32_t> m_hardware; // any other address
+         std::vector<Allocation> m_allocations;
+         uint32_t m_heapCursor = HeapBase;
+         uint32_t m_interruptStatus = 0;
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -326,12 +326,34 @@ namespace
+                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
+                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
+     }
++    bool testSpuAutoDmaPacing()
++    {
++        IopMemory memory;
++        memory.write32(0x1F8010C4u, (4u << 16u) | 16u); // DMA4: 4 blocks of 16 words
++        memory.write32(0x1F8010C8u, 0x01000201u);
++        const auto plain = memory.takeDmaStart();
++        memory.write16(0x1F9001B0u, 1u); // core0 ADMAS: auto-DMA
++        memory.write32(0x1F8010C8u, 0x01000201u);
++        const auto paced = memory.takeDmaStart();
++        memory.write32(0x1F801504u, (4u << 16u) | 16u); // DMA7 (core1)
++        memory.write32(0x1F801508u, 0x01000201u);
++        const auto plainCore1 = memory.takeDmaStart();
++        memory.write16(0x1F9005B0u, 2u); // core1 ADMAS
++        memory.write32(0x1F801508u, 0x01000201u);
++        const auto pacedCore1 = memory.takeDmaStart();
++        const bool ok = plain && plain->delayCycles == 128u && paced && paced->delayCycles == 64u * 768u &&
++                        plainCore1 && plainCore1->delayCycles == 128u && pacedCore1 && pacedCore1->irq == 0x28 &&
++                        pacedCore1->delayCycles == 64u * 768u;
++        if (!ok)
++            std::cerr << "SPU2 auto-DMA should complete at 48 kHz (768 IOP cycles per word), other transfers at 2 per word\n";
++        return ok;
++    }
+ }
+ 
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+-        !testTimrmanPeriodicCallback())
++        !testTimrmanPeriodicCallback() || !testSpuAutoDmaPacing())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_async_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -24,6 +24,7 @@ public:
+     void Reset() override;
+ 
+     void Submit(const GSPrimitiveBatch &batch) override;
++    void SubmitBatch(const GSPrimitiveBatch *batches, size_t count) override;
+     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
+     void BeginTransfer(const GSTransferCommand &command) override;
+     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
+@@ -59,10 +60,18 @@ private:
+     {
+     };
+     using ImageData = std::vector<uint8_t>;
++    // Draws [first, first + count) of m_pendingDraws.
++    struct DrawRange
++    {
++        uint32_t first;
++        uint32_t count;
++    };
+     // Kept small: a frame queues ~100k of these.
+-    using Command = std::variant<GSPrimitiveBatch, ClutLoad, GSTransferCommand, ImageData, FlushCmd, TextureFlushCmd, GSSyncReason, Clear>;
++    using Command = std::variant<DrawRange, ClutLoad, GSTransferCommand, ImageData, FlushCmd, TextureFlushCmd, GSSyncReason, Clear>;
+ 
+-    void Enqueue(Command &&command);
++    // wakeNow: wake the worker even if it has less than kWakeDraws commands queued (anything but a draw).
++    template <class T>
++    void Enqueue(T &&command, bool wakeNow = true);
+     void Drain() const;
+     void Run(Command &command);
+     void WorkerLoop();
+@@ -71,8 +80,12 @@ private:
+     mutable std::mutex m_mutex;
+     mutable std::condition_variable m_cv;
+     std::vector<Command> m_pending;
++    std::vector<GSPrimitiveBatch> m_pendingDraws; // what the DrawRanges in m_pending refer to
++    size_t QueuedLocked() const { return m_pending.size() + m_pendingDraws.size(); }
+     uint64_t m_submitted = 0;
+     uint64_t m_completed = 0;
+     bool m_stop = false;
++    bool m_wakeNow = false;         // a command other than a draw or CLUT load is queued
++    mutable int m_drainWaiters = 0; // threads in Drain
+     std::thread m_worker;
+ };
+diff --git a/ps2xRuntime/include/runtime/gs/gs_backend.h b/ps2xRuntime/include/runtime/gs/gs_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_backend.h
+@@ -23,6 +23,12 @@ public:
+     virtual void Reset() = 0;
+ 
+     virtual void Submit(const GSPrimitiveBatch &batch) = 0;
++    // Draws in order, as Submit would take them one by one.
++    virtual void SubmitBatch(const GSPrimitiveBatch *batches, size_t count)
++    {
++        for (size_t i = 0; i < count; ++i)
++            Submit(batches[i]);
++    }
+     virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
+     // Runs the steps in order, as Submit / LoadClut would; a backend may overlap independent primitives.
+     virtual void SubmitMany(const GSDrawStep *steps, size_t count)
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -244,6 +244,21 @@ private:
+     bool m_debugHistoryPaused = true;
+ 
+     std::unique_ptr<GSRasterBackend> m_backend;
++
++    // Draws not yet handed to m_backend (guarded by m_stateMutex). flushDraws runs before every other backend
++    // call (backendFlushed) and when a locked entry point returns (DrawFlush), so the backend sees calls in order.
++    mutable std::vector<GSPrimitiveBatch> m_queuedDraws;
++    void flushDraws() const;
++    GSRasterBackend *backendFlushed() const
++    {
++        flushDraws();
++        return m_backend.get();
++    }
++    struct DrawFlush
++    {
++        const GS &gs;
++        ~DrawFlush() { gs.flushDraws(); }
++    };
+ };
+ 
+ #endif
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -6,6 +6,7 @@
+ #include <cstdint>
+ #include <array>
+ #include <functional>
++#include <thread>
+ #include <vector>
+ #include <unordered_map>
+ #include <atomic>
+@@ -361,7 +362,11 @@ public:
+         m_gifVuWorker.stop(); // it posts to the GS stage
+         m_gsWorker.stop();
+     }
+-    void postGifVu(std::function<void()> job) { m_gifVuWorker.post(std::move(job)); }
++    void postGifVu(std::function<void()> job)
++    {
++        flushUnpackBlocks(); // UNPACK results the EE decoded before this job come first
++        m_gifVuWorker.post(std::move(job));
++    }
+     // The GS frontend (packets reaching the GS, native GS uploads) runs as a second ordered stage after the
+     // GIF/VU worker, so the worker does not wait for it. postGs from the GIF/VU worker keeps their order;
+     // postGsAfterGifVu orders an EE request after the GIF/VU work the EE issued before it.
+@@ -373,6 +378,7 @@ public:
+     bool gsStageInline() const { return m_gsWorker.mode() == OrderedWorker::Mode::Inline; }
+     void drainGifVu() const
+     {
++        flushUnpackBlocks();
+         m_gifVuWorker.drain(); // what it posted to the GS stage is queued there now
+         m_gsWorker.drain();
+     }
+@@ -446,6 +452,19 @@ public:
+     bool m_path3Masked = false;       // GIF/VU worker side
+     bool m_path3MaskedIssued = false; // EE side, see isPath3Masked()
+     bool m_vif1UnpackReference = false;
++    // CL == WL UNPACK results decoded on the EE, not yet posted to the GIF/VU worker (see flushUnpackBlocks).
++    struct UnpackBlock
++    {
++        uint32_t start;   // first VU1 qword (wraps at 1024)
++        uint32_t count;   // qwords
++        size_t data;      // index of its first word in m_unpackData (4 per qword)
++        size_t masks;     // index of its lane masks in m_unpackMasks, SIZE_MAX when every lane is written
++    };
++    mutable std::vector<UnpackBlock> m_unpackBlocks;
++    mutable std::vector<uint32_t> m_unpackData;
++    mutable std::vector<uint8_t> m_unpackMasks;
++    std::atomic<std::thread::id> m_unpackOwner{}; // the thread filling the batch (only it flushes)
++    void flushUnpackBlocks() const;
+     uint32_t m_vif1PendingPath2ImageQwc = 0u;
+     bool m_vif1PendingPath2DirectHl = false;
+     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -1,11 +1,14 @@
+ #include "runtime/gs/gs_async_backend.h"
+ 
++#include <type_traits>
+ #include <utility>
+ 
+ namespace
+ {
+     // Bounds the queue so a producer far ahead of the rasteriser cannot use unbounded memory.
+     constexpr size_t kMaxPendingCommands = 1u << 18u; // a few frames
++    // Draws are cheap to queue but waking the worker is a syscall: wake it once this many commands wait.
++    constexpr size_t kWakeDraws = 1024u;
+ }
+ 
+ GSAsyncBackend::GSAsyncBackend(std::unique_ptr<GSRasterBackend> inner)
+@@ -24,15 +27,23 @@ GSAsyncBackend::~GSAsyncBackend()
+     m_worker.join();
+ }
+ 
+-void GSAsyncBackend::Enqueue(Command &&command)
++template <class T>
++void GSAsyncBackend::Enqueue(T &&command, bool wakeNow)
+ {
+     std::unique_lock<std::mutex> lock(m_mutex);
+-    m_cv.wait(lock, [this]() { return m_pending.size() < kMaxPendingCommands; });
+-    const bool wasEmpty = m_pending.empty();
+-    m_pending.push_back(std::move(command));
++    if (QueuedLocked() >= kMaxPendingCommands)
++    {
++        m_wakeNow = true;
++        m_cv.notify_all();
++        m_cv.wait(lock, [this]() { return QueuedLocked() < kMaxPendingCommands; });
++    }
++    m_pending.emplace_back(std::in_place_type<std::decay_t<T>>, std::forward<T>(command));
+     ++m_submitted;
++    if (wakeNow)
++        m_wakeNow = true;
++    const bool wake = wakeNow || QueuedLocked() == kWakeDraws;
+     lock.unlock();
+-    if (wasEmpty)
++    if (wake)
+         m_cv.notify_all();
+ }
+ 
+@@ -40,7 +51,11 @@ void GSAsyncBackend::Drain() const
+ {
+     std::unique_lock<std::mutex> lock(m_mutex);
+     const uint64_t target = m_submitted;
++    ++m_drainWaiters;
++    if (m_completed < target)
++        m_cv.notify_all(); // draws may be waiting for kWakeDraws
+     m_cv.wait(lock, [this, target]() { return m_completed >= target; });
++    --m_drainWaiters;
+ }
+ 
+ void GSAsyncBackend::Run(Command &command)
+@@ -48,7 +63,7 @@ void GSAsyncBackend::Run(Command &command)
+     struct Visitor
+     {
+         GSRasterBackend &b;
+-        void operator()(const GSPrimitiveBatch &batch) { b.Submit(batch); }
++        void operator()(const DrawRange &) {} // WorkerLoop hands draws over itself
+         void operator()(const ClutLoad &c) { b.LoadClut(c.tex0, c.texclut); }
+         void operator()(const GSTransferCommand &t) { b.BeginTransfer(t); }
+         void operator()(const ImageData &d) { b.UploadImage(d.data(), static_cast<uint32_t>(d.size())); }
+@@ -63,23 +78,28 @@ void GSAsyncBackend::Run(Command &command)
+ void GSAsyncBackend::WorkerLoop()
+ {
+     std::vector<Command> batch;
++    std::vector<GSPrimitiveBatch> draws;
+     std::vector<GSDrawStep> run; // consecutive draws and CLUT loads, handed over together
+     for (;;)
+     {
+         {
+             std::unique_lock<std::mutex> lock(m_mutex);
+-            m_cv.wait(lock, [this]() { return m_stop || !m_pending.empty(); });
++            m_cv.wait(lock, [this]()
++                      { return m_stop || (!m_pending.empty() && (m_wakeNow || m_drainWaiters > 0 || QueuedLocked() >= kWakeDraws)); });
+             if (m_pending.empty())
+                 return; // stopping
+             batch.swap(m_pending);
++            draws.swap(m_pendingDraws);
++            m_wakeNow = false;
+         }
+         m_cv.notify_all(); // the queue has room again
+ 
+         for (Command &command : batch)
+         {
+-            if (const auto *draw = std::get_if<GSPrimitiveBatch>(&command))
++            if (const auto *range = std::get_if<DrawRange>(&command))
+             {
+-                run.push_back(GSDrawStep{draw, {}, {}});
++                for (uint32_t k = 0; k < range->count; ++k)
++                    run.push_back(GSDrawStep{&draws[range->first + k], {}, {}});
+                 continue;
+             }
+             if (const auto *clut = std::get_if<ClutLoad>(&command))
+@@ -102,6 +122,7 @@ void GSAsyncBackend::WorkerLoop()
+         }
+         m_cv.notify_all();
+         batch.clear();
++        draws.clear();
+     }
+ }
+ 
+@@ -119,12 +140,37 @@ void GSAsyncBackend::Reset()
+ 
+ void GSAsyncBackend::Submit(const GSPrimitiveBatch &batch)
+ {
+-    Enqueue(batch);
++    SubmitBatch(&batch, 1u);
++}
++
++void GSAsyncBackend::SubmitBatch(const GSPrimitiveBatch *batches, size_t count)
++{
++    std::unique_lock<std::mutex> lock(m_mutex);
++    if (QueuedLocked() + count > kMaxPendingCommands && !m_pending.empty())
++    {
++        m_wakeNow = true;
++        m_cv.notify_all();
++        m_cv.wait(lock, [this, count]() { return m_pending.empty() || QueuedLocked() + count <= kMaxPendingCommands; });
++    }
++    const size_t first = m_pendingDraws.size();
++    m_pendingDraws.insert(m_pendingDraws.end(), batches, batches + count);
++    DrawRange *last = m_pending.empty() ? nullptr : std::get_if<DrawRange>(&m_pending.back());
++    if (last && last->first + last->count == first)
++        last->count += static_cast<uint32_t>(count);
++    else
++    {
++        m_pending.emplace_back(std::in_place_type<DrawRange>, DrawRange{static_cast<uint32_t>(first), static_cast<uint32_t>(count)});
++        ++m_submitted;
++    }
++    const bool wake = QueuedLocked() >= kWakeDraws;
++    lock.unlock();
++    if (wake)
++        m_cv.notify_all();
+ }
+ 
+ void GSAsyncBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+-    Enqueue(ClutLoad{tex0, texclut});
++    Enqueue(ClutLoad{tex0, texclut}, false);
+ }
+ 
+ void GSAsyncBackend::BeginTransfer(const GSTransferCommand &transfer)
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2734,57 +2734,97 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         m_transferState.y = dsay + row;
+     };
+ 
++    // Whole pixels of bytesPerPixel each: as many as the data holds and the transfer still takes.
++    const auto runPixels = [&](uint32_t bytesPerPixel, auto writeOne)
++    {
++        const uint32_t n = std::min<uint32_t>((sizeBytes - offset) / bytesPerPixel,
++                                              m_transferState.totalPixels - m_transferState.copiedPixels);
++        uint32_t x = m_transferState.x;
++        uint32_t y = m_transferState.y;
++        const uint8_t *src = data + offset;
++        for (uint32_t i = 0; i < n; ++i, src += bytesPerPixel)
++        {
++            writeOne(src, x, y);
++            if (++column >= rrw)
++            {
++                column = 0u;
++                ++row;
++            }
++            x = dsax + column;
++            y = dsay + row;
++        }
++        offset += n * bytesPerPixel;
++        m_transferState.copiedPixels += n;
++        if (m_transferState.copiedPixels >= m_transferState.totalPixels)
++        {
++            m_transferState.direction = 3u;
++            m_transferState.totalPixels = 0u;
++        }
++        else if (n != 0u)
++        {
++            m_transferState.x = x;
++            m_transferState.y = y;
++        }
++    };
++    using Psm = GSMem::PixelStorageMode;
++    const auto word32 = [](const uint8_t *src)
++    {
++        uint32_t value;
++        std::memcpy(&value, src, sizeof(value));
++        return value;
++    };
++    const auto word24 = [](const uint8_t *src)
++    {
++        return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8u) | (static_cast<uint32_t>(src[2]) << 16u);
++    };
++    const auto word16 = [](const uint8_t *src)
++    {
++        uint16_t value;
++        std::memcpy(&value, src, sizeof(value));
++        return static_cast<uint32_t>(value);
++    };
++
+     switch (dpsm)
+     {
+     case GS_PSM_CT32:
++        runPixels(4u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::C32>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, word32(src)); });
++        break;
+     case GS_PSM_Z32:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            if (sizeBytes - offset < 4u)
+-                return;
+-            uint32_t value = 0u;
+-            std::memcpy(&value, data + offset, sizeof(value));
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 4u;
+-            advancePixel(1u);
+-        }
++        runPixels(4u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::Z32>::Write(GSMem::PageTableZ32, m_vram, dbp, dbw, x, y, word32(src)); });
+         break;
+     case GS_PSM_CT24:
++        runPixels(3u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::C24>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, word24(src)); });
++        break;
+     case GS_PSM_Z24:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            if (sizeBytes - offset < 3u)
+-                return;
+-            const uint32_t value = static_cast<uint32_t>(data[offset]) |
+-                                   (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
+-                                   (static_cast<uint32_t>(data[offset + 2u]) << 16u);
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 3u;
+-            advancePixel(1u);
+-        }
++        runPixels(3u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::Z24>::Write(GSMem::PageTableZ32, m_vram, dbp, dbw, x, y, word24(src)); });
+         break;
+     case GS_PSM_CT16:
++        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::C16>::Write(GSMem::PageTableC16, m_vram, dbp, dbw, x, y, word16(src)); });
++        break;
+     case GS_PSM_CT16S:
++        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::C16S>::Write(GSMem::PageTableC16S, m_vram, dbp, dbw, x, y, word16(src)); });
++        break;
+     case GS_PSM_Z16:
++        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::Z16>::Write(GSMem::PageTableZ16, m_vram, dbp, dbw, x, y, word16(src)); });
++        break;
+     case GS_PSM_Z16S:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            if (sizeBytes - offset < 2u)
+-                return;
+-            uint16_t value = 0u;
+-            std::memcpy(&value, data + offset, sizeof(value));
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 2u;
+-            advancePixel(1u);
+-        }
++        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::Z16S>::Write(GSMem::PageTableZ16S, m_vram, dbp, dbw, x, y, word16(src)); });
+         break;
+     case GS_PSM_T8:
++        runPixels(1u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::P8>::Write(GSMem::PageTableP8, m_vram, dbp, dbw, x, y, *src); });
++        break;
+     case GS_PSM_T8H:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, m_transferState.x, m_transferState.y, data[offset++]);
+-            advancePixel(1u);
+-        }
++        runPixels(1u, [&](const uint8_t *src, uint32_t x, uint32_t y)
++                  { GSMem::PixelStorageTraits<Psm::P8H>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, *src); });
+         break;
+     case GS_PSM_T4:
+     case GS_PSM_T4HL:
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -125,6 +125,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ void GS::reset()
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     std::memset(m_ctx, 0, sizeof(m_ctx));
+     m_prim = {};
+     m_primRegister = {};
+@@ -161,9 +162,9 @@ void GS::reset()
+     m_hasPreferredDisplaySource = false;
+     if (m_backend)
+     {
+-        m_backend->Flush();
+-        m_backend->Sync(GSSyncReason::Reset);
+-        m_backend->Reset();
++        backendFlushed()->Flush();
++        backendFlushed()->Sync(GSSyncReason::Reset);
++        backendFlushed()->Reset();
+     }
+     {
+         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+@@ -226,6 +227,7 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
+ GSDebugSnapshot GS::getDebugSnapshot() const
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+ 
+     GSDebugSnapshot snapshot{};
+     snapshot.ctx[0] = m_ctx[0];
+@@ -240,7 +242,7 @@ GSDebugSnapshot GS::getDebugSnapshot() const
+     snapshot.bitbltbuf = m_bitbltbuf;
+     snapshot.trxpos = m_trxpos;
+     snapshot.trxreg = m_trxreg;
+-    const GSTransferSnapshot transfer = m_backend ? m_backend->GetTransferSnapshot() : GSTransferSnapshot{};
++    const GSTransferSnapshot transfer = m_backend ? backendFlushed()->GetTransferSnapshot() : GSTransferSnapshot{};
+     snapshot.trxdir = transfer.direction;
+     snapshot.transferX = transfer.x;
+     snapshot.transferY = transfer.y;
+@@ -266,6 +268,7 @@ GSDebugSnapshot GS::getDebugSnapshot() const
+ std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+ 
+     std::vector<GSDebugHistoryEntry> out;
+     out.reserve(m_debugHistoryCount);
+@@ -280,6 +283,7 @@ std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
+ void GS::clearDebugHistory()
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     m_debugHistoryWrite = 0;
+     m_debugHistoryCount = 0;
+     m_debugNextSeq = 1;
+@@ -290,12 +294,14 @@ void GS::clearDebugHistory()
+ bool GS::isDebugHistoryPaused() const
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     return m_debugHistoryPaused;
+ }
+ 
+ void GS::setDebugHistoryPaused(bool paused)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     m_debugHistoryPaused = paused;
+ }
+ 
+@@ -314,7 +320,7 @@ GSDebugHistoryEntry GS::makeDebugEventUnlocked(GSDebugEventKind kind) const
+     entry.bitbltbuf = m_bitbltbuf;
+     entry.trxpos = m_trxpos;
+     entry.trxreg = m_trxreg;
+-    const GSTransferSnapshot transfer = m_backend ? m_backend->GetTransferSnapshot() : GSTransferSnapshot{};
++    const GSTransferSnapshot transfer = m_backend ? backendFlushed()->GetTransferSnapshot() : GSTransferSnapshot{};
+     entry.trxdir = transfer.direction;
+     entry.transferPixels = transfer.totalPixels;
+     return entry;
+@@ -453,7 +459,7 @@ void GS::recordTransferDebugEventUnlocked()
+     }
+ 
+     GSDebugHistoryEntry entry = makeDebugEventUnlocked(GSDebugEventKind::Transfer);
+-    entry.transferPixels = m_backend ? m_backend->GetTransferSnapshot().totalPixels : 0u;
++    entry.transferPixels = m_backend ? backendFlushed()->GetTransferSnapshot().totalPixels : 0u;
+     recordDebugEventUnlocked(entry);
+ }
+ 
+@@ -476,6 +482,7 @@ void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp
+ bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     if (!m_hasPreferredDisplaySource)
+     {
+         outSource = {};
+@@ -529,6 +536,7 @@ void GS::latchHostPresentationFrame()
+     GSPresentationRequest request{};
+     {
+         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++        const DrawFlush drawFlush{*this};
+         if (!m_backend || !m_privRegs)
+         {
+             std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+@@ -571,6 +579,7 @@ void GS::latchHostPresentationFrame()
+     if (hasFrame)
+     {
+         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++        const DrawFlush drawFlush{*this};
+         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
+     }
+ }
+@@ -641,6 +650,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+ 
+@@ -745,6 +755,7 @@ bool GS::canProcessNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes
+ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     if (!canProcessNativePackedGIFPacket(data, sizeBytes))
+         return false;
+ 
+@@ -787,6 +798,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+                            uint32_t sizeBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+ 
+@@ -1065,6 +1077,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     writeRegisterUnlocked(regAddr, value);
+ }
+ 
+@@ -1242,7 +1255,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
+         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
+         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+-        m_backend->LoadClut(t, m_texclut);
++        backendFlushed()->LoadClut(t, m_texclut);
+         break;
+     }
+     case GS_REG_CLAMP_1:
+@@ -1273,7 +1286,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
+         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
+         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+-        m_backend->LoadClut(t, m_texclut);
++        backendFlushed()->LoadClut(t, m_texclut);
+         break;
+     }
+     case GS_REG_XYOFFSET_1:
+@@ -1394,7 +1407,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+             command.trxpos = m_trxpos;
+             command.trxreg = m_trxreg;
+             command.direction = m_trxdir;
+-            m_backend->BeginTransfer(command);
++            backendFlushed()->BeginTransfer(command);
+         }
+         recordTransferDebugEventUnlocked();
+         break;
+@@ -1416,7 +1429,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         break;
+     case GS_REG_TEXFLUSH:
+         if (m_backend)
+-            m_backend->TextureFlush();
++            backendFlushed()->TextureFlush();
+         break;
+     case GS_REG_SCANMSK:
+         m_scanmsk = value;
+@@ -1481,8 +1494,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     {
+         if (m_backend)
+         {
+-            m_backend->Flush();
+-            m_backend->Sync(GSSyncReason::Finish);
++            backendFlushed()->Flush();
++            backendFlushed()->Sync(GSSyncReason::Finish);
+         }
+         if (m_privRegs)
+             m_privRegs->csr.fetch_or(0x2);
+@@ -1620,7 +1633,9 @@ void GS::vertexKick(bool drawing)
+             }
+         }
+         updatePreferredDisplaySourceForDraw(batch);
+-        m_backend->Submit(batch);
++        m_queuedDraws.push_back(batch);
++        if (m_queuedDraws.size() >= 256u)
++            flushDraws();
+         recordDrawDebugEventUnlocked(needed);
+     }
+ 
+@@ -1651,29 +1666,39 @@ void GS::vertexKick(bool drawing)
+     }
+ }
+ 
++void GS::flushDraws() const
++{
++    if (!m_queuedDraws.empty() && m_backend)
++        m_backend->SubmitBatch(m_queuedDraws.data(), m_queuedDraws.size());
++    m_queuedDraws.clear();
++}
++
+ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (m_backend)
+-        m_backend->UploadImage(data, sizeBytes);
++        backendFlushed()->UploadImage(data, sizeBytes);
+ }
+ 
+ 
+ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-    return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
++    const DrawFlush drawFlush{*this};
++    return m_backend && backendFlushed()->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+ }
+ 
+ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-    return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
++    const DrawFlush drawFlush{*this};
++    return m_backend && backendFlushed()->ClearFramebuffer(activeContext(), rgba);
+ }
+ 
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-    return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
++    const DrawFlush drawFlush{*this};
++    return m_backend ? backendFlushed()->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+ 
+ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+@@ -1682,11 +1707,12 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+         backend = std::make_unique<GSCpuBackend>();
+ 
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+     if (m_backend)
+     {
+-        m_backend->Flush();
+-        m_backend->Sync(GSSyncReason::Reset);
++        backendFlushed()->Flush();
++        backendFlushed()->Sync(GSSyncReason::Reset);
+ 
+         // The external 4 MiB GS allocation is the backend hand-off format.
+         // This keeps hot backend replacement deterministic even when a future
+@@ -1694,7 +1720,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+         if (m_localMemoryStorage && m_localMemorySize != 0u)
+         {
+             std::vector<uint8_t> localMemory;
+-            m_backend->SnapshotVram(localMemory);
++            backendFlushed()->SnapshotVram(localMemory);
+             const size_t bytes = std::min<size_t>(localMemory.size(), m_localMemorySize);
+             if (bytes != 0u)
+                 std::memcpy(m_localMemoryStorage, localMemory.data(), bytes);
+@@ -1702,20 +1728,22 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+     }
+ 
+     m_backend = std::move(backend);
+-    m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
++    backendFlushed()->Initialize(m_localMemoryStorage, m_localMemorySize);
+ }
+ 
+ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-    return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
++    const DrawFlush drawFlush{*this};
++    return m_backend ? backendFlushed()->ReadVram(psm, base, bw, x, y) : 0u;
+ }
+ 
+ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const DrawFlush drawFlush{*this};
+     if (m_backend)
+-        m_backend->WriteVram(psm, base, bw, x, y, value);
++        backendFlushed()->WriteVram(psm, base, bw, x, y, value);
+ }
+ 
+ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1423,6 +1423,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                     const int kMaxChainTags = 4096;
+                     std::vector<uint8_t> chainBuf;
++                    // Chains of a channel tend to be alike in size: start from the last one's.
++                    static size_t lastChainBytes[3] = {0u, 0u, 0u};
++                    size_t &chainHint = lastChainBytes[channelBase == 0x1000A000u ? 0 : channelBase == 0x10009000u ? 1 : 2];
++                    chainBuf.reserve(chainHint);
+ 
+                     std::vector<std::array<uint32_t, 3>> mhrsSegs; // TEMP-DEBUG(mhrs): chain offset, EE address, bytes
+                     std::vector<VifSourceSpan> chainSpans;
+@@ -1636,6 +1640,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
+                     m_ioRegisters[channelBase + 0x00] = chcr;
+ 
++                    chainHint = chainBuf.size();
+                     if (!chainBuf.empty())
+                     {
+                         PendingTransfer pt;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,5 +1,6 @@
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -797,8 +798,40 @@ bool PS2Runtime::syncCoreSubsystems()
+                                             m_gs.processGIFPacket(data, size);
+                                             return;
+                                         }
+-                                        m_memory.postGs([this, packet = std::vector<uint8_t>(data, data + size)]
+-                                                        { m_gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size())); });
++                                        // Buffers go back to the pool once the GS stage has processed them.
++                                        struct PacketPool
++                                        {
++                                            std::mutex mutex;
++                                            std::vector<std::vector<uint8_t> *> free;
++                                        };
++                                        static PacketPool pool;
++                                        std::vector<uint8_t> *packet = nullptr;
++                                        {
++                                            std::lock_guard<std::mutex> lock(pool.mutex);
++                                            if (!pool.free.empty())
++                                            {
++                                                packet = pool.free.back();
++                                                pool.free.pop_back();
++                                            }
++                                        }
++                                        if (!packet)
++                                            packet = new std::vector<uint8_t>();
++                                        packet->assign(data, data + size);
++                                        m_memory.postGs([this, packet]
++                                                        {
++                                                            m_gs.processGIFPacket(packet->data(), static_cast<uint32_t>(packet->size()));
++                                                            // Keep only small buffers, and a bounded number, so image uploads cannot pin memory.
++                                                            if (packet->capacity() <= 65536u)
++                                                            {
++                                                                std::lock_guard<std::mutex> lock(pool.mutex);
++                                                                if (pool.free.size() < 256u)
++                                                                {
++                                                                    pool.free.push_back(packet);
++                                                                    return;
++                                                                }
++                                                            }
++                                                            delete packet;
++                                                        });
+                                     });
+     m_memory.setGifArbiter(&m_gifArbiter);
+     // VIF1 MSCAL/MSCNT: the run goes to the GIF/VU worker. VPU_STAT's D/T stop bits come from the run only when
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,5 +1,6 @@
+ #include <algorithm> // TEMP-DEBUG(mhrs)
+ #include <iostream> // TEMP-DEBUG(mhrs)
++#include <thread>
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <array>
+@@ -314,6 +315,44 @@ static void appendVifSpans(std::vector<PS2Memory::VifSourceSpan> &out, const std
+     }
+ }
+ 
++void PS2Memory::flushUnpackBlocks() const
++{
++    if (std::this_thread::get_id() != m_unpackOwner.load(std::memory_order_relaxed) || m_unpackBlocks.empty())
++        return;
++    std::vector<UnpackBlock> blocks;
++    std::vector<uint32_t> words;
++    std::vector<uint8_t> masks;
++    blocks.swap(m_unpackBlocks);
++    words.swap(m_unpackData);
++    masks.swap(m_unpackMasks);
++    m_unpackBlocks.reserve(blocks.size());
++    m_unpackData.reserve(words.size());
++    m_unpackMasks.reserve(masks.size());
++    m_gifVuWorker.post([this, blocks = std::move(blocks), words = std::move(words), masks = std::move(masks)]
++                       {
++                           uint8_t *const vu1 = m_vu1Data;
++                           for (const UnpackBlock &b : blocks)
++                           {
++                               const uint32_t *src = words.data() + b.data;
++                               for (uint32_t i = 0; i < b.count;)
++                               {
++                                   const uint32_t dest = (b.start + i) & 0x3FFu;
++                                   const uint32_t run = std::min<uint32_t>(b.count - i, 1024u - dest);
++                                   if (b.masks == SIZE_MAX)
++                                       std::memcpy(vu1 + dest * 16u, src + static_cast<size_t>(i) * 4u, run * 16u);
++                                   else
++                                       for (uint32_t j = 0; j < run; ++j)
++                                       {
++                                           const uint8_t lanes = masks[b.masks + i + j];
++                                           for (uint32_t f = 0; f < 4u; ++f)
++                                               if ((lanes >> f) & 1u)
++                                                   std::memcpy(vu1 + (dest + j) * 16u + f * 4u, src + static_cast<size_t>(i + j) * 4u + f, 4u);
++                                       }
++                                   i += run;
++                               }
++                           } });
++}
++
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+     // Spans describe this call's data only (empty for data without a guest source, e.g. FIFO writes).
+@@ -321,6 +360,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+     sourceSpans.swap(m_vif1SourceSpans);
+     if (sizeBytes == 0u)
+         return;
++    struct FlushUnpacksOnReturn
++    {
++        PS2Memory &memory;
++        ~FlushUnpacksOnReturn() { memory.flushUnpackBlocks(); }
++    } flushUnpacksOnReturn{*this};
+ 
+     // Stalled by an I-bit VIFcode: hold the data until FBRST.STC (the DMA would wait on hardware).
+     if (m_vif1Stalled)
+@@ -640,8 +684,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             // Offset/difference mode adds ROW to the kept lanes too, and unknown formats copy raw bytes: those results
+             // depend on what VU1 memory holds, so they are computed where it is (the GIF/VU worker). Difference mode
+             // also feeds kept lanes into ROW, which the EE needs: only that waits for the worker.
+-            const bool readsMemory = !knownFormat || ((mode == 1u || mode == 2u) && sourceLanes != 0xFu);
+-            const bool rowFromMemory = knownFormat && mode == 2u && sourceLanes != 0xFu;
++            // Kept lanes (not supplied by the format) written as data (mask 0) take VU1 memory plus ROW in modes 1/2.
++            // Only cycle positions that read source data have such lanes; their mask cycle is min(position, 3).
++            const auto maskSpecAt = [&](uint32_t maskCycle, uint32_t field) -> uint32_t
++            { return maskEnable ? (vif1_regs.mask >> ((maskCycle * 4u + field) * 2u)) & 3u : 0u; };
++            bool keptDataLanes = false;
++            for (uint32_t c = 0; c < std::min<uint32_t>(std::min(cl, wl), 4u); ++c)
++                for (uint32_t field = 0; field < 4u; ++field)
++                    if (((sourceLanes >> field) & 1u) == 0u && maskSpecAt(c, field) == 0u)
++                        keptDataLanes = true;
++            const bool readsMemory = !knownFormat || ((mode == 1u || mode == 2u) && keptDataLanes);
++            const bool rowFromMemory = knownFormat && mode == 2u && keptDataLanes;
+ 
+             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+@@ -886,6 +939,103 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     postGifVu([unpack, mode, mask = vif1_regs.mask, rows, src = std::vector<uint8_t>(data + pos, data + pos + totalBytes)]() mutable
+                               { unpack(src.data(), true, mode, mask, rows.row, rows.col, nullptr); });
+                 }
++                else if (cl == wl && knownFormat)
++                {
++                    // Every cycle position reads a source vector and vectors land on consecutive qwords. Lanes per
++                    // mask cycle: data (mask 0) where the format supplies the lane, ROW (1), COL (2); 3 and kept lanes
++                    // stay (kept lanes in modes 1/2 went to readsMemory above).
++                    uint8_t laneMask[4];
++                    uint8_t specs[4][4];
++                    for (uint32_t c = 0; c < 4u; ++c)
++                    {
++                        laneMask[c] = 0u;
++                        for (uint32_t field = 0; field < 4u; ++field)
++                        {
++                            const uint32_t spec = maskSpecAt(c, field);
++                            specs[c][field] = static_cast<uint8_t>(spec);
++                            if ((spec == 0u && ((sourceLanes >> field) & 1u) != 0u) || spec == 1u || spec == 2u)
++                                laneMask[c] |= static_cast<uint8_t>(1u << field);
++                        }
++                    }
++                    const uint32_t usedCycles = std::min<uint32_t>(wl, 4u);
++                    bool allLanes = true;
++                    for (uint32_t c = 0; c < usedCycles; ++c)
++                        allLanes = allLanes && laneMask[c] == 0xFu;
++
++                    m_unpackOwner.store(std::this_thread::get_id(), std::memory_order_relaxed);
++                    const size_t dataAt = m_unpackData.size();
++                    const size_t masksAt = allLanes ? SIZE_MAX : m_unpackMasks.size();
++                    m_unpackData.resize(dataAt + static_cast<size_t>(writeVectorCount) * 4u, 0u);
++                    if (!allLanes)
++                        m_unpackMasks.resize(masksAt + writeVectorCount);
++                    m_unpackBlocks.push_back(UnpackBlock{vuAddr, writeVectorCount, dataAt, masksAt});
++                    const uint8_t *src = data + pos;
++                    const bool addRow = (vl != 3u || vn != 3u) && (mode == 1u || mode == 2u);
++                    const uint32_t count = static_cast<uint32_t>(components > 4 ? 4 : components);
++                    uint32_t cyclePos = 0;
++                    for (uint32_t i = 0; i < writeVectorCount; ++i, src += bytesPerVector)
++                    {
++                        uint32_t d[4] = {0u, 0u, 0u, 0u};
++                        if (vl == 0u)
++                        {
++                            for (uint32_t c = 0; c < count; ++c)
++                                std::memcpy(&d[c], src + c * 4u, 4u);
++                        }
++                        else if (vl == 1u)
++                        {
++                            for (uint32_t c = 0; c < count; ++c)
++                            {
++                                uint16_t raw;
++                                std::memcpy(&raw, src + c * 2u, 2u);
++                                d[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
++                            }
++                        }
++                        else if (vl == 2u)
++                        {
++                            for (uint32_t c = 0; c < count; ++c)
++                                d[c] = zeroExtend ? src[c] : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(src[c])));
++                        }
++                        else
++                        {
++                            uint16_t packed;
++                            std::memcpy(&packed, src, 2u);
++                            d[0] = packed & 0x1Fu;
++                            d[1] = (packed >> 5) & 0x1Fu;
++                            d[2] = (packed >> 10) & 0x1Fu;
++                            d[3] = (packed >> 15) & 0x01u;
++                        }
++                        if (components == 1)
++                            d[1] = d[2] = d[3] = d[0];
++
++                        const uint32_t maskCycle = cyclePos > 3u ? 3u : cyclePos;
++                        uint32_t *v = m_unpackData.data() + dataAt + static_cast<size_t>(i) * 4u;
++                        for (uint32_t field = 0; field < 4u; ++field)
++                        {
++                            const uint32_t spec = specs[maskCycle][field];
++                            if (spec == 0u)
++                            {
++                                if (((sourceLanes >> field) & 1u) == 0u)
++                                    continue;
++                                uint32_t value = d[field];
++                                if (addRow)
++                                {
++                                    value += vif1_regs.row[field];
++                                    if (mode == 2u)
++                                        vif1_regs.row[field] = value;
++                                }
++                                v[field] = value;
++                            }
++                            else if (spec == 1u)
++                                v[field] = vif1_regs.row[field];
++                            else if (spec == 2u)
++                                v[field] = vif1_regs.col[maskCycle];
++                        }
++                        if (!allLanes)
++                            m_unpackMasks[masksAt + i] = laneMask[maskCycle];
++                        if (++cyclePos == wl)
++                            cyclePos = 0;
++                    }
++                }
+                 else
+                 {
+                     std::vector<LaneWrite> writes;
