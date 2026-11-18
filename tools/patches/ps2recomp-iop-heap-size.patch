@@ -1,0 +1,105 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -49,7 +49,6 @@
+         std::fill(m_hardwareWords.begin(), m_hardwareWords.end(), 0u);
+         m_hardware.clear();
+         m_allocations.clear();
+-        m_heapCursor = HeapBase;
+         m_interruptStatus = 0;
+         m_interruptMask = 0;
+         m_interruptControl = 1;
+@@ -424,7 +423,8 @@
+             return address;
+         }
+ 
+-        uint32_t candidate = alignUp(m_heapCursor, alignment);
++        // First fit from the bottom, so freed blocks are reused.
++        uint32_t candidate = alignUp(HeapBase, alignment);
+         for (;;)
+         {
+             bool overlap = false;
+@@ -444,7 +444,6 @@
+             return 0u;
+         m_allocations.push_back({candidate, size});
+         markOwned(candidate, size);
+-        m_heapCursor = std::max(m_heapCursor, candidate + size);
+         return candidate;
+     }
+ 
+@@ -464,7 +463,21 @@
+ 
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
++        std::vector<Allocation> blocks;
++        for (const auto &block : m_allocations)
++            if (block.address < HeapLimit && block.address + block.size > HeapBase)
++                blocks.push_back(block);
++        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b)
++                  { return a.address < b.address; });
++        uint32_t largest = 0u;
++        uint32_t cursor = HeapBase;
++        for (const auto &block : blocks)
++        {
++            if (block.address > cursor)
++                largest = std::max(largest, block.address - cursor);
++            cursor = std::max(cursor, block.address + block.size);
++        }
++        return std::max(largest, cursor < HeapLimit ? HeapLimit - cursor : 0u);
+     }
+ 
+     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -28,7 +28,8 @@
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00120000u;
++        // Above the boot modules (they end near 0x62000). MOH: Rising Sun allocates a 0.9 MB sound bank here.
++        static constexpr uint32_t HeapBase = 0x00080000u;
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+@@ -158,7 +159,6 @@
+         std::vector<uint32_t> m_hardwareWords; // registers in [HardwareBase, Spu2End), by word
+         std::unordered_map<uint32_t, uint32_t> m_hardware; // any other address
+         std::vector<Allocation> m_allocations;
+-        uint32_t m_heapCursor = HeapBase;
+         uint32_t m_interruptStatus = 0;
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -180,6 +180,19 @@
+             t.IsTrue(getRegS32(env.ctx, 2) < 0, "sceSifDmaStat should be negative when transfer is complete");
+         });
+ 
++        tc.Run("IOP heap fits a 0.9 MB block and reuses freed blocks", [](TestCase &t)
++        {
++            TestEnv env;
++            // MOH: Rising Sun's in-level scripted sound bank needs 0xda970 + 64 bytes of IOP heap.
++            const uint32_t big = env.runtime.allocateIopMemory(0xDA9B0u, 64u);
++            t.IsTrue(big != 0u, "a 0.9 MB IOP heap block should fit");
++            const uint32_t small = env.runtime.allocateIopMemory(0x1000u, 64u);
++            t.IsTrue(small != 0u, "a small block should fit next to it");
++            t.IsTrue(env.runtime.freeIopMemory(big), "the big block should free");
++            t.IsTrue(env.runtime.allocateIopMemory(0xDA9B0u, 64u) == big,
++                     "a freed block should be reused (first fit)");
++        });
++
+         tc.Run("IOP heap DMA uses private backing instead of aliasing EE RDRAM", [](TestCase &t)
+         {
+             TestEnv env;
+@@ -200,7 +213,7 @@
+             setRegU32(env.ctx, 4, kIopBlockSize);
+             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
+             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
+-            t.IsTrue(iopAddress >= 0x00120000u && iopAddress < 0x00200000u,
++            t.IsTrue(iopAddress >= 0x00080000u && iopAddress < 0x00200000u,
+                      "sceSifAllocIopHeap should return an address in physical IOP RAM");
+             std::memset(env.rdram.data() + iopAddress, 0x5Au, payload.size());
+ 
