@@ -84,3 +84,4 @@ ps2recomp-no-equal-priority-slicing.patch
 ps2recomp-lq-sq-align.patch
 ps2recomp-runtime-pools-kernel-area.patch
 ps2recomp-iop-heap-size.patch
+ps2recomp-vu1-blend-stores.patch
