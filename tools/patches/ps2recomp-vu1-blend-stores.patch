@@ -1,0 +1,32 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.h b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+@@ -167,14 +167,7 @@
+ 
+ VU1_ALWAYS_INLINE void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
+ {
+-    if (dest & 0x8u)
+-        dst[0] = result[0];
+-    if (dest & 0x4u)
+-        dst[1] = result[1];
+-    if (dest & 0x2u)
+-        dst[2] = result[2];
+-    if (dest & 0x1u)
+-        dst[3] = result[3];
++    ps2_vu1_simd::storeDest(dst, _mm_loadu_ps(result), dest);
+ }
+ 
+ constexpr void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+@@ -1186,9 +1179,9 @@
+ {
+     if (!m_activeVuData || address + 16u > m_activeVuDataSize)
+         return;
+-    for (uint32_t component = 0; component < 4u; ++component)
+-        if ((laneMask & laneForComponent(component)) != 0u)
+-            std::memcpy(m_activeVuData + address + component * 4u, &words[component], sizeof(uint32_t));
++    // laneForComponent bits are the dest mask layout (x = bit 3); the blend copies bit patterns unchanged.
++    ps2_vu1_simd::storeDest(reinterpret_cast<float *>(m_activeVuData + address),
++                            _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(words))), laneMask);
+ }
+ 
+ VU1_ALWAYS_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)

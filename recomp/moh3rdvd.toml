@@ -1458,4 +1458,22 @@ instructions = [
   # past the limit the game prints "Frame draw stalled" and halts in a loop of its own (0x2CAF10). On the host
   # a turn takes nanoseconds, so a slow frame (the fire in mission 1) ran out the count. The count stays 0 now.
   { address = "0x002CBA6C", value = "0x24A50000" }, # draw watchdog: addiu $a1, $a1, 0 (was 0xC8)
+  # Frame limiter func_0015A080 waits until 2 vblanks passed since the last frame (30 fps). The limit becomes
+  # 1 + (D_004BB870 < 5): 2 while the level loader's state machine (func_0026DC80, state 5 = done) runs, as the
+  # loader thread only gets the CPU while the main thread sleeps there; 1 (60 fps) otherwise. $s0 holds the limit:
+  # the function loaded 0x360000 into $s0/$a0 four times, and $s4 already holds it, so those slots are free.
+  { address = "0x0015A0C0", value = "0x3C10004C" }, # limiter: lui   $s0, 0x4C           (was lui $s0, 0x36)
+  { address = "0x0015A0EC", value = "0x8E10B870" }, # limiter: lw    $s0, -0x4790($s0)   (was lui $a0, 0x36)
+  { address = "0x0015A0F0", value = "0x8E829DC4" }, # limiter: lw    $v0, -0x623C($s4)   (was ($a0))
+  { address = "0x0015A0FC", value = "0xAE839DBC" }, # limiter: sw    $v1, -0x6244($s4)   (was ($s0))
+  { address = "0x0015A100", value = "0xAE839DC4" }, # limiter: sw    $v1, -0x623C($s4)   (was ($a0))
+  { address = "0x0015A10C", value = "0x2E100005" }, # limiter: sltiu $s0, $s0, 5         (was lui $s0, 0x36)
+  { address = "0x0015A114", value = "0x26100001" }, # limiter: addiu $s0, $s0, 1         (was lui $a0, 0x36)
+  { address = "0x0015A118", value = "0x8E829DC8" }, # limiter: lw    $v0, -0x6238($s4)   (was ($a0))
+  { address = "0x0015A124", value = "0xAE839DC0" }, # limiter: sw    $v1, -0x6240($s4)   (was ($s0))
+  { address = "0x0015A128", value = "0xAE839DC8" }, # limiter: sw    $v1, -0x6238($s4)   (was ($a0))
+  { address = "0x0015A138", value = "0x0050102B" }, # limiter: sltu  $v0, $v0, $s0       (was sltiu $v0, $v0, 2)
+  { address = "0x0015A144", value = "0x00000000" }, # limiter: nop                       (was daddu $s0, $s5, $zero)
+  { address = "0x0015A150", value = "0x8EA29DD8" }, # limiter: lw    $v0, -0x6228($s5)   (was ($s0))
+  { address = "0x0015A15C", value = "0x0050102B" }, # limiter: sltu  $v0, $v0, $s0       (was sltiu $v0, $v0, 2)
 ]
