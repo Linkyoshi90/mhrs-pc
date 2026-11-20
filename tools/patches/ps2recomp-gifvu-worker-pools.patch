@@ -1,0 +1,182 @@
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 5c40485..92ef1d8 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -5,6 +5,10 @@
+ std::atomic<uint32_t> g_mhrsVuStartPc{0}; // TEMP-DEBUG(mhrs)
+ std::atomic<uint32_t> g_mhrsCurGifTag{0}; // TEMP-DEBUG(mhrs)
+ 
++// Packet buffers of drained packets, reused by the next submits on the same thread (one allocation per packet took
++// heap locks on the GIF/VU worker). Bounded, and only small buffers, so image uploads cannot pin memory.
++static thread_local std::vector<std::vector<uint8_t>> t_freePacketBuffers;
++
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+ {
+@@ -32,8 +36,12 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
+     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
+     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
+     { extern std::atomic<uint32_t> g_mhrsVuStartPc; pkt.mhrsTag = (static_cast<uint32_t>(pathId) << 24) | (pathId == GifPathId::Path1 ? (g_mhrsVuStartPc.load() & 0xFFFFFFu) : 0u); } // TEMP-DEBUG(mhrs)
+-    pkt.data.resize(sizeBytes);
+-    std::memcpy(pkt.data.data(), data, sizeBytes);
++    if (!t_freePacketBuffers.empty())
++    {
++        pkt.data = std::move(t_freePacketBuffers.back());
++        t_freePacketBuffers.pop_back();
++    }
++    pkt.data.assign(data, data + sizeBytes);
+     m_queue.push_back(std::move(pkt));
+ }
+ 
+@@ -65,6 +73,9 @@ void GifArbiter::drain()
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
++    for (GifArbiterPacket &pkt : m_queue)
++        if (pkt.data.capacity() <= 65536u && t_freePacketBuffers.size() < 64u)
++            t_freePacketBuffers.push_back(std::move(pkt.data));
+     m_queue.clear();
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9d29e56..9d85c21 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -29,6 +29,7 @@
+ #include <limits>
+ #include <chrono>
+ #include <atomic>
++#include <immintrin.h>
+ #include <thread>
+ #include <unordered_map>
+ #include <sstream>
+@@ -845,15 +846,23 @@ bool PS2Runtime::syncCoreSubsystems()
+                                             return;
+                                         }
+                                         // Buffers go back to the pool once the GS stage has processed them.
++                                        // A spin lock: the worker and the GS stage both take it per packet, for a few
++                                        // instructions, and a contended std::mutex waits in the kernel.
+                                         struct PacketPool
+                                         {
+-                                            std::mutex mutex;
++                                            std::atomic_flag busy = ATOMIC_FLAG_INIT;
+                                             std::vector<std::vector<uint8_t> *> free;
++                                            void lock()
++                                            {
++                                                while (busy.test_and_set(std::memory_order_acquire))
++                                                    _mm_pause();
++                                            }
++                                            void unlock() { busy.clear(std::memory_order_release); }
+                                         };
+                                         static PacketPool pool;
+                                         std::vector<uint8_t> *packet = nullptr;
+                                         {
+-                                            std::lock_guard<std::mutex> lock(pool.mutex);
++                                            std::lock_guard<PacketPool> lock(pool);
+                                             if (!pool.free.empty())
+                                             {
+                                                 packet = pool.free.back();
+@@ -869,7 +878,7 @@ bool PS2Runtime::syncCoreSubsystems()
+                                                             // Keep only small buffers, and a bounded number, so image uploads cannot pin memory.
+                                                             if (packet->capacity() <= 65536u)
+                                                             {
+-                                                                std::lock_guard<std::mutex> lock(pool.mutex);
++                                                                std::lock_guard<PacketPool> lock(pool);
+                                                                 if (pool.free.size() < 256u)
+                                                                 {
+                                                                     pool.free.push_back(packet);
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 3c4ba5d..b37bb37 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -329,33 +329,48 @@ void PS2Memory::flushUnpackBlocks() const
+         std::vector<uint32_t> words;
+         std::vector<uint8_t> masks;
+     };
+-    static std::mutex g_unpackPoolMutex;
+-    static std::vector<UnpackBuffers> g_unpackPool;
+-    UnpackBuffers out;
++    // Pointers, so the job captures 16 bytes and std::function keeps them inline: a heap capture allocated here
++    // and freed on the worker contended for the heap lock. A spin lock, as the sections are a few instructions
++    // and a contended std::mutex waits in the kernel.
++    struct UnpackPool
+     {
+-        std::lock_guard<std::mutex> lock(g_unpackPoolMutex);
+-        if (!g_unpackPool.empty())
++        std::atomic_flag busy = ATOMIC_FLAG_INIT;
++        std::vector<UnpackBuffers *> free;
++        void lock()
+         {
+-            out = std::move(g_unpackPool.back());
+-            g_unpackPool.pop_back();
++            while (busy.test_and_set(std::memory_order_acquire))
++                _mm_pause();
++        }
++        void unlock() { busy.clear(std::memory_order_release); }
++    };
++    static UnpackPool g_unpackPool;
++    UnpackBuffers *out = nullptr;
++    {
++        std::lock_guard<UnpackPool> lock(g_unpackPool);
++        if (!g_unpackPool.free.empty())
++        {
++            out = g_unpackPool.free.back();
++            g_unpackPool.free.pop_back();
+         }
+     }
+-    out.blocks.swap(m_unpackBlocks);
+-    out.words.swap(m_unpackData);
+-    out.masks.swap(m_unpackMasks);
++    if (!out)
++        out = new UnpackBuffers();
++    out->blocks.swap(m_unpackBlocks);
++    out->words.swap(m_unpackData);
++    out->masks.swap(m_unpackMasks);
+     // The buffers the next flush fills: room for the largest flush so far, so they grow once, not per flush.
+     static size_t maxBlocks = 0, maxWords = 0, maxMasks = 0;
+-    maxBlocks = std::max(maxBlocks, out.blocks.size());
+-    maxWords = std::max(maxWords, out.words.size());
+-    maxMasks = std::max(maxMasks, out.masks.size());
++    maxBlocks = std::max(maxBlocks, out->blocks.size());
++    maxWords = std::max(maxWords, out->words.size());
++    maxMasks = std::max(maxMasks, out->masks.size());
+     m_unpackBlocks.reserve(maxBlocks);
+     m_unpackData.reserve(maxWords);
+     m_unpackMasks.reserve(maxMasks);
+-    m_gifVuWorker.post([this, buffers = std::move(out)]() mutable
++    m_gifVuWorker.post([this, buffers = out]()
+                        {
+-                           const std::vector<UnpackBlock> &blocks = buffers.blocks;
+-                           const std::vector<uint32_t> &words = buffers.words;
+-                           const std::vector<uint8_t> &masks = buffers.masks;
++                           const std::vector<UnpackBlock> &blocks = buffers->blocks;
++                           const std::vector<uint32_t> &words = buffers->words;
++                           const std::vector<uint8_t> &masks = buffers->masks;
+                            uint8_t *const vu1 = m_vu1Data;
+                            for (const UnpackBlock &b : blocks)
+                            {
+@@ -383,12 +398,18 @@ void PS2Memory::flushUnpackBlocks() const
+                                    i += run;
+                                }
+                            }
+-                           buffers.blocks.clear();
+-                           buffers.words.clear();
+-                           buffers.masks.clear();
+-                           std::lock_guard<std::mutex> lock(g_unpackPoolMutex);
+-                           if (g_unpackPool.size() < 8u)
+-                               g_unpackPool.push_back(std::move(buffers)); });
++                           buffers->blocks.clear();
++                           buffers->words.clear();
++                           buffers->masks.clear();
++                           {
++                               std::lock_guard<UnpackPool> lock(g_unpackPool);
++                               if (g_unpackPool.free.size() < 8u)
++                               {
++                                   g_unpackPool.free.push_back(buffers);
++                                   return;
++                               }
++                           }
++                           delete buffers; });
+ }
+ 
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)

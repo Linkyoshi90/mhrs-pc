@@ -243,7 +243,20 @@ Three things are needed together.
      now at 100% (idle polling 16% → 10%): it is the bound. Its unpack copy (14–17%) is paid per byte, not
      per block. About 550k UNPACKs a second average 35 qwords, ~300 MB/s read from the EE core. Merging
      contiguous blocks (37% of them) and prefetching the next block made no difference (A/B 93.4 vs 92.6),
-     so that was dropped.
+     so that was dropped. Writing the decoded words with streaming stores, so the worker reads DRAM instead of
+     the EE core's cache, didn't help either (copy still 16%).
+   - **GIF/VU worker heap and lock traffic (2026-11-20, `ps2recomp-gifvu-worker-pools`):** about 10% of the
+     worker was in ntdll, not idle, from three per-job costs:
+     - The unpack job captured a 72-byte struct, which `std::function` heap-allocated on the EE and freed on
+       the worker. It now captures a pooled pointer, which `std::function` keeps inline.
+     - The GIF arbiter allocated a vector per packet. Drained packet buffers are now reused through a
+       per-thread free list.
+     - The GIF packet and unpack pools used a `std::mutex` that the worker and the GS stage take per packet.
+       They now use a spin lock.
+
+     Measured while ComfyUI shared the GPU (8 GB of VRAM, generating now and then; runs ranged 57–94), so the
+     size of the gain is uncertain. The new build won all three pairs: 64 vs 57, 82 vs 79, 88 vs 71.
+     `ab2.sh` (scratchpad) logs GPU utilization per run to spot such load.
      Tools: `~/vec/vustats` (cycles per program),
      `~/vec/vuloops` (cycles per loop and loop body; needs a temporary pair hook in the interpreter, see
      `~/vec/mkloops.py`), `~/vec/vudis.py` (disassembler).

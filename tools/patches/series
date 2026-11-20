@@ -103,3 +103,4 @@ ps2recomp-gs-resolution-live.patch
 ps2recomp-gs-present-pipeline.patch
 ps2recomp-gs-backend-speedups.patch
 ps2recomp-gs-display-writes-ordered.patch
+ps2recomp-gifvu-worker-pools.patch
