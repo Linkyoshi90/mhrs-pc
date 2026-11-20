@@ -208,6 +208,42 @@ Three things are needed together.
      keeps the last frame. The async queue limit went up to 65536 commands. Window, new frames a second: about 54
      at scale 1, about 45 at 2 (every game frame), and about 30 at 3 (limited by the GPU and backend thread).
      `play_mingw.bat` now defaults to 2.
+   - **GS backend thread (2026-11-20, `ps2recomp-gs-backend-speedups`):** with the window fixed, the backend
+     thread was the busiest (95%). Three fixes:
+     - The window thread now copies the 2× frame itself (4.6 MB) from the GPU output slot. Before, the backend
+       thread copied it, at ~8% of its time.
+     - Image uploads write one row run inside a page at a time: one address calculation per run, then a table
+       lookup per pixel (T8/T4 textures stream in every frame).
+     - Each draw batch carries a state id from the frontend. Batches with the same id have the same state, so
+       the backend reads only the vertex cache lines, not all five lines of each 320-byte batch the frontend
+       core just wrote.
+
+     Result: backend thread 95% → 72% busy, with uploads 12% → 6%. Tests cover both new paths (upload vs.
+     per-pixel writes for all 13 formats across pages and split packets; state ids equal ⇔ state equal).
+     Flips/s barely moved (83–85 at 2× in unattended runs) because the VU1 worker is now the busiest thread
+     (95%: unpack copy 14.5%, transformClip 7.5%, XGKICK ~7%, GIF packet posts to the GS frontend). The EE, the
+     VU1 worker and the GS backend each wait on one another for a large share of their time (EE ~26% waiting,
+     backend ~30% idle). The "~8% of the EE in C++ exception unwinding" seen then was a profiler artifact:
+     `tsample2` names the callers of samples outside the exe by scanning 1.3 KB of raw stack, and that
+     found one stale return address inside `parse_lsda_header` while the EE waited in ntdll. No sample ever
+     landed inside the unwinder.
+   - **GS privileged register drains (2026-11-20, `ps2recomp-gs-display-writes-ordered`):** each game frame,
+     the vblank handler reads CSR, acknowledges VSINT (CSR = 0x8), then writes PMODE, SMODE2, DISPFB1,
+     DISPLAY1 and DISPFB2. Each access drained the GIF/VU worker and the GS stage completely, and the first one
+     waited 150–250 ms per second (14–21% of the EE). The drain kept the EE from starting the next frame while
+     the worker finished the last one. Now:
+     - Display registers (PMODE..BGCOLOR) are written by a GS-stage job, in order after the GIF/VU work issued
+       before them, so a present still sees DISPFB change only after the draws before the flip. The EE runs at
+       most five such writes (one frame) ahead.
+     - CSR reads, and CSR writes that don't clear SIGNAL/FINISH or request FLUSH/RESET, don't drain. A queued
+       SIGNAL/FINISH shows up when the GS stage reaches it, as with a slower GS.
+     - Reads of the other registers still drain, which also applies queued display writes first.
+
+     A/B at 2×, two rounds: 92.6 → 95.8 flips/s. Frames dumped every ~2 s look complete. The VU1 worker is
+     now at 100% (idle polling 16% → 10%): it is the bound. Its unpack copy (14–17%) is paid per byte, not
+     per block. About 550k UNPACKs a second average 35 qwords, ~300 MB/s read from the EE core. Merging
+     contiguous blocks (37% of them) and prefetching the next block made no difference (A/B 93.4 vs 92.6),
+     so that was dropped.
      Tools: `~/vec/vustats` (cycles per program),
      `~/vec/vuloops` (cycles per loop and loop body; needs a temporary pair hook in the interpreter, see
      `~/vec/mkloops.py`), `~/vec/vudis.py` (disassembler).

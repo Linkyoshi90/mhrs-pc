@@ -1,0 +1,179 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 3f74f2d..5b81934 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -142,6 +142,20 @@ namespace
+         } while (!csr.compare_exchange_weak(expected, desired));
+     }
+ 
++    // Display registers (PMODE..BGCOLOR): the GS stage applies EE writes to them in stream order (see
++    // writeDisplayReg). CSR, IMR, BUSDIR and SIGLBLID stay immediate.
++    inline bool isGsDisplayReg(uint32_t addr)
++    {
++        return ((addr - PS2_GS_PRIV_REG_BASE) & ~0x7u) <= 0x00E0u;
++    }
++
++    // CSR writes that clear SIGNAL/FINISH (bits 0..1) or request FLUSH/RESET (bits 8..9) must come after the queued GS
++    // work; acknowledging VSINT and the other interrupt bits does not.
++    inline bool csrWriteNeedsDrain(uint64_t value)
++    {
++        return (value & 0x303ull) != 0ull;
++    }
++
+     constexpr std::array<uint32_t, 4> kEeTimerBases = {
+         0x10000000u,
+         0x10000800u,
+@@ -800,6 +814,25 @@ uint16_t PS2Memory::read16(uint32_t address)
+     return 0;
+ }
+ 
++// A display register write as a GS-stage job, ordered after the GIF/VU work issued before it: the window's present
++// reads these registers, and the draws before a DISPFB flip must reach the backend first. This replaced a full drain
++// per write (the game's vblank handler writes five per frame), which kept the EE from overlapping the GIF/VU worker
++// and GS stage finishing the last frame (~20% of the EE waited there).
++// ponytail: the throttle counters are process-wide (one PS2Memory runs the game); per instance if that changes.
++static std::atomic<uint64_t> g_displayWritesPosted{0}, g_displayWritesDone{0};
++static void writeDisplayReg(PS2Memory &memory, uint64_t *reg, uint64_t mask, uint64_t bits)
++{
++    const uint64_t n = g_displayWritesPosted.fetch_add(1u, std::memory_order_relaxed) + 1u;
++    memory.postGsAfterGifVu([reg, mask, bits]()
++                            {
++                                *reg = (*reg & ~mask) | (bits & mask);
++                                g_displayWritesDone.fetch_add(1u, std::memory_order_release); });
++    // At most one frame ahead (five writes per frame here): the queues stay short and input latency stays a frame.
++    constexpr uint64_t kWritesAhead = 5u;
++    while (g_displayWritesDone.load(std::memory_order_acquire) + kWritesAhead < n)
++        std::this_thread::yield();
++}
++
+ uint32_t PS2Memory::read32(uint32_t address)
+ {
+     if (address & 3)
+@@ -809,7 +842,8 @@ uint32_t PS2Memory::read32(uint32_t address)
+ 
+     if (isGsPrivReg(address))
+     {
+-        drainGifVu();
++        if (((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) != kGsCsrRegOffset)
++            drainGifVu(); // also applies the display register writes still queued
+         ++g_mhrsDrain[1]; // TEMP-DEBUG(mhrs)
+         uint32_t off = address & 7;
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+@@ -859,7 +893,8 @@ uint64_t PS2Memory::read64(uint32_t address)
+ 
+     if (isGsPrivReg(address))
+     {
+-        drainGifVu();
++        if (((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) != kGsCsrRegOffset)
++            drainGifVu(); // also applies the display register writes still queued
+         ++g_mhrsDrain[1]; // TEMP-DEBUG(mhrs)
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+@@ -1022,11 +1057,20 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+ 
+     if (isGsPrivReg(address))
+     {
+-        drainGifVu();
+-        ++g_mhrsDrain[1]; // TEMP-DEBUG(mhrs)
+-        mhrsCountGsPrivWrite(address); // TEMP-DEBUG(mhrs) fps
+-        uint32_t off = address & 7;
++        const uint32_t off = address & 7;
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
++        mhrsCountGsPrivWrite(address); // TEMP-DEBUG(mhrs) fps
++        if (isGsDisplayReg(address))
++        {
++            if (uint64_t *reg = gsRegPtr(gs_regs, address))
++                writeDisplayReg(*this, reg, 0xFFFFFFFFULL << (off * 8), static_cast<uint64_t>(value) << (off * 8));
++            return;
++        }
++        if (regOff != kGsCsrRegOffset || off != 0u || csrWriteNeedsDrain(value))
++        {
++            drainGifVu();
++            ++g_mhrsDrain[1]; // TEMP-DEBUG(mhrs)
++        }
+         if (regOff == kGsCsrRegOffset)
+         {
+             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
+@@ -1085,10 +1129,19 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+ 
+     if (isGsPrivReg(address))
+     {
+-        drainGifVu();
+-        ++g_mhrsDrain[1]; // TEMP-DEBUG(mhrs)
+-        mhrsCountGsPrivWrite(address); // TEMP-DEBUG(mhrs) fps
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
++        mhrsCountGsPrivWrite(address); // TEMP-DEBUG(mhrs) fps
++        if (isGsDisplayReg(address))
++        {
++            if (uint64_t *reg = gsRegPtr(gs_regs, address))
++                writeDisplayReg(*this, reg, ~0ULL, value);
++            return;
++        }
++        if (regOff != kGsCsrRegOffset || csrWriteNeedsDrain(value))
++        {
++            drainGifVu();
++            ++g_mhrsDrain[1]; // TEMP-DEBUG(mhrs)
++        }
+         if (regOff == kGsCsrRegOffset)
+         {
+             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 7aadd94..7722d02 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -8,8 +8,11 @@
+ #include "Stubs/GS.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
++#include <thread>
+ #include <vector>
+ 
+ namespace
+@@ -179,6 +182,43 @@ void register_ps2_memory_tests()
+             t.Equals(mem.read32(0x00103000u), 0x2468ACE0u, "writes through 0x3010 alias should land in base RDRAM");
+         });
+ 
++        tc.Run("GS display register writes wait for the GS stage in order, CSR reads and VSINT acks do not drain", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            mem.startGifVuWorker(OrderedWorker::Mode::Async);
++            std::atomic<bool> release{false};
++            mem.postGsAfterGifVu([&release]()
++                                 {
++                                     while (!release.load())
++                                         std::this_thread::yield();
++                                 });
++            // Releases the stage after 2 s, so a drain that should not happen fails the test instead of hanging it.
++            std::atomic<bool> timedOut{false};
++            std::thread watchdog([&]()
++                                 {
++                                     const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++                                     while (!release.load() && std::chrono::steady_clock::now() < end)
++                                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                                     timedOut = !release.exchange(true);
++                                 });
++            const uint64_t before = mem.gs().dispfb1;
++            const uint64_t flipped = before ^ 0x1234ull;
++            mem.write64(PS2_GS_PRIV_REG_BASE + 0x70u, flipped);
++            mem.write32(PS2_GS_PRIV_REG_BASE + 0x1000u, 0x8u); // VSINT ack
++            (void)mem.read64(PS2_GS_PRIV_REG_BASE + 0x1000u);
++            const uint64_t whileBlocked = mem.gs().dispfb1;
++            const bool drained = timedOut.load();
++            release = true;
++            watchdog.join();
++            t.IsTrue(!drained, "DISPFB write, VSINT ack and CSR read return while the GS stage is busy");
++            t.Equals(whileBlocked, before, "DISPFB keeps its value until the GS stage reaches the write");
++            t.Equals(mem.read64(PS2_GS_PRIV_REG_BASE + 0x70u), flipped, "reading DISPFB back sees the write");
++            mem.write32(PS2_GS_PRIV_REG_BASE + 0x74u, 0x5u);
++            t.Equals(mem.read64(PS2_GS_PRIV_REG_BASE + 0x70u), (flipped & 0xFFFFFFFFull) | (0x5ull << 32), "a 32-bit write changes its half only");
++            mem.stopGifVuWorker();
++        });
++
+         tc.Run("translateAddress handles kseg and uncached aliases", [](TestCase &t)
+         {
+             PS2Memory mem;

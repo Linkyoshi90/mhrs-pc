@@ -1,0 +1,633 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_hires.h b/ps2xRuntime/include/runtime/gs/gs_hires.h
+index 1faa87b..648ec60 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_hires.h
++++ b/ps2xRuntime/include/runtime/gs/gs_hires.h
+@@ -15,6 +15,12 @@ void gsHiresPublish(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t heig
+ // The same from memory the caller keeps: copied into a buffer that goes back and forth with the window's, so a
+ // frame costs no allocation.
+ void gsHiresPublishCopy(const uint8_t *pixels, uint32_t width, uint32_t height);
++// The same without copying: the window copies from pixels itself in gsHiresTake. The caller keeps the memory
++// unchanged until gsHiresRelease covers it.
++void gsHiresPublishShared(const uint8_t *pixels, uint32_t width, uint32_t height);
++// Before the caller overwrites [begin, end): drops a frame published there that the window has not taken, and waits
++// while the window is copying from there.
++void gsHiresRelease(const uint8_t *begin, const uint8_t *end);
+ // Whether a present completed since the last call; if so, pixels is swapped with what it published.
+ bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height);
+ // True while the Vulkan backend presents on the GPU: presents then run behind the queued draws (asynchronously) and
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+index 836a3ff..e31a4c8 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -253,6 +253,9 @@ struct GSPrimitiveBatch
+ {
+     std::array<GSVertex, 3> vertices{};
+     uint8_t vertexCount = 0;
++    // Batches with the same non-zero id have identical state (the frontend sets it): the backend thread then needs
++    // only the vertices' cache lines, not the state's, from the core that built the batch. 0: unknown.
++    uint32_t stateId = 0;
+     GSDrawState state{};
+ };
+ 
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+index 0c961c0..52707c7 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+@@ -261,6 +261,9 @@ namespace GSMem
+ 		// writes the pixel
+ 		static constexpr void Write(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y, PackedT value);
+ 
++		// writes the pixel at an Address() result
++		static constexpr void WriteAt(u8* data, u32 pixel_addr, PackedT value);
++
+ 		// reads the pixel
+ 		static constexpr auto Read(const PageLookupTableT& table, const u8* data, u32 block, u32 bw, u32 x, u32 y, TexturePageCache* cache = nullptr) -> PackedT;
+ 
+@@ -461,7 +464,12 @@ namespace GSMem
+ 	template<PixelStorageMode psm>
+ 	constexpr void PixelStorageTraits<psm>::Write(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y, PackedT value)
+ 	{
+-		const u32 pixel_addr = Address(table, block, bw, x, y);
++		WriteAt(data, Address(table, block, bw, x, y), value);
++	}
++
++	template<PixelStorageMode psm>
++	constexpr void PixelStorageTraits<psm>::WriteAt(u8* data, u32 pixel_addr, PackedT value)
++	{
+ 		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + BitOffset();
+ 		const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
+ 		const u32 shift = bits % 8;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 0b191e7..7806bad 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2719,49 +2719,31 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     // copiedPixels % rrw and / rrw, kept in step instead of divided out for every pixel.
+     uint32_t column = m_transferState.copiedPixels % rrw;
+     uint32_t row = m_transferState.copiedPixels / rrw;
+-    auto advancePixel = [&](uint32_t count)
+-    {
+-        const uint32_t totalPixels = m_transferState.totalPixels;
+-        m_transferState.copiedPixels =
+-            std::min<uint32_t>(totalPixels, m_transferState.copiedPixels + count);
+-
+-        if (m_transferState.copiedPixels >= totalPixels)
+-        {
+-            m_transferState.direction = 3u;
+-            m_transferState.totalPixels = 0u;
+-            return;
+-        }
+-
+-        column += count;
+-        while (column >= rrw)
+-        {
+-            column -= rrw;
+-            ++row;
+-        }
+-        m_transferState.x = dsax + column;
+-        m_transferState.y = dsay + row;
+-    };
+-
+-    // Whole pixels of bytesPerPixel each: as many as the data holds and the transfer still takes.
+-    const auto runPixels = [&](uint32_t bytesPerPixel, auto writeOne)
+-    {
+-        const uint32_t n = std::min<uint32_t>((sizeBytes - offset) / bytesPerPixel,
+-                                              m_transferState.totalPixels - m_transferState.copiedPixels);
+-        uint32_t x = m_transferState.x;
+-        uint32_t y = m_transferState.y;
+-        const uint8_t *src = data + offset;
+-        for (uint32_t i = 0; i < n; ++i, src += bytesPerPixel)
+-        {
+-            writeOne(src, x, y);
+-            if (++column >= rrw)
++    // Pixels of one row inside one page differ only in their page-table entry: Address() once per such run, then a
++    // table lookup per pixel (the per-pixel version cost the GS backend thread ~15% while textures stream in).
++    // pixelAt(i) gives the i-th pixel value of this call's data.
++    const auto runRows = [&](auto traits, const auto &table, uint32_t n, auto pixelAt)
++    {
++        using T = decltype(traits);
++        constexpr auto pe = T::PageExtent();
++        const uint32_t blk = dbp % static_cast<uint32_t>(T::BlocksPerPage());
++        for (uint32_t i = 0; i < n;)
++        {
++            const uint32_t x = dsax + column, y = dsay + row;
++            const uint32_t xi = x % static_cast<uint32_t>(pe.x);
++            const uint32_t chunk = std::min({n - i, rrw - column, static_cast<uint32_t>(pe.x) - xi});
++            const auto &trow = table[blk][y % static_cast<uint32_t>(pe.y)];
++            const uint32_t base = T::Address(table, dbp, dbw, x, y) - trow[xi];
++            for (uint32_t k = 0; k < chunk; ++k)
++                T::WriteAt(m_vram, base + trow[xi + k], static_cast<typename T::PackedT>(pixelAt(i + k)));
++            i += chunk;
++            column += chunk;
++            if (column >= rrw)
+             {
+                 column = 0u;
+                 ++row;
+             }
+-            x = dsax + column;
+-            y = dsay + row;
+         }
+-        offset += n * bytesPerPixel;
+         m_transferState.copiedPixels += n;
+         if (m_transferState.copiedPixels >= m_transferState.totalPixels)
+         {
+@@ -2770,10 +2752,18 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         }
+         else if (n != 0u)
+         {
+-            m_transferState.x = x;
+-            m_transferState.y = y;
++            m_transferState.x = dsax + column;
++            m_transferState.y = dsay + row;
+         }
+     };
++    const auto runFast = [&](auto traits, const auto &table, uint32_t bytesPerPixel, auto read)
++    {
++        const uint32_t n = std::min<uint32_t>((sizeBytes - offset) / bytesPerPixel,
++                                              m_transferState.totalPixels - m_transferState.copiedPixels);
++        const uint8_t *src = data + offset;
++        runRows(traits, table, n, [&](uint32_t i) { return read(src + i * bytesPerPixel); });
++        offset += n * bytesPerPixel;
++    };
+     using Psm = GSMem::PixelStorageMode;
+     const auto word32 = [](const uint8_t *src)
+     {
+@@ -2795,63 +2785,51 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     switch (dpsm)
+     {
+     case GS_PSM_CT32:
+-        runPixels(4u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::C32>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, word32(src)); });
++        runFast(GSMem::PixelStorageTraits<Psm::C32>{}, GSMem::PageTableC32, 4u, word32);
+         break;
+     case GS_PSM_Z32:
+-        runPixels(4u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::Z32>::Write(GSMem::PageTableZ32, m_vram, dbp, dbw, x, y, word32(src)); });
++        runFast(GSMem::PixelStorageTraits<Psm::Z32>{}, GSMem::PageTableZ32, 4u, word32);
+         break;
+     case GS_PSM_CT24:
+-        runPixels(3u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::C24>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, word24(src)); });
++        runFast(GSMem::PixelStorageTraits<Psm::C24>{}, GSMem::PageTableC32, 3u, word24);
+         break;
+     case GS_PSM_Z24:
+-        runPixels(3u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::Z24>::Write(GSMem::PageTableZ32, m_vram, dbp, dbw, x, y, word24(src)); });
++        runFast(GSMem::PixelStorageTraits<Psm::Z24>{}, GSMem::PageTableZ32, 3u, word24);
+         break;
+     case GS_PSM_CT16:
+-        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::C16>::Write(GSMem::PageTableC16, m_vram, dbp, dbw, x, y, word16(src)); });
++        runFast(GSMem::PixelStorageTraits<Psm::C16>{}, GSMem::PageTableC16, 2u, word16);
+         break;
+     case GS_PSM_CT16S:
+-        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::C16S>::Write(GSMem::PageTableC16S, m_vram, dbp, dbw, x, y, word16(src)); });
++        runFast(GSMem::PixelStorageTraits<Psm::C16S>{}, GSMem::PageTableC16S, 2u, word16);
+         break;
+     case GS_PSM_Z16:
+-        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::Z16>::Write(GSMem::PageTableZ16, m_vram, dbp, dbw, x, y, word16(src)); });
++        runFast(GSMem::PixelStorageTraits<Psm::Z16>{}, GSMem::PageTableZ16, 2u, word16);
+         break;
+     case GS_PSM_Z16S:
+-        runPixels(2u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::Z16S>::Write(GSMem::PageTableZ16S, m_vram, dbp, dbw, x, y, word16(src)); });
++        runFast(GSMem::PixelStorageTraits<Psm::Z16S>{}, GSMem::PageTableZ16S, 2u, word16);
+         break;
+     case GS_PSM_T8:
+-        runPixels(1u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::P8>::Write(GSMem::PageTableP8, m_vram, dbp, dbw, x, y, *src); });
++        runFast(GSMem::PixelStorageTraits<Psm::P8>{}, GSMem::PageTableP8, 1u, [](const uint8_t *src) { return static_cast<uint32_t>(*src); });
+         break;
+     case GS_PSM_T8H:
+-        runPixels(1u, [&](const uint8_t *src, uint32_t x, uint32_t y)
+-                  { GSMem::PixelStorageTraits<Psm::P8H>::Write(GSMem::PageTableC32, m_vram, dbp, dbw, x, y, *src); });
++        runFast(GSMem::PixelStorageTraits<Psm::P8H>{}, GSMem::PageTableC32, 1u, [](const uint8_t *src) { return static_cast<uint32_t>(*src); });
+         break;
+     case GS_PSM_T4:
+     case GS_PSM_T4HL:
+     case GS_PSM_T4HH:
+-        while (offset < sizeBytes && m_transferState.direction == 0u)
+-        {
+-            // Both nibbles go where copiedPixels says (not m_transferState.x/y).
+-            const uint8_t packed = data[offset++];
+-            const uint32_t firstPixel = m_transferState.copiedPixels;
+-            GSMem::WritePixel(m_vram, dpsm, dbp, dbw, dsax + column, dsay + row, packed & 0x0Fu);
+-            if (firstPixel + 1u < m_transferState.totalPixels)
+-            {
+-                const bool wraps = column + 1u >= rrw;
+-                GSMem::WritePixel(m_vram, dpsm, dbp, dbw, dsax + (wraps ? column + 1u - rrw : column + 1u), dsay + (wraps ? row + 1u : row),
+-                                  (packed >> 4u) & 0x0Fu);
+-            }
+-            advancePixel(std::min<uint32_t>(2u, m_transferState.totalPixels - firstPixel));
+-        }
++    {
++        const uint32_t n = std::min<uint32_t>((sizeBytes - offset) * 2u, m_transferState.totalPixels - m_transferState.copiedPixels);
++        const uint8_t *src = data + offset;
++        const auto nibble = [&](uint32_t i) { return static_cast<uint32_t>(src[i >> 1u] >> ((i & 1u) * 4u)) & 0x0Fu; };
++        if (dpsm == GS_PSM_T4)
++            runRows(GSMem::PixelStorageTraits<Psm::P4>{}, GSMem::PageTableP4, n, nibble);
++        else if (dpsm == GS_PSM_T4HL)
++            runRows(GSMem::PixelStorageTraits<Psm::P4HL>{}, GSMem::PageTableC32, n, nibble);
++        else
++            runRows(GSMem::PixelStorageTraits<Psm::P4HH>{}, GSMem::PageTableC32, n, nibble);
++        offset += (n + 1u) / 2u;
+         break;
++    }
+     default:
+         return;
+     }
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 73f1805..9406f48 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1746,6 +1746,14 @@ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_
+         backendFlushed()->WriteVram(psm, base, bw, x, y, value);
+ }
+ 
++namespace
++{
++    // The state the last batch built on this thread had, and its id (ids are unique across threads).
++    std::atomic<uint32_t> g_nextBatchStateId{1};
++    thread_local GSDrawState t_lastBatchState{};
++    thread_local uint32_t t_lastBatchStateId = 0;
++}
++
+ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+ {
+     GSPrimitiveBatch batch{};
+@@ -1776,6 +1784,12 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+     // across the right edge and leaving visible vertical seam lines.
+     batch.state.linearFilter = (mxl == 0u) ? (mmag != 0u)
+                                            : (mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u);
++    if (t_lastBatchStateId == 0u || std::memcmp(&batch.state, &t_lastBatchState, sizeof(GSDrawState)) != 0)
++    {
++        std::memcpy(&t_lastBatchState, &batch.state, sizeof(GSDrawState)); // padding too, for the memcmp
++        t_lastBatchStateId = g_nextBatchStateId.fetch_add(1u, std::memory_order_relaxed);
++    }
++    batch.stateId = t_lastBatchStateId;
+     return batch;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index b3252a6..3bbb808 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -15,6 +15,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <initializer_list>
++#include <condition_variable>
+ #include <mutex>
+ #include <iostream>
+ #include <utility>
+@@ -424,6 +425,24 @@ namespace
+         uint32_t outOffset; // first word of the output slot
+     };
+ 
++    // TEMP-DEBUG(mhrs): MHRS_HIRES_EVERY=<n> writes every n-th high-resolution frame to build/hires_NNN.ppm
++    void debugDumpHires(const uint8_t *pixels, uint32_t width, uint32_t height)
++    {
++        static const char *every = std::getenv("MHRS_HIRES_EVERY");
++        static uint64_t presents = 0, written = 0;
++        if (!every || (++presents % std::strtoull(every, nullptr, 10)) != 0)
++            return;
++        char path[64];
++        std::snprintf(path, sizeof(path), "build/hires_%03llu.ppm", static_cast<unsigned long long>(written++));
++        if (FILE *f = std::fopen(path, "wb"))
++        {
++            std::fprintf(f, "P6\n%u %u\n255\n", width, height);
++            for (size_t i = 0; i < static_cast<size_t>(width) * height * 4u; i += 4)
++                std::fwrite(pixels + i, 1, 3, f);
++            std::fclose(f);
++        }
++    }
++
+     // present_hires.comp's push constants.
+     struct HiresPresentPush
+     {
+@@ -436,7 +455,10 @@ namespace
+ 
+     // The latest high-resolution frame, for the window (gs_hires.h).
+     std::mutex g_hiresMutex;
++    std::condition_variable g_hiresCopied;
+     std::vector<uint8_t> g_hiresPixels;
++    const uint8_t *g_hiresShared = nullptr;  // published with gsHiresPublishShared, not taken yet
++    const uint8_t *g_hiresReading = nullptr; // the window is copying from here
+     uint32_t g_hiresWidth = 0, g_hiresHeight = 0;
+     bool g_hiresFresh = false;
+ }
+@@ -445,6 +467,7 @@ void gsHiresPublish(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t heig
+ {
+     std::lock_guard<std::mutex> lock(g_hiresMutex);
+     g_hiresPixels = std::move(pixels);
++    g_hiresShared = nullptr;
+     g_hiresWidth = width;
+     g_hiresHeight = height;
+     g_hiresFresh = true;
+@@ -454,20 +477,53 @@ void gsHiresPublishCopy(const uint8_t *pixels, uint32_t width, uint32_t height)
+ {
+     std::lock_guard<std::mutex> lock(g_hiresMutex);
+     g_hiresPixels.assign(pixels, pixels + static_cast<size_t>(width) * height * 4u); // keeps the capacity
++    g_hiresShared = nullptr;
+     g_hiresWidth = width;
+     g_hiresHeight = height;
+     g_hiresFresh = true;
+ }
+ 
+-bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height)
++void gsHiresPublishShared(const uint8_t *pixels, uint32_t width, uint32_t height)
+ {
+     std::lock_guard<std::mutex> lock(g_hiresMutex);
++    g_hiresShared = pixels;
++    g_hiresWidth = width;
++    g_hiresHeight = height;
++    g_hiresFresh = true;
++}
++
++void gsHiresRelease(const uint8_t *begin, const uint8_t *end)
++{
++    std::unique_lock<std::mutex> lock(g_hiresMutex);
++    if (g_hiresShared >= begin && g_hiresShared < end)
++    {
++        g_hiresShared = nullptr;
++        g_hiresFresh = false;
++    }
++    g_hiresCopied.wait(lock, [&] { return !(g_hiresReading >= begin && g_hiresReading < end); });
++}
++
++bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height)
++{
++    std::unique_lock<std::mutex> lock(g_hiresMutex);
+     if (!g_hiresFresh)
+         return false;
+     g_hiresFresh = false;
+-    pixels.swap(g_hiresPixels);
+     width = g_hiresWidth;
+     height = g_hiresHeight;
++    if (!g_hiresShared)
++    {
++        pixels.swap(g_hiresPixels);
++        return true;
++    }
++    // Copy on this (the window's) thread, outside the lock: gsHiresRelease waits for it.
++    const uint8_t *src = g_hiresReading = g_hiresShared;
++    g_hiresShared = nullptr;
++    lock.unlock();
++    pixels.assign(src, src + static_cast<size_t>(width) * height * 4u);
++    lock.lock();
++    g_hiresReading = nullptr;
++    g_hiresCopied.notify_all();
+     return true;
+ }
+ 
+@@ -626,6 +682,10 @@ struct GSVulkanBackend::VkState
+     std::vector<uint32_t> touchedTiles;
+     std::vector<VkBufferCopy> regions;
+ 
++    // The last batch's state, copied once per state id (batch.stateId) instead of read from every batch.
++    GSDrawState drawState{};
++    uint32_t drawStateId = 0;
++    uint32_t pipeStateId = 0; // the batch state id lastState was filled from
+     // State of the last primitive (runs of primitives share one).
+     bool haveState = false;
+     PipeState lastState{};
+@@ -1318,7 +1378,12 @@ void GSVulkanBackend::VkState::draw(const GSPrimitiveBatch &batch)
+ {
+     if (batch.vertexCount == 0u)
+         return;
+-    const GSDrawState &state = batch.state;
++    if (batch.stateId == 0u || batch.stateId != drawStateId)
++    {
++        drawState = batch.state;
++        drawStateId = batch.stateId;
++    }
++    const GSDrawState &state = drawState;
+     const GSContext &ctx = state.context;
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+@@ -1457,13 +1522,19 @@ void GSVulkanBackend::VkState::draw(const GSPrimitiveBatch &batch)
+         return; // fully clipped: the CPU's loops run zero iterations
+ 
+     PipeState p;
+-    fillPipeState(p, state);
+-    if (!haveState || std::memcmp(&p, &lastState, sizeof(p)) != 0)
++    if (haveState && batch.stateId != 0u && batch.stateId == pipeStateId)
++        p = lastState;
++    else
+     {
+-        lastState = p;
+-        haveState = true;
+-        info = analyzeState(p);
+-        stateIndex = kNone;
++        fillPipeState(p, state);
++        if (!haveState || std::memcmp(&p, &lastState, sizeof(p)) != 0)
++        {
++            lastState = p;
++            haveState = true;
++            info = analyzeState(p);
++            stateIndex = kNone;
++        }
++        pipeStateId = batch.stateId;
+     }
+     if (!info.ok)
+     {
+@@ -1688,6 +1759,8 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+         if (vk.slots[slot].pending) // not read back yet (cannot happen with 3 slots read one present later)
+             vkWaitForFences(vk.device, 1, &vk.slotFences[slot], VK_TRUE, UINT64_MAX);
+         const uint32_t base = slot * VkState::kSlotWords;
++        const uint8_t *slotBytes = static_cast<const uint8_t *>(vk.outMapped) + static_cast<size_t>(base) * 4u;
++        gsHiresRelease(slotBytes, slotBytes + VkState::kSlotWords * 4u);
+         const VkCommandBuffer cb = vk.command();
+         vk.barrier(cb); // after all drawing submitted before, not only what this command buffer holds
+         PresentPushConstants pc{};
+@@ -1746,7 +1819,8 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+         {
+             if (done.hiresWidth != 0u)
+             {
+-                gsHiresPublishCopy(src + VkState::kSlotNativeWords * 4u, done.hiresWidth, done.hiresHeight);
++                debugDumpHires(src + VkState::kSlotNativeWords * 4u, done.hiresWidth, done.hiresHeight);
++                gsHiresPublishShared(src + VkState::kSlotNativeWords * 4u, done.hiresWidth, done.hiresHeight);
+             }
+             else
+                 gsHiresPublish({}, 0u, 0u);
+@@ -1788,22 +1862,7 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+         vk.drain();
+         std::vector<uint8_t> pixels(static_cast<size_t>(outW) * outH * 4u);
+         std::memcpy(pixels.data(), vk.outMapped, pixels.size());
+-        { // TEMP-DEBUG(mhrs): MHRS_HIRES_EVERY=<n> writes every n-th high-resolution frame to build/hires_NNN.ppm
+-            static const char *every = std::getenv("MHRS_HIRES_EVERY");
+-            static uint64_t presents = 0, written = 0;
+-            if (every && (++presents % std::strtoull(every, nullptr, 10)) == 0)
+-            {
+-                char path[64];
+-                std::snprintf(path, sizeof(path), "build/hires_%03llu.ppm", static_cast<unsigned long long>(written++));
+-                if (FILE *f = std::fopen(path, "wb"))
+-                {
+-                    std::fprintf(f, "P6\n%u %u\n255\n", outW, outH);
+-                    for (size_t i = 0; i < pixels.size(); i += 4)
+-                        std::fwrite(pixels.data() + i, 1, 3, f);
+-                    std::fclose(f);
+-                }
+-            }
+-        }
++        debugDumpHires(pixels.data(), outW, outH);
+         gsHiresPublish(std::move(pixels), outW, outH);
+     }
+     else
+@@ -1823,6 +1882,8 @@ void gsHiresSetActive(bool) {}
+ void gsHiresSetScale(uint32_t) {}
+ void gsHiresPublish(std::vector<uint8_t> &&, uint32_t, uint32_t) {}
+ void gsHiresPublishCopy(const uint8_t *, uint32_t, uint32_t) {}
++void gsHiresPublishShared(const uint8_t *, uint32_t, uint32_t) {}
++void gsHiresRelease(const uint8_t *, const uint8_t *) {}
+ bool gsHiresTake(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
+ 
+ struct GSVulkanBackend::VkState
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 012134c..650b0cd 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -19,6 +19,8 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <memory>
++#include <string>
+ #include <thread>
+ #include <vector>
+ 
+@@ -4676,6 +4678,132 @@ void register_ps2_gs_tests()
+                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+         });
+ 
++        tc.Run("GS draw batches share a state id exactly while their state is identical", [](TestCase &t)
++        {
++            // Records the batches and hands everything to a CPU backend (which is final).
++            struct Recorder : GSRasterBackend
++            {
++                GSCpuBackend inner;
++                std::vector<GSPrimitiveBatch> *seen = nullptr;
++                void Submit(const GSPrimitiveBatch &batch) override
++                {
++                    seen->push_back(batch);
++                    inner.Submit(batch);
++                }
++                void Initialize(uint8_t *vram, uint32_t size) override { inner.Initialize(vram, size); }
++                void Reset() override { inner.Reset(); }
++                void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override { inner.LoadClut(tex0, texclut); }
++                void BeginTransfer(const GSTransferCommand &command) override { inner.BeginTransfer(command); }
++                void UploadImage(const uint8_t *data, uint32_t size) override { inner.UploadImage(data, size); }
++                void Flush() override { inner.Flush(); }
++                void TextureFlush() override { inner.TextureFlush(); }
++                void Sync(GSSyncReason reason) override { inner.Sync(reason); }
++                PresentationFrame Present(const GSPresentationRequest &request) override { return inner.Present(request); }
++                bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override { return inner.ClearFramebuffer(context, rgba); }
++                uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { return inner.ConsumeLocalToHostBytes(dst, maxBytes); }
++                uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override { return inner.ReadVram(psm, base, bw, x, y); }
++                void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override { inner.WriteVram(psm, base, bw, x, y, value); }
++                void SnapshotVram(std::vector<uint8_t> &out) const override { inner.SnapshotVram(out); }
++                GSTransferSnapshot GetTransferSnapshot() const override { return inner.GetTransferSnapshot(); }
++            };
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            std::vector<GSPrimitiveBatch> seen;
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            auto recorder = std::make_unique<Recorder>();
++            recorder->seen = &seen;
++            gs.setRasterBackend(std::move(recorder));
++
++            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
++            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
++            gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
++            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
++            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
++            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
++            auto sprite = [&](uint32_t x)
++            {
++                gs.writeRegister(GS_REG_RGBAQ, 0x80000000ull | x); // vertex data, not state
++                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(x << 4));
++                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>((x + 4u) << 4) | (static_cast<uint64_t>(8u << 4) << 16));
++            };
++            sprite(0u);
++            sprite(8u);
++            gs.writeRegister(GS_REG_TEST_1, 0x50000ull); // state change
++            sprite(16u);
++            gs.writeRegister(GS_REG_TEST_1, 0x50000ull); // same value again: same state
++            sprite(24u);
++            gs.writeRegister(GS_REG_TEST_1, 0x30000ull); // back to the first state: a new id is fine, a wrong one is not
++            sprite(32u);
++            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u); // hands the queued draws to the backend
++
++            t.Equals(seen.size(), size_t{5}, "five sprites reach the backend");
++            if (seen.size() != 5u)
++                return;
++            for (const GSPrimitiveBatch &batch : seen)
++                t.IsTrue(batch.stateId != 0u, "frontend batches carry a state id");
++            t.Equals(seen[0].stateId, seen[1].stateId, "sprites without a state change share an id");
++            t.IsTrue(seen[2].stateId != seen[1].stateId, "a register change gives a new id");
++            t.Equals(seen[3].stateId, seen[2].stateId, "rewriting the same value keeps the id");
++            t.IsTrue(seen[4].stateId != seen[3].stateId, "changing back gives a different id than the last one");
++            for (size_t i = 0; i < seen.size(); ++i)
++                for (size_t j = 0; j < seen.size(); ++j)
++                    if (seen[i].stateId == seen[j].stateId)
++                        t.IsTrue(std::memcmp(&seen[i].state, &seen[j].state, sizeof(GSDrawState)) == 0,
++                                 "equal ids must mean equal state");
++        });
++
++        tc.Run("GS image upload matches per-pixel writes for every format, across pages and split packets", [](TestCase &t)
++        {
++            struct Format
++            {
++                uint8_t psm;
++                uint32_t bitsPerPixel;
++            };
++            const Format formats[] = {{GS_PSM_CT32, 32}, {GS_PSM_CT24, 24}, {GS_PSM_CT16, 16}, {GS_PSM_CT16S, 16},
++                                      {GS_PSM_Z32, 32},  {GS_PSM_Z24, 24},  {GS_PSM_Z16, 16},  {GS_PSM_Z16S, 16},
++                                      {GS_PSM_T8, 8},    {GS_PSM_T8H, 8},   {GS_PSM_T4, 4},    {GS_PSM_T4HL, 4},
++                                      {GS_PSM_T4HH, 4}};
++            uint32_t seed = 777u;
++            auto rnd = [&]() { return (seed = seed * 1664525u + 1013904223u) >> 8; };
++            for (const Format &f : formats)
++            {
++                constexpr uint32_t kDbp = 64u, kDbw = 4u, kRrw = 150u, kRrh = 40u, kDsax = 37u, kDsay = 21u;
++                std::vector<uint8_t> data(kRrw * kRrh * f.bitsPerPixel / 8u);
++                for (uint8_t &byte : data)
++                    byte = static_cast<uint8_t>(rnd());
++                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE), expected;
++                for (uint8_t &byte : vram)
++                    byte = static_cast<uint8_t>(rnd());
++                expected = vram;
++                for (uint32_t i = 0; i < kRrw * kRrh; ++i)
++                {
++                    uint32_t value = 0u;
++                    if (f.bitsPerPixel == 4u)
++                        value = (data[i / 2u] >> ((i & 1u) * 4u)) & 0xFu;
++                    else
++                        std::memcpy(&value, data.data() + i * f.bitsPerPixel / 8u, f.bitsPerPixel / 8u);
++                    GSMem::WritePixel(expected.data(), f.psm, kDbp, kDbw, kDsax + i % kRrw, kDsay + i / kRrw, value);
++                }
++
++                GSCpuBackend cpu;
++                cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++                GSTransferCommand command;
++                command.bitbltbuf.dbp = kDbp;
++                command.bitbltbuf.dbw = kDbw;
++                command.bitbltbuf.dpsm = f.psm;
++                command.trxpos.dsax = kDsax;
++                command.trxpos.dsay = kDsay;
++                command.trxreg.rrw = kRrw;
++                command.trxreg.rrh = kRrh;
++                command.direction = 0;
++                cpu.BeginTransfer(command);
++                // Packets of whole qwords that end mid-row (48 bytes: whole pixels of every size).
++                for (size_t at = 0; at < data.size(); at += 48u * 37u)
++                    cpu.UploadImage(data.data() + at, static_cast<uint32_t>(std::min<size_t>(48u * 37u, data.size() - at)));
++                t.IsTrue(vram == expected, "upload of psm " + std::to_string(f.psm) + " must write what per-pixel writes do");
++            }
++        });
++
+         tc.Run("Vulkan batch raster matches the CPU backend on overlapping primitives", [](TestCase &t)
+         {
+             // Without a Vulkan device the Vulkan backend is the CPU backend and this passes trivially.
