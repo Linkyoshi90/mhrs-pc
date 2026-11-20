@@ -1,0 +1,146 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index fd4bed0..d53429e 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -644,22 +644,6 @@ namespace
+         return {(smode2 & 0x1ull) != 0ull, ((smode2 >> 1) & 0x1ull) != 0ull};
+     }
+ 
+-    void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
+-    {
+-        if (pixels.empty() || width == 0u || height < 2u)
+-            return;
+-        const std::vector<uint8_t> source = pixels;
+-        for (uint32_t y = 0; y < height; ++y)
+-        {
+-            uint32_t sourceY = ((y >> 1u) << 1u) + (oddField ? 1u : 0u);
+-            if (sourceY >= height)
+-                sourceY = height - 1u;
+-            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u,
+-                        source.data() + sourceY * kHostFrameWidth * 4u,
+-                        width * 4u);
+-        }
+-    }
+-
+     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
+     {
+         for (uint32_t y = 0; y < height; ++y)
+@@ -3236,8 +3220,9 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     PresentationFrame result{};
+     const GSPmodeState pmode = decodePmode(request.pmode);
+     const GSSmode2State smode2 = decodeSMode2(request.smode2);
+-    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
+-    const bool oddField = (request.vsyncTick & 1ull) != 0ull;
++    // Field mode (interlaced, FFMD=0) with a full-height buffer: both fields come from the same frame, so it is
++    // shown whole (weave). Showing one field's lines per vsync without the TV's half-line offset made the picture
++    // bounce a line up and down whenever the vsync parity of a presented frame changed.
+     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
+@@ -3330,8 +3315,6 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+                     dst[3] = pmode.amod ? dst[3] : src[3];
+                 }
+             normalizePresentationAlpha(result.pixels, result.width, result.height);
+-            if (fieldMode)
+-                applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+             result.displayFbp = displayFrame1.fbp;
+             result.sourceFbp = selected1.fbp;
+             return result;
+@@ -3345,8 +3328,6 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     GSFrameReg selected = displayFrame;
+     if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
+         return {};
+-    if (fieldMode)
+-        applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+     normalizePresentationAlpha(result.pixels, result.width, result.height);
+     result.displayFbp = displayFrame.fbp;
+     result.sourceFbp = selected.fbp;
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index d61009b..9cf9b99 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -110,22 +110,6 @@ namespace
+         return {(smode2 & 0x1ull) != 0ull, ((smode2 >> 1) & 0x1ull) != 0ull};
+     }
+ 
+-    void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
+-    {
+-        if (pixels.empty() || width == 0u || height < 2u)
+-            return;
+-        const std::vector<uint8_t> source = pixels;
+-        for (uint32_t y = 0; y < height; ++y)
+-        {
+-            uint32_t sourceY = ((y >> 1u) << 1u) + (oddField ? 1u : 0u);
+-            if (sourceY >= height)
+-                sourceY = height - 1u;
+-            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u,
+-                        source.data() + sourceY * kHostFrameWidth * 4u,
+-                        width * 4u);
+-        }
+-    }
+-
+     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
+     {
+         for (uint32_t y = 0; y < height; ++y)
+@@ -1390,8 +1374,9 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+     PresentationFrame result{};
+     const GSPmodeState pmode = decodePmode(request.pmode);
+     const GSSmode2State smode2 = decodeSMode2(request.smode2);
+-    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
+-    const bool oddField = (request.vsyncTick & 1ull) != 0ull;
++    // Field mode (interlaced, FFMD=0) with a full-height buffer: both fields come from the same frame, so it is
++    // shown whole (weave). Showing one field's lines per vsync without the TV's half-line offset made the picture
++    // bounce a line up and down whenever the vsync parity of a presented frame changed.
+     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
+@@ -1484,8 +1469,6 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+                     dst[3] = pmode.amod ? dst[3] : src[3];
+                 }
+             normalizePresentationAlpha(result.pixels, result.width, result.height);
+-            if (fieldMode)
+-                applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+             result.displayFbp = displayFrame1.fbp;
+             result.sourceFbp = selected1.fbp;
+             debugDumpFrame(result);
+@@ -1500,8 +1483,6 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+     GSFrameReg selected = displayFrame;
+     if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
+         return {};
+-    if (fieldMode)
+-        applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+     normalizePresentationAlpha(result.pixels, result.width, result.height);
+     result.displayFbp = displayFrame.fbp;
+     result.sourceFbp = selected.fbp;
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 36bcd00..012134c 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -1684,7 +1684,7 @@ void register_ps2_gs_tests()
+                      "single-circuit presentation should normalize the last row alpha");
+         });
+ 
+-        tc.Run("latched host presentation line-doubles interlaced field output", [](TestCase &t)
++        tc.Run("latched host presentation shows a full-height interlaced field-mode frame whole", [](TestCase &t)
+         {
+             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+             GSRegisters regs{};
+@@ -1735,12 +1735,12 @@ void register_ps2_gs_tests()
+             const uint32_t row2 = pixelAtRow(2u);
+             const uint32_t row3 = pixelAtRow(3u);
+ 
+-            t.Equals(row0, row1,
+-                     "field presentation should duplicate the active field into the next scanline");
+-            t.Equals(row2, row3,
+-                     "field presentation should duplicate later field scanlines as well");
+-            t.IsTrue(row0 != row2,
+-                     "field presentation should still preserve different source content across field rows");
++            // Both fields come from the same frame: every line is shown (a field per vsync without the TV's
++            // half-line offset made the picture bounce).
++            t.Equals(row0, kLine0 & 0xFFFFFFu, "line 0 should be shown");
++            t.Equals(row1, kLine1 & 0xFFFFFFu, "line 1 should be shown, not line 0 doubled");
++            t.Equals(row2, kLine2 & 0xFFFFFFu, "line 2 should be shown");
++            t.Equals(row3, kLine3 & 0xFFFFFFu, "line 3 should be shown, not line 2 doubled");
+         });
+ 
+         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)

@@ -1,0 +1,75 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index d4bef47..aa3c2f5 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -423,6 +423,35 @@ namespace ps2x::iop::detail
+             return address;
+         }
+ 
++        // Large blocks (sound banks) from the top, small ones first fit from the bottom: otherwise small
++        // allocations split the gap a freed bank leaves, and after a few level loads the next bank no longer fits.
++        constexpr uint32_t kLargeBlock = 64u * 1024u;
++        if (size >= kLargeBlock)
++        {
++            std::vector<Allocation> blocks(m_allocations.begin(), m_allocations.end());
++            std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b) { return a.address > b.address; });
++            uint32_t top = HeapLimit;
++            for (size_t i = 0;; ++i)
++            {
++                const uint32_t bottom = i < blocks.size() ? std::max(HeapBase, blocks[i].address + blocks[i].size) : HeapBase;
++                if (top >= bottom && top - bottom >= size)
++                {
++                    const uint32_t candidate = (top - size) & ~(alignment - 1u);
++                    if (candidate >= bottom)
++                    {
++                        m_allocations.push_back({candidate, size});
++                        markOwned(candidate, size);
++                        return candidate;
++                    }
++                }
++                if (i >= blocks.size())
++                    break;
++                top = std::min(top, blocks[i].address);
++            }
++            std::fprintf(stderr, "[iop-heap] no room for %u bytes (largest free %u)\n", size, maxFreeMemory());
++            return 0u;
++        }
++
+         // First fit from the bottom, so freed blocks are reused.
+         uint32_t candidate = alignUp(HeapBase, alignment);
+         for (;;)
+@@ -441,7 +470,10 @@ namespace ps2x::iop::detail
+                 break;
+         }
+         if (candidate > HeapLimit || size > HeapLimit - candidate)
++        {
++            std::fprintf(stderr, "[iop-heap] no room for %u bytes (largest free %u)\n", size, maxFreeMemory());
+             return 0u;
++        }
+         m_allocations.push_back({candidate, size});
+         markOwned(candidate, size);
+         return candidate;
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+index 2ca9f5b..08e90be 100644
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -193,6 +193,19 @@ void register_ps2_sif_dma_tests()
+                      "a freed block should be reused (first fit)");
+         });
+ 
++        tc.Run("IOP heap still fits the next sound bank after small blocks took the freed one's place", [](TestCase &t)
++        {
++            TestEnv env;
++            // Level 1's scripted bank, a small block, the bank freed at the level change, small blocks of the next
++            // level, then level 2's bank (0xd0f90 + 64).
++            const uint32_t bank1 = env.runtime.allocateIopMemory(0xDA9B0u, 64u);
++            t.IsTrue(bank1 != 0u && env.runtime.allocateIopMemory(0x1000u, 64u) != 0u, "the first level fits");
++            t.IsTrue(env.runtime.freeIopMemory(bank1), "the bank frees");
++            for (int i = 0; i < 20; ++i)
++                t.IsTrue(env.runtime.allocateIopMemory(0x4000u, 64u) != 0u, "small blocks fit");
++            t.IsTrue(env.runtime.allocateIopMemory(0xD0FD0u, 64u) != 0u, "the next level's bank still fits");
++        });
++
+         tc.Run("IOP heap DMA uses private backing instead of aliasing EE RDRAM", [](TestCase &t)
+         {
+             TestEnv env;

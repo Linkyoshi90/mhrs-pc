@@ -1,0 +1,546 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+index 9112e45..b2659fb 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_async_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -67,7 +67,12 @@ private:
+         uint32_t count;
+     };
+     // Kept small: a frame queues ~100k of these.
+-    using Command = std::variant<DrawRange, ClutLoad, GSTransferCommand, ImageData, FlushCmd, TextureFlushCmd, GSSyncReason, Clear>;
++    // A present behind the queued draws (gsHiresActive): its request is the display state when it was queued.
++    struct PresentCmd
++    {
++        std::shared_ptr<const GSPresentationRequest> request;
++    };
++    using Command = std::variant<DrawRange, ClutLoad, GSTransferCommand, ImageData, FlushCmd, TextureFlushCmd, GSSyncReason, Clear, PresentCmd>;
+ 
+     // wakeNow: wake the worker even if it has less than kWakeDraws commands queued (anything but a draw).
+     template <class T>
+@@ -87,5 +92,9 @@ private:
+     bool m_stop = false;
+     bool m_wakeNow = false;         // a command other than a draw or CLUT load is queued
+     mutable int m_drainWaiters = 0; // threads in Drain
++    int m_presentsQueued = 0;       // PresentCmds waiting in the queue (at most kMaxQueuedPresents)
++    std::mutex m_frameMutex;
++    PresentationFrame m_latestFrame; // the last completed asynchronous present
++    bool m_haveFrame = false;
+     std::thread m_worker;
+ };
+diff --git a/ps2xRuntime/include/runtime/gs/gs_hires.h b/ps2xRuntime/include/runtime/gs/gs_hires.h
+index 057f496..1faa87b 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_hires.h
++++ b/ps2xRuntime/include/runtime/gs/gs_hires.h
+@@ -10,8 +10,16 @@
+ // (F2) changes it while the game runs.
+ uint32_t gsHiresScale();
+ void gsHiresSetScale(uint32_t scale);
++// Every GPU present publishes: the high-resolution display, or nothing (width 0) when it has none (native only).
+ void gsHiresPublish(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t height);
+-// The frame published since the last call, if any (pixels is swapped with it).
++// The same from memory the caller keeps: copied into a buffer that goes back and forth with the window's, so a
++// frame costs no allocation.
++void gsHiresPublishCopy(const uint8_t *pixels, uint32_t width, uint32_t height);
++// Whether a present completed since the last call; if so, pixels is swapped with what it published.
+ bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height);
++// True while the Vulkan backend presents on the GPU: presents then run behind the queued draws (asynchronously) and
++// gsHiresTake says when one completed.
++bool gsHiresActive();
++void gsHiresSetActive(bool active);
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index df1ef21..7a54dee 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -1,4 +1,8 @@
++#include <algorithm>
++#include <cstdio>
++#include <chrono>
+ #include "runtime/gs/gs_async_backend.h"
++#include "runtime/gs/gs_hires.h"
+ 
+ #if defined(__linux__)
+ #include <pthread.h>
+@@ -9,7 +13,8 @@
+ namespace
+ {
+     // Bounds the queue so a producer far ahead of the rasteriser cannot use unbounded memory.
+-    constexpr size_t kMaxPendingCommands = 1u << 18u; // a few frames
++    // About two thirds of a frame: a longer queue only delays the window (presents run behind it).
++    constexpr size_t kMaxPendingCommands = 1u << 16u;
+     // Draws are cheap to queue but waking the worker is a syscall: wake it once this many commands wait.
+     constexpr size_t kWakeDraws = 1024u;
+ }
+@@ -77,6 +82,7 @@ void GSAsyncBackend::Run(Command &command)
+         void operator()(TextureFlushCmd) { b.TextureFlush(); }
+         void operator()(GSSyncReason reason) { b.Sync(reason); }
+         void operator()(const Clear &c) { b.ClearFramebuffer(c.context, c.rgba); }
++        void operator()(const PresentCmd &) {} // WorkerLoop runs presents itself
+     };
+     std::visit(Visitor{*m_inner}, command);
+ }
+@@ -116,6 +122,18 @@ void GSAsyncBackend::WorkerLoop()
+             if (!run.empty())
+                 m_inner->SubmitMany(run.data(), run.size());
+             run.clear();
++            if (const auto *present = std::get_if<PresentCmd>(&command))
++            {
++                PresentationFrame frame = m_inner->Present(*present->request);
++                {
++                    std::lock_guard<std::mutex> lock(m_frameMutex);
++                    m_latestFrame = std::move(frame);
++                    m_haveFrame = true;
++                }
++                std::lock_guard<std::mutex> lock(m_mutex);
++                --m_presentsQueued;
++                continue;
++            }
+             Run(command);
+         }
+         if (!run.empty())
+@@ -208,8 +226,33 @@ void GSAsyncBackend::Sync(GSSyncReason reason)
+ 
+ PresentationFrame GSAsyncBackend::Present(const GSPresentationRequest &request)
+ {
+-    Drain();
+-    return m_inner->Present(request);
++    if (!gsHiresActive())
++    {
++        Drain();
++        return m_inner->Present(request);
++    }
++    // GPU present: queued behind the draws instead of waiting for all of them (the queue can hold a few frames of
++    // work, and the window waited ~150 ms per frame at 3x internal resolution). The caller gets the newest completed
++    // present; gsHiresTake tells the window whether it is new.
++    // Two in flight: one alone caps the new frames at one per queue round trip (~26/s at 3x).
++    constexpr int kMaxQueuedPresents = 2;
++    bool queue = false;
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        queue = m_presentsQueued < kMaxQueuedPresents;
++        if (queue)
++            ++m_presentsQueued;
++    }
++    if (queue)
++        Enqueue(PresentCmd{std::make_shared<const GSPresentationRequest>(request)});
++    {
++        std::lock_guard<std::mutex> lock(m_frameMutex);
++        if (m_haveFrame)
++            return m_latestFrame;
++    }
++    Drain(); // the very first present
++    std::lock_guard<std::mutex> lock(m_frameMutex);
++    return m_latestFrame;
+ }
+ 
+ bool GSAsyncBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index 48d4fa6..b3252a6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -421,6 +421,7 @@ namespace
+         uint32_t flags;
+         uint32_t wordMask;
+         uint32_t byteMask16;
++        uint32_t outOffset; // first word of the output slot
+     };
+ 
+     // present_hires.comp's push constants.
+@@ -428,6 +429,7 @@ namespace
+     {
+         uint32_t basePtr, fbw, psm, width, height, originX, originY, flags, scale;
+         uint32_t valid[16];
++        uint32_t outOffset;
+     };
+     constexpr uint32_t kPushBytes = 128u;
+     static_assert(sizeof(HiresPresentPush) <= kPushBytes && sizeof(PresentPushConstants) <= kPushBytes);
+@@ -448,6 +450,15 @@ void gsHiresPublish(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t heig
+     g_hiresFresh = true;
+ }
+ 
++void gsHiresPublishCopy(const uint8_t *pixels, uint32_t width, uint32_t height)
++{
++    std::lock_guard<std::mutex> lock(g_hiresMutex);
++    g_hiresPixels.assign(pixels, pixels + static_cast<size_t>(width) * height * 4u); // keeps the capacity
++    g_hiresWidth = width;
++    g_hiresHeight = height;
++    g_hiresFresh = true;
++}
++
+ bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height)
+ {
+     std::lock_guard<std::mutex> lock(g_hiresMutex);
+@@ -463,8 +474,12 @@ bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height
+ namespace
+ {
+     std::atomic<uint32_t> g_hiresScale{0}; // 0: not read from PS2X_VK_SCALE yet
++    std::atomic<bool> g_hiresActive{false};
+ }
+ 
++bool gsHiresActive() { return g_hiresActive.load(std::memory_order_relaxed); }
++void gsHiresSetActive(bool active) { g_hiresActive.store(active, std::memory_order_relaxed); }
++
+ uint32_t gsHiresScale()
+ {
+     uint32_t scale = g_hiresScale.load(std::memory_order_relaxed);
+@@ -551,6 +566,19 @@ struct GSVulkanBackend::VkState
+ 
+     VkBuffer outBuffer = VK_NULL_HANDLE; // present output, host-visible
+     void *outMapped = nullptr;
++    // outBuffer holds kSlots slots of a native frame (640x512 words) and a high-resolution one (kMaxScale^2 as many).
++    // Slot 0: synchronous presents. Slots 1..3: pipelined presents, each read back at the following present.
++    static constexpr uint32_t kSlots = 4u;
++    static constexpr uint32_t kSlotNativeWords = 640u * 512u;
++    static constexpr uint32_t kSlotWords = kSlotNativeWords * (1u + 4u * 4u);
++    struct PresentSlot
++    {
++        bool pending = false;
++        uint32_t width = 0, height = 0, fbp = 0, hiresWidth = 0, hiresHeight = 0;
++    };
++    std::array<PresentSlot, kSlots> slots{};
++    std::array<VkFence, kSlots> slotFences{};
++    uint32_t lastSlot = 0; // the pipelined slot submitted last (0: none)
+ 
+     // Snapshots of cpuDirty pages on their way to the device copy.
+     VkBuffer uploadBuffer = VK_NULL_HANDLE;
+@@ -620,7 +648,7 @@ struct GSVulkanBackend::VkState
+ 
+     VkCommandBuffer command();
+     void barrier(VkCommandBuffer cb);
+-    void submit();
++    void submit(VkFence fence = VK_NULL_HANDLE);
+     void idleReset();
+     void drain();
+     void waitIdle();
+@@ -772,7 +800,7 @@ bool GSVulkanBackend::initVulkan()
+         !vk.createBuffer(vk.vramBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          false, vk.vramBuffer, nullptr) ||
+         !vk.createBuffer(VkState::kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, vk.uploadBuffer, &uploadMapped) ||
+-        !vk.createBuffer(kHostFrameWidth * kHostFrameHeight * 4u * VkState::kMaxScale * VkState::kMaxScale, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, vk.outBuffer, &vk.outMapped) ||
++        !vk.createBuffer(VkState::kSlots * VkState::kSlotWords * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, vk.outBuffer, &vk.outMapped) ||
+         !vk.createStream(vk.states, sizeof(PipeState), VkState::kMaxStates) ||
+         !vk.createStream(vk.geoms, sizeof(Geom), VkState::kMaxGeoms) ||
+         !vk.createStream(vk.tiles, 4u, VkState::kTileWords) ||
+@@ -896,6 +924,10 @@ bool GSVulkanBackend::initVulkan()
+     commandBufferInfo.commandBufferCount = VkState::kCommandBuffers;
+     if (vkAllocateCommandBuffers(vk.device, &commandBufferInfo, vk.commandBuffers.data()) != VK_SUCCESS)
+         return false;
++    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++    for (VkFence &fence : vk.slotFences)
++        if (vkCreateFence(vk.device, &fenceInfo, nullptr, &fence) != VK_SUCCESS)
++            return false;
+ 
+     VkPhysicalDeviceProperties props{};
+     vkGetPhysicalDeviceProperties(vk.phys, &props);
+@@ -911,6 +943,9 @@ void GSVulkanBackend::shutdownVulkan()
+     if (vk.device != VK_NULL_HANDLE)
+     {
+         vkDeviceWaitIdle(vk.device);
++        for (VkFence fence : vk.slotFences)
++            if (fence != VK_NULL_HANDLE)
++                vkDestroyFence(vk.device, fence, nullptr);
+         if (vk.commandPool)
+             vkDestroyCommandPool(vk.device, vk.commandPool, nullptr);
+         if (vk.pipeline)
+@@ -978,7 +1013,7 @@ void GSVulkanBackend::VkState::idleReset()
+     clutSlot = kNone;
+ }
+ 
+-void GSVulkanBackend::VkState::submit()
++void GSVulkanBackend::VkState::submit(VkFence fence)
+ {
+     if (!commandOpen)
+         return;
+@@ -987,7 +1022,7 @@ void GSVulkanBackend::VkState::submit()
+     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+     submitInfo.commandBufferCount = 1;
+     submitInfo.pCommandBuffers = &cb;
+-    if (vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
++    if (vkQueueSubmit(queue, 1, &submitInfo, fence) != VK_SUCCESS)
+         std::cerr << "[gs-vulkan] vkQueueSubmit failed" << std::endl;
+     commandOpen = false;
+     unsubmitted = 0;
+@@ -1098,29 +1133,10 @@ void GSVulkanBackend::VkState::closeBatch()
+     tiles.used = cursor;
+ 
+     // Internal resolution: a batch drawing 32-bit frame and depth buffers also draws their high-resolution copy, in
+-    // the same dispatch: the same tile lists, each native 8x8 tile as scale x scale tiles of 8x8 samples.
++    // the same dispatch: each native tile again as scale x scale tiles of 8x8 samples (the shader derives them).
+     const bool hires = scale > 1u && (batchKey[2] == GS_PSM_CT32 || batchKey[2] == GS_PSM_CT24) &&
+                        (batchKey[4] == UINT32_MAX || isOneOf(batchKey[4], {GS_PSM_Z32, GS_PSM_Z24, GS_PSM_CT32, GS_PSM_CT24}));
+-    const uint32_t hiresBase = tiles.used;
+-    uint32_t hiresTotal = 0;
+-    if (hires)
+-    {
+-        for (uint32_t i = 0; i < tileTotal; ++i)
+-        {
+-            const uint32_t key = words[tileBase + i * 3u];
+-            const uint32_t tx = key & 0xFFu, ty = key >> 8u;
+-            for (uint32_t sy = 0; sy < scale; ++sy)
+-                for (uint32_t sx = 0; sx < scale; ++sx)
+-                {
+-                    uint32_t *h = words + hiresBase + hiresTotal * 3u;
+-                    h[0] = (tx * scale + sx) | ((ty * scale + sy) << 16u);
+-                    h[1] = words[tileBase + i * 3u + 1u];
+-                    h[2] = words[tileBase + i * 3u + 2u];
+-                    ++hiresTotal;
+-                }
+-        }
+-        tiles.used += hiresTotal * 3u;
+-    }
++    const uint32_t hiresTotal = hires ? tileTotal * scale * scale : 0u;
+ 
+     const VkCommandBuffer cb = command();
+     for (Stream *stream : {&states, &geoms, &tiles, &cluts})
+@@ -1148,7 +1164,7 @@ void GSVulkanBackend::VkState::closeBatch()
+ 
+     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, rasterPipeline);
+     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+-    uint32_t push[21] = {tileBase, tileTotal, hiresBase, hiresTotal, scale};
++    uint32_t push[21] = {tileBase, tileTotal, hiresTotal, 0u, scale};
+     if (hires)
+         shadowValidWords(push + 5);
+     vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+@@ -1465,7 +1481,7 @@ void GSVulkanBackend::VkState::draw(const GSPrimitiveBatch &batch)
+     const uint32_t entries = (box.x1 - box.x0 + 1u) * (box.y1 - box.y0 + 1u);
+     // Tile headers take at most three words per list word.
+     if (geoms.used == kMaxGeoms || states.used == kMaxStates || cluts.used == kClutSlots ||
+-        tiles.used + (4u + 3u * scale * scale) * (batchEntries + entries) > kTileWords)
++        tiles.used + 4u * (batchEntries + entries) > kTileWords)
+         waitIdle();
+ 
+     uint32_t clutBase = 0u;
+@@ -1646,6 +1662,7 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+             result.displayFbp = displayFrame1.fbp;
+             result.sourceFbp = selected1.fbp;
+             debugDumpFrame(result);
++            gsHiresPublish({}, 0u, 0u); // native only
+             return result;
+         }
+     }
+@@ -1654,10 +1671,96 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+     const GSDisplayReadOrigin &origin = valid1 ? origin1 : origin2;
+     result.width = valid1 ? width1 : width2;
+     result.height = valid1 ? height1 : height2;
++
++    // Pipelined present (the usual case: one display buffer, no preferred source): record the copies, submit them
++    // with a fence and return the previous present's frame, read back now that the GPU has long finished it. A
++    // synchronous present waits for all the drawing queued before it, then the GPU idles while this thread copies:
++    // presents took ~13 ms of this thread and limited the window to ~30 new frames a second at 2x resolution.
++    VkState &vk = *m_vk;
++    if (!(request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp) &&
++        isOneOf(displayFrame.psm, {GS_PSM_CT32, GS_PSM_CT24, GS_PSM_CT16, GS_PSM_CT16S}) && result.width != 0u &&
++        result.height != 0u && result.width <= kHostFrameWidth && result.height <= kHostFrameHeight)
++    {
++        vk.closeBatch();
++        vk.stageCpuDirty();
++        vk.syncScale();
++        const uint32_t slot = vk.lastSlot % 3u + 1u;
++        if (vk.slots[slot].pending) // not read back yet (cannot happen with 3 slots read one present later)
++            vkWaitForFences(vk.device, 1, &vk.slotFences[slot], VK_TRUE, UINT64_MAX);
++        const uint32_t base = slot * VkState::kSlotWords;
++        const VkCommandBuffer cb = vk.command();
++        vk.barrier(cb); // after all drawing submitted before, not only what this command buffer holds
++        PresentPushConstants pc{};
++        pc.basePtr = GSInternal::framePageBaseToBlock(displayFrame.fbp);
++        pc.fbw = displayFrame.fbw ? displayFrame.fbw : kHostFrameWidth / 64u;
++        pc.psm = displayFrame.psm;
++        pc.width = result.width;
++        pc.height = result.height;
++        pc.originX = origin.x;
++        pc.originY = origin.y;
++        pc.wordMask = static_cast<uint32_t>(vk.vramBufferSize / 4u - 1u);
++        pc.byteMask16 = static_cast<uint32_t>(vk.vramBufferSize - 2u);
++        pc.outOffset = base;
++        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipeline);
++        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.descriptorSet, 0, nullptr);
++        vkCmdPushConstants(cb, vk.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
++        vkCmdDispatch(cb, (kHostFrameWidth * kHostFrameHeight + 63u) / 64u, 1, 1);
++        VkState::PresentSlot meta{true, result.width, result.height, displayFrame.fbp, 0u, 0u};
++        if (vk.scale > 1u && (displayFrame.psm == GS_PSM_CT32 || displayFrame.psm == GS_PSM_CT24))
++        {
++            HiresPresentPush hp{};
++            hp.basePtr = pc.basePtr;
++            hp.fbw = pc.fbw;
++            hp.psm = pc.psm;
++            hp.width = result.width;
++            hp.height = result.height;
++            hp.originX = origin.x;
++            hp.originY = origin.y;
++            hp.scale = vk.scale;
++            vk.shadowValidWords(hp.valid);
++            hp.outOffset = base + VkState::kSlotNativeWords;
++            meta.hiresWidth = result.width * vk.scale;
++            meta.hiresHeight = result.height * vk.scale;
++            const uint32_t groups = (meta.hiresWidth * meta.hiresHeight + 63u) / 64u;
++            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.hiresPresentPipeline);
++            vkCmdPushConstants(cb, vk.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hp), &hp);
++            vkCmdDispatch(cb, std::min(groups, 65535u), (groups + 65534u) / 65535u, 1);
++        }
++        vk.barrier(cb);
++        vkResetFences(vk.device, 1, &vk.slotFences[slot]);
++        vk.submit(vk.slotFences[slot]);
++        vk.slots[slot] = meta;
++        const uint32_t ready = vk.lastSlot != 0u ? vk.lastSlot : slot; // the very first present reads its own
++        vk.lastSlot = slot;
++
++        vkWaitForFences(vk.device, 1, &vk.slotFences[ready], VK_TRUE, UINT64_MAX);
++        const VkState::PresentSlot done = vk.slots[ready];
++        vk.slots[ready].pending = false;
++        const uint8_t *src = static_cast<const uint8_t *>(vk.outMapped) + static_cast<size_t>(ready) * VkState::kSlotWords * 4u;
++        PresentationFrame frame{};
++        frame.width = done.width;
++        frame.height = done.height;
++        frame.pixels.assign(src, src + kHostFrameWidth * kHostFrameHeight * 4u);
++        // A black frame at fbp 0: the synchronous path looks for another source (the boot screens use that).
++        if (!(done.fbp == 0u && countNonBlackPixels(frame.pixels, frame.width, frame.height) == 0u))
++        {
++            if (done.hiresWidth != 0u)
++            {
++                gsHiresPublishCopy(src + VkState::kSlotNativeWords * 4u, done.hiresWidth, done.hiresHeight);
++            }
++            else
++                gsHiresPublish({}, 0u, 0u);
++            normalizePresentationAlpha(frame.pixels, frame.width, frame.height);
++            frame.displayFbp = done.fbp;
++            frame.sourceFbp = done.fbp;
++            debugDumpFrame(frame);
++            return frame;
++        }
++    }
++
+     GSFrameReg selected = displayFrame;
+     if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
+         return {};
+-    VkState &vk = *m_vk;
+     vk.syncScale(); // copySource closed the open batch
+     if (vk.scale > 1u && (selected.psm == GS_PSM_CT32 || selected.psm == GS_PSM_CT24) && result.width != 0u && result.height != 0u &&
+         result.width <= kHostFrameWidth && result.height <= kHostFrameHeight)
+@@ -1703,6 +1806,8 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+         }
+         gsHiresPublish(std::move(pixels), outW, outH);
+     }
++    else
++        gsHiresPublish({}, 0u, 0u); // this present is native only
+     normalizePresentationAlpha(result.pixels, result.width, result.height);
+     result.displayFbp = displayFrame.fbp;
+     result.sourceFbp = selected.fbp;
+@@ -1713,8 +1818,11 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+ #else // !PS2X_HAS_VULKAN — no Vulkan in this build: everything stays on the CPU backend.
+ 
+ uint32_t gsHiresScale() { return 1u; }
++bool gsHiresActive() { return false; }
++void gsHiresSetActive(bool) {}
+ void gsHiresSetScale(uint32_t) {}
+ void gsHiresPublish(std::vector<uint8_t> &&, uint32_t, uint32_t) {}
++void gsHiresPublishCopy(const uint8_t *, uint32_t, uint32_t) {}
+ bool gsHiresTake(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
+ 
+ struct GSVulkanBackend::VkState
+@@ -1765,6 +1873,7 @@ GSVulkanBackend::GSVulkanBackend()
+     // The GPU present whenever the GPU draws: faster than syncing VRAM back for the CPU present, and the internal
+     // resolution needs it.
+     m_gpuPresent = m_gpuPresent || m_gpuRaster;
++    gsHiresSetActive(m_gpuOk && m_gpuPresent);
+ #else
+     m_gpuRaster = false;
+ #endif
+diff --git a/ps2xRuntime/src/lib/gs/shaders/present_deswizzle.comp b/ps2xRuntime/src/lib/gs/shaders/present_deswizzle.comp
+index 5d5f34c..2266188 100755
+--- a/ps2xRuntime/src/lib/gs/shaders/present_deswizzle.comp
++++ b/ps2xRuntime/src/lib/gs/shaders/present_deswizzle.comp
+@@ -30,6 +30,7 @@ layout(push_constant) uniform PushConstants
+     uint flags;      // bit0: preserveAlpha
+     uint wordMask;   // vram word count - 1
+     uint byteMask16; // vram byte count - 2 (CT16 wrap)
++    uint outOffset;  // first word of the output slot
+ } pc;
+ 
+ const uint HOST_W = 640u;
+@@ -121,5 +122,5 @@ void main()
+         }
+     }
+ 
+-    outPixels[gid] = rgba;
++    outPixels[pc.outOffset + gid] = rgba;
+ }
+diff --git a/ps2xRuntime/src/lib/gs/shaders/present_hires.comp b/ps2xRuntime/src/lib/gs/shaders/present_hires.comp
+index 4fd75f7..c175c7c 100644
+--- a/ps2xRuntime/src/lib/gs/shaders/present_hires.comp
++++ b/ps2xRuntime/src/lib/gs/shaders/present_hires.comp
+@@ -32,6 +32,7 @@ layout(push_constant) uniform Push
+     uint flags;   // bit0: preserveAlpha
+     uint scale;
+     uint valid[16];
++    uint outOffset; // first word of the output slot
+ } pc;
+ 
+ const uint BlockTableC32[32] = uint[](
+@@ -71,5 +72,5 @@ void main()
+     else
+         word = vram[addr];
+     const uint alpha = ((pc.flags & 1u) != 0u && pc.psm == 0u) ? (word >> 24u) : 255u;
+-    outPixels[gid] = (word & 0x00FFFFFFu) | (alpha << 24u);
++    outPixels[pc.outOffset + gid] = (word & 0x00FFFFFFu) | (alpha << 24u);
+ }
+diff --git a/ps2xRuntime/src/lib/gs/shaders/raster_batch.comp b/ps2xRuntime/src/lib/gs/shaders/raster_batch.comp
+index 3d0e192..7d3737a 100644
+--- a/ps2xRuntime/src/lib/gs/shaders/raster_batch.comp
++++ b/ps2xRuntime/src/lib/gs/shaders/raster_batch.comp
+@@ -16,8 +16,8 @@ layout(push_constant) uniform Push
+ {
+     uint tileBase;  // first tile header word of the batch in tiles[]
+     uint tileCount;
+-    uint hiresBase; // then the high-resolution sample tiles (keys x | y << 16, 8x8 samples each), same dispatch
+-    uint hiresCount;
++    uint hiresCount; // then tileCount * scale^2 high-resolution tiles of 8x8 samples, same dispatch
++    uint unused;
+     uint scale;
+     uint valid[16]; // pages with a valid high-resolution copy
+ } pc;
+@@ -137,7 +137,11 @@ void main()
+     if (tile >= pc.tileCount + pc.hiresCount)
+         return;
+     const bool hires = tile >= pc.tileCount;
+-    const uint header = hires ? pc.hiresBase + (tile - pc.tileCount) * 3u : pc.tileBase + tile * 3u;
++    // A high-resolution tile is sample tile (sub % scale, sub / scale) of a native tile, with its list.
++    const uint samplesPerTile = pc.scale * pc.scale;
++    const uint native = hires ? (tile - pc.tileCount) / samplesPerTile : tile;
++    const uint sub = hires ? (tile - pc.tileCount) % samplesPerTile : 0u;
++    const uint header = pc.tileBase + native * 3u;
+     const uint key = tiles[header];
+     int x, y;
+     float px, py;
+@@ -148,8 +152,8 @@ void main()
+         gScale = pc.scale;
+         for (uint i = 0u; i < 16u; ++i)
+             gShadowValid[i] = pc.valid[i];
+-        const uint sx = (key & 0xFFFFu) * 8u + gl_LocalInvocationID.x;
+-        const uint sy = (key >> 16u) * 8u + gl_LocalInvocationID.y;
++        const uint sx = ((key & 0xFFu) * pc.scale + sub % pc.scale) * 8u + gl_LocalInvocationID.x;
++        const uint sy = ((key >> 8u) * pc.scale + sub / pc.scale) * 8u + gl_LocalInvocationID.y;
+         x = int(sx / pc.scale);
+         y = int(sy / pc.scale);
+         gSub = (sy % pc.scale) * pc.scale + (sx % pc.scale);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3feff41..9d29e56 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -549,8 +549,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     };
+     static std::vector<uint8_t> s_hires;
+     uint32_t hiresWidth = 0u, hiresHeight = 0u;
+-    if (gsHiresTake(s_hires, hiresWidth, hiresHeight) && hiresWidth != 0u && hiresHeight != 0u &&
+-        s_hires.size() >= static_cast<size_t>(hiresWidth) * hiresHeight * 4u)
++    const bool presented = gsHiresTake(s_hires, hiresWidth, hiresHeight);
++    if (gsHiresActive() && !presented && s_hasUploadedFrame)
++    {
++        // GPU presents run behind the GS queue: nothing new completed since the last window frame, keep showing it.
++        outWidth = s_lastWidth;
++        outHeight = s_lastHeight;
++        return;
++    }
++    if (presented && hiresWidth != 0u && hiresHeight != 0u && s_hires.size() >= static_cast<size_t>(hiresWidth) * hiresHeight * 4u)
+     {
+         fitTexture(hiresWidth, hiresHeight);
+         UpdateTexture(tex, s_hires.data());

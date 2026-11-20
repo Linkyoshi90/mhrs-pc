@@ -1,0 +1,224 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_hires.h b/ps2xRuntime/include/runtime/gs/gs_hires.h
+index a0523f7..057f496 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_hires.h
++++ b/ps2xRuntime/include/runtime/gs/gs_hires.h
+@@ -4,10 +4,12 @@
+ #include <cstdint>
+ #include <vector>
+ 
+-// Internal resolution of the Vulkan GS backend: PS2X_VK_SCALE=2..4 draws 32-bit frame buffers at that many times
+-// the native resolution as well, and each present publishes the display at that size (packed RGBA8, width x
+-// height) for the window. 1 (the default) or no Vulkan: nothing is published.
++// Internal resolution of the Vulkan GS backend: 2..4 draws 32-bit frame buffers at that many times the native
++// resolution as well, and each present publishes the display at that size (packed RGBA8, width x height) for the
++// window. 1 or no Vulkan: nothing is published. PS2X_VK_SCALE sets the start value (default 1); the controls menu
++// (F2) changes it while the game runs.
+ uint32_t gsHiresScale();
++void gsHiresSetScale(uint32_t scale);
+ void gsHiresPublish(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t height);
+ // The frame published since the last call, if any (pixels is swapped with it).
+ bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height);
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index 149803c..48d4fa6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -5,6 +5,7 @@
+ #include "runtime/gs/ps2_gs_memory.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <array>
+ #include <bitset>
+ #include <chrono>
+@@ -459,17 +460,28 @@ bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height
+     return true;
+ }
+ 
++namespace
++{
++    std::atomic<uint32_t> g_hiresScale{0}; // 0: not read from PS2X_VK_SCALE yet
++}
++
+ uint32_t gsHiresScale()
+ {
+-    static const uint32_t scale = []
++    uint32_t scale = g_hiresScale.load(std::memory_order_relaxed);
++    if (scale == 0u)
+     {
+         const char *env = std::getenv("PS2X_VK_SCALE");
+-        const int v = env ? std::atoi(env) : 1;
+-        return static_cast<uint32_t>(std::clamp(v, 1, 4));
+-    }();
++        scale = static_cast<uint32_t>(std::clamp(env ? std::atoi(env) : 1, 1, 4));
++        g_hiresScale.store(scale, std::memory_order_relaxed);
++    }
+     return scale;
+ }
+ 
++void gsHiresSetScale(uint32_t scale)
++{
++    g_hiresScale.store(std::clamp<uint32_t>(scale, 1u, 4u), std::memory_order_relaxed);
++}
++
+ // GS VRAM has two copies. The GPU rasterizes into a device-local buffer; the CPU backend
+ // (uploads, CLUT loads, primitives the shader does not cover, readbacks, CPU present)
+ // works on a host buffer. cpuDirty / gpuDirty say which copy of a page is newer (never
+@@ -510,7 +522,18 @@ struct GSVulkanBackend::VkState
+     // word. shadowValid: pages whose samples match their native words as drawn at high resolution (draws to 32-bit
+     // frame/z buffers write both); anything else that writes a page (CPU, 16-bit draws) makes it stale, and the
+     // next high-resolution draw into it first refills it from the native words.
+-    uint32_t scale = 1;
++    static constexpr uint32_t kMaxScale = 4u; // the buffers are sized for it, so the scale can change at any time
++    uint32_t maxScale = 1;                     // kMaxScale, or 1 without the high-resolution buffers/pipelines
++    uint32_t scale = 1;                        // the one in use (changes between batches, see syncScale)
++    void syncScale()
++    {
++        const uint32_t wanted = std::min(gsHiresScale(), maxScale);
++        if (wanted != scale)
++        {
++            scale = wanted;
++            shadowValid.reset(); // every page refills at the new size before it is drawn
++        }
++    }
+     VkBuffer shadowBuffer = VK_NULL_HANDLE;
+     PageSet shadowValid;
+     VkPipeline upsamplePipeline = VK_NULL_HANDLE;
+@@ -749,7 +772,7 @@ bool GSVulkanBackend::initVulkan()
+         !vk.createBuffer(vk.vramBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          false, vk.vramBuffer, nullptr) ||
+         !vk.createBuffer(VkState::kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, vk.uploadBuffer, &uploadMapped) ||
+-        !vk.createBuffer(kHostFrameWidth * kHostFrameHeight * 4u * gsHiresScale() * gsHiresScale(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, vk.outBuffer, &vk.outMapped) ||
++        !vk.createBuffer(kHostFrameWidth * kHostFrameHeight * 4u * VkState::kMaxScale * VkState::kMaxScale, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, vk.outBuffer, &vk.outMapped) ||
+         !vk.createStream(vk.states, sizeof(PipeState), VkState::kMaxStates) ||
+         !vk.createStream(vk.geoms, sizeof(Geom), VkState::kMaxGeoms) ||
+         !vk.createStream(vk.tiles, 4u, VkState::kTileWords) ||
+@@ -760,12 +783,11 @@ bool GSVulkanBackend::initVulkan()
+     }
+     vk.vramMapped = static_cast<uint8_t *>(vramMapped);
+     vk.uploadMapped = static_cast<uint8_t *>(uploadMapped);
+-    vk.scale = gsHiresScale();
+-    if (vk.scale > 1u &&
+-        !vk.createBuffer(vk.vramBufferSize * vk.scale * vk.scale, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false, vk.shadowBuffer, nullptr))
++    vk.maxScale = VkState::kMaxScale;
++    if (!vk.createBuffer(vk.vramBufferSize * vk.maxScale * vk.maxScale, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false, vk.shadowBuffer, nullptr))
+     {
+-        std::cerr << "[gs-vulkan] no memory for internal resolution x" << vk.scale << ", drawing at native resolution" << std::endl;
+-        vk.scale = 1u;
++        std::cerr << "[gs-vulkan] no memory for internal resolution, drawing at native resolution" << std::endl;
++        vk.maxScale = 1u;
+     }
+ 
+     // Bindings: 0 = VRAM, 1 = present output, 2 = CLUT snapshots, 3 = states, 4 = geoms,
+@@ -773,7 +795,7 @@ bool GSVulkanBackend::initVulkan()
+     // Shaders use subsets of these; the layout and set are shared.
+     constexpr uint32_t kBindings = 7u;
+     const VkBuffer bound[kBindings] = {vk.vramBuffer, vk.outBuffer, vk.cluts.dev, vk.states.dev, vk.geoms.dev, vk.tiles.dev,
+-                                       vk.scale > 1u ? vk.shadowBuffer : vk.vramBuffer};
++                                       vk.maxScale > 1u ? vk.shadowBuffer : vk.vramBuffer};
+     VkDescriptorSetLayoutBinding bindings[kBindings]{};
+     for (uint32_t i = 0; i < kBindings; ++i)
+     {
+@@ -851,13 +873,14 @@ bool GSVulkanBackend::initVulkan()
+     }
+     if (!supportedFeatures.shaderFloat64 || !createPipeline(kRasterBatchSpv, sizeof(kRasterBatchSpv), vk.rasterPipeline))
+         std::cerr << "[gs-vulkan] no raster pipeline (shaderFloat64: " << supportedFeatures.shaderFloat64 << "), drawing on CPU" << std::endl;
+-    if (vk.scale > 1u && (vk.rasterPipeline == VK_NULL_HANDLE ||
+-                          !createPipeline(kShadowUpsampleSpv, sizeof(kShadowUpsampleSpv), vk.upsamplePipeline) ||
+-                          !createPipeline(kPresentHiresSpv, sizeof(kPresentHiresSpv), vk.hiresPresentPipeline)))
++    if (vk.maxScale > 1u && (vk.rasterPipeline == VK_NULL_HANDLE ||
++                             !createPipeline(kShadowUpsampleSpv, sizeof(kShadowUpsampleSpv), vk.upsamplePipeline) ||
++                             !createPipeline(kPresentHiresSpv, sizeof(kPresentHiresSpv), vk.hiresPresentPipeline)))
+     {
+         std::cerr << "[gs-vulkan] internal resolution pipelines unavailable, drawing at native resolution" << std::endl;
+-        vk.scale = 1u;
++        vk.maxScale = 1u;
+     }
++    vk.syncScale();
+     if (vk.scale > 1u)
+         std::cerr << "[gs-vulkan] internal resolution x" << vk.scale << std::endl;
+ 
+@@ -1433,6 +1456,8 @@ void GSVulkanBackend::VkState::draw(const GSPrimitiveBatch &batch)
+     }
+     if (batchGeoms != 0u && info.key != batchKey)
+         closeBatch();
++    if (batchGeoms == 0u)
++        syncScale(); // the open batch's tile room was reserved for the scale it started with
+ 
+     // info.ok bounds the scissor, and with it the box, to 0..2047.
+     const TileBox box{static_cast<uint8_t>(g.minX >> 3), static_cast<uint8_t>(g.minY >> 3),
+@@ -1633,6 +1658,7 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+     if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
+         return {};
+     VkState &vk = *m_vk;
++    vk.syncScale(); // copySource closed the open batch
+     if (vk.scale > 1u && (selected.psm == GS_PSM_CT32 || selected.psm == GS_PSM_CT24) && result.width != 0u && result.height != 0u &&
+         result.width <= kHostFrameWidth && result.height <= kHostFrameHeight)
+     {
+@@ -1687,6 +1713,7 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+ #else // !PS2X_HAS_VULKAN — no Vulkan in this build: everything stays on the CPU backend.
+ 
+ uint32_t gsHiresScale() { return 1u; }
++void gsHiresSetScale(uint32_t) {}
+ void gsHiresPublish(std::vector<uint8_t> &&, uint32_t, uint32_t) {}
+ bool gsHiresTake(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
+ 
+@@ -1728,13 +1755,16 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &)
+ 
+ GSVulkanBackend::GSVulkanBackend()
+ {
+-    m_gpuPresent = std::getenv("PS2X_VK_PRESENT") != nullptr || gsHiresScale() > 1u; // the high-resolution display needs the GPU present
++    m_gpuPresent = std::getenv("PS2X_VK_PRESENT") != nullptr;
+     m_gpuRaster = std::getenv("PS2X_VK_RASTER") != nullptr;
+     m_gpuOk = initVulkan();
+     if (!m_gpuOk)
+         shutdownVulkan();
+ #if defined(PS2X_HAS_VULKAN)
+     m_gpuRaster = m_gpuRaster && m_gpuOk && m_vk->rasterPipeline != VK_NULL_HANDLE;
++    // The GPU present whenever the GPU draws: faster than syncing VRAM back for the CPU present, and the internal
++    // resolution needs it.
++    m_gpuPresent = m_gpuPresent || m_gpuRaster;
+ #else
+     m_gpuRaster = false;
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_menus.cpp b/ps2xRuntime/src/lib/ps2_menus.cpp
+index b9838db..eb98cef 100755
+--- a/ps2xRuntime/src/lib/ps2_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_menus.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/ps2_menus.h"
+ #include "runtime/ps2_pad_keys.h"
++#include "runtime/gs/gs_hires.h"
+ #include "ps2_host_backend.h"
+ 
+ #include <algorithm>
+@@ -69,6 +70,7 @@ namespace
+         RowSensitivity,
+         RowDeadzone,
+         RowInvertY,
++        RowResolution,
+         RowDefaults,
+         RowCount
+     };
+@@ -207,6 +209,11 @@ namespace
+             if (changed)
+                 controls.invertY = !controls.invertY;
+             break;
++        case RowResolution: // not a control: applies at once, nothing saved (PS2X_VK_SCALE sets the start value)
++            if (step != 0)
++                gsHiresSetScale(static_cast<uint32_t>(std::clamp(static_cast<int>(gsHiresScale()) + step, 1, 4)));
++            changed = false;
++            break;
+         case RowDefaults:
+             changed = enter;
+             if (changed)
+@@ -244,6 +251,10 @@ namespace
+                 case RowSensitivity: label = "Stick look sensitivity"; value = TextFormat("%.1f", controls->sensitivity); break;
+                 case RowDeadzone: label = "Gamepad dead zone"; value = TextFormat("%.2f", controls->deadzone); break;
+                 case RowInvertY: label = "Invert look up/down"; value = controls->invertY ? "on" : "off"; break;
++                case RowResolution:
++                    label = "Internal resolution";
++                    value = TextFormat("%ux (%ux%u)", gsHiresScale(), 640u * gsHiresScale(), 448u * gsHiresScale());
++                    break;
+                 case RowDefaults: label = "Reset all to defaults (Enter)"; break;
+                 }
+             DrawText(label.c_str(), p.x + 20, y, kFont, RAYWHITE);

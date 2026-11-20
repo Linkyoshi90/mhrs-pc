@@ -1,0 +1,222 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 9c43685..4fc6c01 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1449,11 +1449,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     size_t &chainHint = lastChainBytes[channelBase == 0x1000A000u ? 0 : channelBase == 0x10009000u ? 1 : 2];
+                     chainBuf.reserve(chainHint);
+ 
+-                    std::vector<std::array<uint32_t, 3>> mhrsSegs; // TEMP-DEBUG(mhrs): chain offset, EE address, bytes
+                     std::vector<VifSourceSpan> chainSpans;
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+-                        mhrsSegs.push_back({static_cast<uint32_t>(chainBuf.size()), srcAddr, qwCount * 16u}); // TEMP-DEBUG(mhrs)
+                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
+                         uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+                         const bool scratch = isScratchpad(srcAddr);
+@@ -1630,31 +1628,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     if (tagsProcessed >= kMaxChainTags)
+                         std::cerr << "[dma] chain at 0x" << std::hex << channelBase << " cut off after " << std::dec << tagsProcessed << " tags" << std::endl;
+ 
+-                    if (channelBase == 0x10009000u) // TEMP-DEBUG(mhrs): VIF1 chain carrying UNPACK V4-32 num=4 addr=4 with zero data
+-                    {
+-                        static int n = 0;
+-                        for (size_t off = 0; n < 40 && off + 68 <= chainBuf.size(); off += 4)
+-                        {
+-                            uint32_t code;
+-                            std::memcpy(&code, chainBuf.data() + off, 4);
+-                            if (code != 0x6C040004u)
+-                                continue;
+-                            bool zero = true;
+-                            for (size_t k = 4; k < 68; ++k)
+-                                zero = zero && chainBuf[off + k] == 0;
+-                            if (!zero)
+-                                continue;
+-                            ++n;
+-                            uint32_t ee = 0xFFFFFFFFu;
+-                            for (const auto &seg : mhrsSegs)
+-                                if (off + 4 >= seg[0] && off + 4 < seg[0] + seg[2])
+-                                    ee = seg[1] + static_cast<uint32_t>(off + 4 - seg[0]);
+-                            std::cerr << "[mhrs-zeromatrix] chainOff=0x" << std::hex << off << " matrixEE=0x" << ee << " segs:";
+-                            for (const auto &seg : mhrsSegs)
+-                                std::cerr << " " << seg[0] << "@" << seg[1] << "+" << seg[2];
+-                            std::cerr << std::dec << std::endl;
+-                        }
+-                    }
+                     if (channelBase == 0x1000A000u) { static int n = 0; if (n++ < 60) std::cerr << "[gif-chain] tags=" << tagsProcessed << " bytes=" << chainBuf.size() << std::hex << " lastTagUpper=0x" << lastTagUpper << " tagAddr=0x" << tagAddr << std::dec << std::endl; } // TEMP-DEBUG(mhrs)
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index edd2011..7db542c 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,3 +1,4 @@
++#include <smmintrin.h>
+ #include <algorithm> // TEMP-DEBUG(mhrs)
+ #include <iostream> // TEMP-DEBUG(mhrs)
+ #include <thread>
+@@ -338,15 +339,21 @@ void PS2Memory::flushUnpackBlocks() const
+                                {
+                                    const uint32_t dest = (b.start + i) & 0x3FFu;
+                                    const uint32_t run = std::min<uint32_t>(b.count - i, 1024u - dest);
++                                   // Inline qword copies: mingw's memcpy (msvcrt) took ~9% of the worker here.
++                                   __m128i *const to = reinterpret_cast<__m128i *>(vu1 + dest * 16u);
++                                   const __m128i *const from = reinterpret_cast<const __m128i *>(src + static_cast<size_t>(i) * 4u);
+                                    if (b.masks == SIZE_MAX)
+-                                       std::memcpy(vu1 + dest * 16u, src + static_cast<size_t>(i) * 4u, run * 16u);
++                                       for (uint32_t j = 0; j < run; ++j)
++                                           _mm_storeu_si128(to + j, _mm_loadu_si128(from + j));
+                                    else
+                                        for (uint32_t j = 0; j < run; ++j)
+                                        {
+-                                           const uint8_t lanes = masks[b.masks + i + j];
+-                                           for (uint32_t f = 0; f < 4u; ++f)
+-                                               if ((lanes >> f) & 1u)
+-                                                   std::memcpy(vu1 + (dest + j) * 16u + f * 4u, src + static_cast<size_t>(i + j) * 4u + f, 4u);
++                                           const uint32_t lanes = masks[b.masks + i + j];
++                                           const __m128i sel = _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(static_cast<int32_t>(lanes)), _mm_setr_epi32(1, 2, 4, 8)),
++                                                                               _mm_setr_epi32(1, 2, 4, 8));
++                                           const __m128 merged = _mm_blendv_ps(_mm_loadu_ps(reinterpret_cast<const float *>(to + j)),
++                                                                               _mm_loadu_ps(reinterpret_cast<const float *>(from + j)), _mm_castsi128_ps(sel));
++                                           _mm_storeu_ps(reinterpret_cast<float *>(to + j), merged);
+                                        }
+                                    i += run;
+                                }
+@@ -580,6 +587,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 {
+                     postGifVu([this, destAddr, code = std::vector<uint8_t>(data + pos, data + pos + copyBytes)]
+                               {
++                                  if (std::memcmp(m_vu1Code + destAddr, code.data(), code.size()) == 0)
++                                      return; // the same words again: the decoded image stays valid
+                                   std::memcpy(m_vu1Code + destAddr, code.data(), code.size());
+                                   markVU1CodeModified(); });
+                 }
+@@ -972,69 +981,94 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     const uint8_t *src = data + pos;
+                     const bool addRow = (vl != 3u || vn != 3u) && (mode == 1u || mode == 2u);
+                     const uint32_t count = static_cast<uint32_t>(components > 4 ? 4 : components);
++                    // Per mask cycle, as lane masks for blends: lanes taken from the data (mask 0 where the format
++                    // supplies the lane), from ROW (1), from COL (2). Other lanes stay 0 (not written: laneMask).
++                    __m128i dataSel[4], rowSel[4], colSel[4], colVec[4];
++                    for (uint32_t c = 0; c < usedCycles; ++c)
++                    {
++                        alignas(16) int32_t dl[4], rl[4], cl4[4];
++                        for (uint32_t field = 0; field < 4u; ++field)
++                        {
++                            const uint32_t spec = specs[c][field];
++                            dl[field] = spec == 0u && ((sourceLanes >> field) & 1u) != 0u ? -1 : 0;
++                            rl[field] = spec == 1u ? -1 : 0;
++                            cl4[field] = spec == 2u ? -1 : 0;
++                        }
++                        dataSel[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(dl));
++                        rowSel[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(rl));
++                        colSel[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(cl4));
++                        colVec[c] = _mm_set1_epi32(static_cast<int32_t>(vif1_regs.col[c]));
++                    }
++                    __m128i rowVec = _mm_loadu_si128(reinterpret_cast<const __m128i *>(vif1_regs.row));
++                    const auto blend = [](__m128i d, __m128i v, __m128i sel)
++                    { return _mm_castps_si128(_mm_blendv_ps(_mm_castsi128_ps(d), _mm_castsi128_ps(v), _mm_castsi128_ps(sel))); };
++                    const __m128i countLanes = _mm_cmpgt_epi32(_mm_set1_epi32(static_cast<int32_t>(count)), _mm_setr_epi32(0, 1, 2, 3));
++                    const uint8_t *const dataEnd = data + sizeBytes;
+                     uint32_t cyclePos = 0;
+                     for (uint32_t i = 0; i < writeVectorCount; ++i, src += bytesPerVector)
+                     {
+-                        uint32_t d[4] = {0u, 0u, 0u, 0u};
++                        __m128i d;
+                         if (vl == 0u)
+                         {
+-                            for (uint32_t c = 0; c < count; ++c)
+-                                std::memcpy(&d[c], src + c * 4u, 4u);
++                            if (dataEnd - src >= 16)
++                                d = _mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(src)), countLanes);
++                            else
++                            {
++                                alignas(16) uint32_t raw[4] = {0u, 0u, 0u, 0u};
++                                std::memcpy(raw, src, count * 4u);
++                                d = _mm_load_si128(reinterpret_cast<const __m128i *>(raw));
++                            }
+                         }
+                         else if (vl == 1u)
+                         {
+-                            for (uint32_t c = 0; c < count; ++c)
++                            __m128i r;
++                            if (dataEnd - src >= 8)
++                                r = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src));
++                            else
+                             {
+-                                uint16_t raw;
+-                                std::memcpy(&raw, src + c * 2u, 2u);
+-                                d[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
++                                uint16_t raw[4] = {0u, 0u, 0u, 0u};
++                                std::memcpy(raw, src, count * 2u);
++                                r = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(raw));
+                             }
++                            d = _mm_and_si128(zeroExtend ? _mm_cvtepu16_epi32(r) : _mm_cvtepi16_epi32(r), countLanes);
+                         }
+                         else if (vl == 2u)
+                         {
+-                            for (uint32_t c = 0; c < count; ++c)
+-                                d[c] = zeroExtend ? src[c] : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(src[c])));
++                            uint32_t raw = 0u;
++                            if (dataEnd - src >= 4)
++                                std::memcpy(&raw, src, 4u);
++                            else
++                                std::memcpy(&raw, src, count);
++                            const __m128i r = _mm_cvtsi32_si128(static_cast<int32_t>(raw));
++                            d = _mm_and_si128(zeroExtend ? _mm_cvtepu8_epi32(r) : _mm_cvtepi8_epi32(r), countLanes);
+                         }
+                         else
+                         {
+                             uint16_t packed;
+                             std::memcpy(&packed, src, 2u);
+-                            d[0] = packed & 0x1Fu;
+-                            d[1] = (packed >> 5) & 0x1Fu;
+-                            d[2] = (packed >> 10) & 0x1Fu;
+-                            d[3] = (packed >> 15) & 0x01u;
++                            d = _mm_setr_epi32(packed & 0x1F, (packed >> 5) & 0x1F, (packed >> 10) & 0x1F, (packed >> 15) & 0x1);
+                         }
+                         if (components == 1)
+-                            d[1] = d[2] = d[3] = d[0];
++                            d = _mm_shuffle_epi32(d, 0);
+ 
+                         const uint32_t maskCycle = cyclePos > 3u ? 3u : cyclePos;
+-                        uint32_t *v = m_unpackData.data() + dataAt + static_cast<size_t>(i) * 4u;
+-                        for (uint32_t field = 0; field < 4u; ++field)
++                        if (addRow)
+                         {
+-                            const uint32_t spec = specs[maskCycle][field];
+-                            if (spec == 0u)
+-                            {
+-                                if (((sourceLanes >> field) & 1u) == 0u)
+-                                    continue;
+-                                uint32_t value = d[field];
+-                                if (addRow)
+-                                {
+-                                    value += vif1_regs.row[field];
+-                                    if (mode == 2u)
+-                                        vif1_regs.row[field] = value;
+-                                }
+-                                v[field] = value;
+-                            }
+-                            else if (spec == 1u)
+-                                v[field] = vif1_regs.row[field];
+-                            else if (spec == 2u)
+-                                v[field] = vif1_regs.col[maskCycle];
++                            d = _mm_add_epi32(d, rowVec);
++                            if (mode == 2u)
++                                rowVec = blend(rowVec, d, dataSel[maskCycle]);
+                         }
++                        __m128i v = _mm_and_si128(d, dataSel[maskCycle]);
++                        v = blend(v, rowVec, rowSel[maskCycle]);
++                        v = blend(v, colVec[maskCycle], colSel[maskCycle]);
++                        _mm_storeu_si128(reinterpret_cast<__m128i *>(m_unpackData.data() + dataAt + static_cast<size_t>(i) * 4u), v);
+                         if (!allLanes)
+                             m_unpackMasks[masksAt + i] = laneMask[maskCycle];
+                         if (++cyclePos == wl)
+                             cyclePos = 0;
+                     }
++                    if (addRow && mode == 2u)
++                        _mm_storeu_si128(reinterpret_cast<__m128i *>(vif1_regs.row), rowVec);
+                 }
+                 else
+                 {

@@ -1,0 +1,303 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_lean.h b/ps2xRuntime/include/runtime/ps2_vu1_lean.h
+index 6b79678..bb0da4f 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_lean.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_lean.h
+@@ -180,6 +180,10 @@ struct VU1Interpreter::LeanAccess
+         return CompiledAccess::kEnded;
+     }
+ 
++    // ---- native loop kernels (called by generated nodes, see vu1_lean_gen.cpp transformClipHead) ----
++
++    static uint64_t transformClipLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd);
++
+     // ---- used by the generator: the interpreter's timing on a scratch VU1Interpreter ----
+ 
+     // Timing state relative to a cycle: everything that decides when later pairs issue and when results land.
+@@ -359,4 +363,207 @@ struct VU1Interpreter::LeanAccess
+     static bool recordsBranchBackup(const DecodedInstructionPair &p) { return viWrite(p) != 0u && p.lowerUsage.delaysNextBranchRead; }
+ };
+ 
++// The game's vertex transform/clip loop (about 30% of all VU1 cycles), run natively. The generated code calls
++// it at the loop's head node in its steady timing state (node X: 13 pairs, then node Y at +0xD8: 2 pairs, 15
++// cycles a pass on the unclipped path; the generator checks the words, issue cycles and chain-start saves):
++//   0 MULq.xyz vf14, vf11               LQI vf07, (vi03++)      8 MADDw vf08, vf04, vf07w   FCAND vi01, 0x3FFFF
++//   1 MINIz.w vf21, vf21, vf20z          LQI vf12, (vi05++)      9 FTOI4 vf13, vf10          (Q lands)
++//   2 CLIP vf08, vf08w                   DIV Q, vf00w, vf08w    10 MULAi.w ACC, vf00         SQI vf14, (vi06++)
++//   3 MUL.xyz vf09, vf08, vf05                                  11 MSUB.w vf10, vf20, vf22   IBEQ vi01, vi00 -> Y
++//   4 MULAx ACC, vf01, vf07x                                    12 MAXx.w vf21, vf08, vf20x  SQI vf12, (vi06++)
++//   5 SUBx.w vf22, vf21, vf20x                                  13 ADDA.xyz ACC, vf06, vf00  IBGTZ vi02 -> X
++//   6 MADDAy ACC, vf02, vf07y            LQI vf11, (vi04++)     14 MADDq.xyz vf10, vf09      SQI vf13, (vi06++)
++//   7 MADDAz ACC, vf03, vf07z            ISUBIU vi02, vi02, 1
++// Values are computed as the lean code does (relaxed floats: clamped operands, flush-to-zero from run()). A pass
++// runs here only if it takes the unclipped path; at least 2 passes and
++// their cycles are left to the lean code. The state left behind is the lean code's at the head after the
++// same passes: registers, memory, PATH1 progress, clip flag, Q, the last two passes' MAC/status flag entries
++// and chain starts, the VI branch backup. Not reproduced: the sticky status bits (0xFC0) of the flag entries
++// of passes before the last two. Returns the base cycle of the head after the passes run here.
++inline uint64_t VU1Interpreter::LeanAccess::transformClipLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd)
++{
++    using namespace ps2_vu1_simd;
++    constexpr uint64_t kPass = 15u;
++    static const bool enabled = []
++    {
++        const char *value = std::getenv("PS2X_VU1_KERNELS");
++        return value == nullptr || *value != '0';
++    }();
++    VU1State &s = vu.m_state;
++    if (!enabled || static_cast<int16_t>(s.vi[2]) < 3 || base + 4u * kPass > budgetEnd || vu.m_stopRequested ||
++        vu.m_fdiv.valid || (vu.m_vfWriteMask | vu.m_viWriteMask) != 0u || vu.m_activeVuDataSize != 0x4000u ||
++        (vu.m_viBranchBackupValid && vu.m_viBranchBackupReg != 6u))
++        return base;
++    // The previous pass's MSUB/MADDq flag entries land by this pass's FCAND, before anything here reads flags.
++    vu.m_cycle = base + 8u;
++    vu.syncFlags();
++    if (vu.m_flagCount != 0u)
++    {
++        vu.m_cycle = base - 1u;
++        return base;
++    }
++
++    uint8_t *const mem = vu.m_activeVuData;
++    const auto cl = [](__m128 v) VU1_LAMBDA_ALWAYS_INLINE { return clampOperands(v); };
++#define VU1K_BC(v, i) _mm_shuffle_ps((v), (v), _MM_SHUFFLE(i, i, i, i))
++#define VU1K_LANE(v, i) _mm_cvtss_f32(VU1K_BC(v, i))
++    const auto load = [mem](int32_t vi) VU1_LAMBDA_ALWAYS_INLINE
++    { return _mm_loadu_ps(reinterpret_cast<const float *>(mem + ((static_cast<uint32_t>(static_cast<uint16_t>(vi)) * 16u) & 0x3FFFu))); };
++    const auto inc = [](int32_t vi) VU1_LAMBDA_ALWAYS_INLINE { return static_cast<int32_t>(static_cast<int16_t>(vi + 1)); };
++    const auto blendXyz = [](__m128 d, __m128 v) VU1_LAMBDA_ALWAYS_INLINE { return _mm_blend_ps(d, v, 0x7); };
++    const auto blendW = [](__m128 d, __m128 v) VU1_LAMBDA_ALWAYS_INLINE { return _mm_blend_ps(d, v, 0x8); };
++
++    const __m128 vf00 = _mm_loadu_ps(s.vf[0]), vf01 = _mm_loadu_ps(s.vf[1]), vf02 = _mm_loadu_ps(s.vf[2]),
++                 vf03 = _mm_loadu_ps(s.vf[3]), vf04 = _mm_loadu_ps(s.vf[4]), vf05 = _mm_loadu_ps(s.vf[5]),
++                 vf06 = _mm_loadu_ps(s.vf[6]), vf20 = _mm_loadu_ps(s.vf[20]);
++    const __m128 vf20n = normalizeOperands(vf20);
++    const __m128 iv = _mm_set1_ps(s.i);
++    __m128 vf07 = _mm_loadu_ps(s.vf[7]), vf08 = _mm_loadu_ps(s.vf[8]), vf09 = _mm_loadu_ps(s.vf[9]),
++           vf10 = _mm_loadu_ps(s.vf[10]), vf11 = _mm_loadu_ps(s.vf[11]), vf12 = _mm_loadu_ps(s.vf[12]),
++           vf13 = _mm_loadu_ps(s.vf[13]), vf14 = _mm_loadu_ps(s.vf[14]), vf21 = _mm_loadu_ps(s.vf[21]),
++           vf22 = _mm_loadu_ps(s.vf[22]), acc = _mm_loadu_ps(s.acc);
++    float q = s.q;
++    uint32_t clip = vu.m_workingClip;
++    int32_t vi01 = s.vi[1], vi02 = s.vi[2], vi03 = s.vi[3], vi04 = s.vi[4], vi05 = s.vi[5], vi06 = s.vi[6];
++
++    // Operands of the flag-writing FMACs and the chain-start values of the last two passes ([1] = last).
++    struct Last
++    {
++        __m128 accMsub, vf22, accMaddq, vf09, vf10Before, vf21Before;
++        float q;
++    } last[2]{};
++    uint32_t di = 0u, diSticky = 0u; // the last DIV's D/I status bits, and all of them
++    uint64_t passes = 0;
++    for (uint64_t c = base; static_cast<int16_t>(vi02) >= 3 && c + 4u * kPass <= budgetEnd; c += kPass, ++passes)
++    {
++        // 0..8 into temporaries: a pass that takes the clipped path or divides by zero is left to the lean code.
++        const __m128 n14 = blendXyz(vf14, _mm_mul_ps(cl(vf11), cl(_mm_set1_ps(q))));         // 0 MULq.xyz
++        const __m128 n07 = load(vi03);                                                              //   LQI
++        const __m128 vf21n = normalizeOperands(vf21);                                               // 1 MINIz.w
++        __m128 n21 = blendW(vf21, _mm_min_ps(vf21n, _mm_set1_ps(VU1K_LANE(vf20n, 2))));
++        const __m128 n12 = load(vi05);                                                              //   LQI
++        uint32_t clipBits = 0;                                                                      // 2 CLIP
++        {
++            uint32_t w;
++            std::memcpy(&w, reinterpret_cast<const char *>(&vf08) + 12, 4);
++            const int32_t limit = (w & 0x7F800000u) != 0u ? static_cast<int32_t>(w & 0x7FFFFFFFu) : 0x007FFFFF;
++            alignas(16) int32_t b[4];
++            _mm_store_si128(reinterpret_cast<__m128i *>(b), _mm_castps_si128(vf08));
++            for (int k = 0; k < 3; ++k)
++            {
++                clipBits |= (b[k] > limit ? 1u : 0u) << (2 * k);
++                clipBits |= (static_cast<int32_t>(static_cast<uint32_t>(b[k]) ^ 0x80000000u) > limit ? 1u : 0u) << (2 * k + 1);
++            }
++        }
++        const uint32_t nClip = ((clip << 6) | clipBits) & 0xFFFFFFu;
++        const float num = normalizeOperand(VU1K_LANE(vf00, 3)), den = normalizeOperand(VU1K_LANE(vf08, 3)); //   DIV
++        uint32_t nDi = 0u, ignored = 0u;
++        float nq;
++        if (den == 0.0f)
++        {
++            nDi = num == 0.0f ? 0x10u : 0x20u;
++            nq = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
++        }
++        else
++            nq = num / den;
++        nq = vu.normalizeResult(vu.normalizeResult(nq, ignored), ignored);
++        const __m128 n09 = blendXyz(vf09, _mm_mul_ps(cl(vf08), cl(vf05)));                  // 3 MUL.xyz
++        __m128 nacc = _mm_mul_ps(cl(vf01), cl(VU1K_BC(n07, 0)));                                        // 4 MULAx
++        const __m128 n22 = blendW(vf22, _mm_sub_ps(cl(n21), cl(VU1K_BC(vf20, 0))));              // 5 SUBx.w
++        nacc = _mm_add_ps(cl(nacc), _mm_mul_ps(cl(vf02), cl(VU1K_BC(n07, 1))));                         // 6 MADDAy
++        const __m128 n11 = load(vi04);                                                              //   LQI
++        nacc = _mm_add_ps(cl(nacc), _mm_mul_ps(cl(vf03), cl(VU1K_BC(n07, 2))));                         // 7 MADDAz
++        const __m128 n08 = _mm_add_ps(cl(nacc), _mm_mul_ps(cl(vf04), cl(VU1K_BC(n07, 3))));             // 8 MADDw
++        if ((nClip & 0x3FFFFu) != 0u)                                                               //   FCAND
++            break;
++
++        // The pass runs here: commit.
++        vf14 = n14, vf07 = n07, vf21 = n21, vf12 = n12, vf09 = n09, vf22 = n22, vf11 = n11, vf08 = n08;
++        clip = nClip;
++        vi03 = inc(vi03), vi05 = inc(vi05), vi04 = inc(vi04);
++        vi02 = static_cast<int16_t>(vi02 - 1);
++        vi01 = 0;
++        q = nq;                                                                                     // 9 Q lands
++        di = nDi, diSticky |= nDi;
++        {                                                                                           //   FTOI4
++            // vuFloatToInt(x, 16): x * 16 is exact in float (or overflows), truncated, saturated at both ends
++            // (cvtt gives INT32_MIN for anything out of range; at or above 2^31 it must be INT32_MAX).
++            const __m128 scaled = _mm_mul_ps(normalizeOperands(vf10), _mm_set1_ps(16.0f));
++            const __m128i t = _mm_cvttps_epi32(scaled);
++            const __m128 high = _mm_cmpge_ps(scaled, _mm_set1_ps(2147483648.0f));
++            vf13 = _mm_blendv_ps(_mm_castsi128_ps(t), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)), high);
++        }
++        acc = blendW(nacc, _mm_mul_ps(cl(vf00), cl(iv)));                                   // 10 MULAi.w
++        if (vu.m_xgkick.active)
++            kickTo(vu, c + 10u);
++        _mm_storeu_ps(reinterpret_cast<float *>(mem + ((static_cast<uint32_t>(static_cast<uint16_t>(vi06)) * 16u) & 0x3FFFu)), vf14);
++        vi06 = inc(vi06);
++        last[0] = last[1];
++        last[1].accMsub = acc, last[1].vf22 = vf22, last[1].vf10Before = vf10, last[1].vf21Before = vf21;
++        vf10 = blendW(vf10, _mm_sub_ps(cl(acc), _mm_mul_ps(cl(vf20), cl(vf22))));           // 11 MSUB.w
++        vf21 = blendW(vf21, _mm_max_ps(normalizeOperands(vf08), _mm_set1_ps(VU1K_LANE(vf20n, 0)))); // 12 MAXx.w
++        if (vu.m_xgkick.active)
++            kickTo(vu, c + 12u);
++        _mm_storeu_ps(reinterpret_cast<float *>(mem + ((static_cast<uint32_t>(static_cast<uint16_t>(vi06)) * 16u) & 0x3FFFu)), vf12);
++        vi06 = inc(vi06);
++        acc = blendXyz(acc, _mm_add_ps(cl(vf06), cl(vf00)));                                 // 13 ADDA.xyz
++        last[1].accMaddq = acc, last[1].vf09 = vf09, last[1].q = q;
++        vf10 = blendXyz(vf10, _mm_add_ps(cl(acc), _mm_mul_ps(cl(vf09), cl(_mm_set1_ps(q))))); // 14 MADDq.xyz
++        if (vu.m_xgkick.active)
++            kickTo(vu, c + 14u);
++        _mm_storeu_ps(reinterpret_cast<float *>(mem + ((static_cast<uint32_t>(static_cast<uint16_t>(vi06)) * 16u) & 0x3FFFu)), vf13);
++        vi06 = inc(vi06);
++    }
++    if (passes == 0u)
++    {
++        vu.m_cycle = base - 1u;
++        return base;
++    }
++    const uint64_t head = base + passes * kPass;
++
++    // The flag entries of the last two passes as the lean code queues them: the one before lands at the last
++    // pass's FCAND, the last one's are still in the pipeline at the head.
++    static constexpr DecodedInstructionPair kMsub = decodePair(0x8000033Cu, 0x36A2ADu, Unit::VU1);
++    static constexpr DecodedInstructionPair kMaddq = decodePair(0x8000033Cu, 0x1C04AA1u, Unit::VU1);
++    const auto queueFlags = [&vu, &s](const Last &l, uint64_t passBase)
++    {
++        _mm_storeu_ps(s.acc, l.accMsub);
++        _mm_storeu_ps(s.vf[22], l.vf22);
++        vu.m_cycle = passBase + 11u;
++        vu.execFmacInline<true, false>(kMsub);
++        _mm_storeu_ps(s.acc, l.accMaddq);
++        _mm_storeu_ps(s.vf[9], l.vf09);
++        s.q = l.q;
++        vu.m_cycle = passBase + 14u;
++        vu.execFmacInline<true, false>(kMaddq);
++    };
++    if (passes >= 2u)
++    {
++        queueFlags(last[0], head - 2u * kPass);
++        vu.m_cycle = head - kPass + 8u;
++        vu.syncFlags();
++    }
++    queueFlags(last[1], head - kPass);
++
++    _mm_storeu_ps(s.vf[7], vf07), _mm_storeu_ps(s.vf[8], vf08), _mm_storeu_ps(s.vf[9], vf09);
++    _mm_storeu_ps(s.vf[10], vf10), _mm_storeu_ps(s.vf[11], vf11), _mm_storeu_ps(s.vf[12], vf12);
++    _mm_storeu_ps(s.vf[13], vf13), _mm_storeu_ps(s.vf[14], vf14), _mm_storeu_ps(s.vf[21], vf21);
++    _mm_storeu_ps(s.vf[22], vf22), _mm_storeu_ps(s.acc, acc);
++    s.q = q;
++    s.vi[1] = vi01, s.vi[2] = vi02, s.vi[3] = vi03, s.vi[4] = vi04, s.vi[5] = vi05, s.vi[6] = vi06;
++    vu.m_workingClip = clip;
++    s.clip = clip;
++    s.status = (s.status & 0xFCFu) | di | (diSticky << 6); // each pass's DIV landed: current D/I, sticky ones
++    // Chain starts the lean code keeps (the lane before the write): MSUB.w and MADDq.xyz on vf10 (MSUB leaves xyz
++    // alone, so both are vf10 before the MSUB), MAXx.w on vf21.
++    _mm_storeu_ps(vu.m_vfChainStart[10].data(), last[1].vf10Before);
++    vu.m_vfChainStart[21][3] = VU1K_LANE(last[1].vf21Before, 3);
++    if (vu.m_viBranchBackupValid)
++        vu.m_viBranchBackupValue = static_cast<int16_t>(vi06 - 1);
++    vu.m_cycle = head - 1u;
++    return head;
++#undef VU1K_BC
++#undef VU1K_LANE
++}
++
+ #endif
+diff --git a/ps2xRuntime/tools/vu1_lean_gen.cpp b/ps2xRuntime/tools/vu1_lean_gen.cpp
+index 36cca95..3f3d308 100644
+--- a/ps2xRuntime/tools/vu1_lean_gen.cpp
++++ b/ps2xRuntime/tools/vu1_lean_gen.cpp
+@@ -127,6 +127,7 @@ namespace
+     };
+ 
+     GS g_gs;
++    size_t g_kernelNodes = 0; // nodes that call a native loop kernel
+     VU1Interpreter g_sim;
+     std::array<uint8_t, 0x4000> g_simData{};
+ 
+@@ -511,6 +512,45 @@ namespace
+         return os.str();
+     }
+ 
++    // The head node of the game's vertex transform/clip loop in its steady timing state, which the native kernel
++    // LeanAccess::transformClipLoop (ps2_vu1_lean.h) runs: node n has the loop's first 13 pairs at cycles 0..12
++    // (Q lands at 9) and on IBEQ taken goes to the node at +0xD8 (2 pairs at 0, 1), which loops back to n. The
++    // chain-start saves must be the ones the kernel rebuilds.
++    bool transformClipHead(const Program &program, size_t n)
++    {
++        static constexpr uint32_t kWords[15][2] = {
++            {0x81E71B7Cu, 0x01C05B9Cu}, {0x81EC2B7Cu, 0x0034AD56u}, {0x81E803BCu, 0x01C841FFu}, {0x8000033Cu, 0x01C5426Au},
++            {0x8000033Cu, 0x01E709BCu}, {0x8000033Cu, 0x0034AD84u}, {0x81EB237Cu, 0x01E710BDu}, {0x12021001u, 0x01E718BEu},
++            {0x2403FFFFu, 0x01E7220Bu}, {0x8000033Cu, 0x01ED517Du}, {0x81E6737Du, 0x002001FEu}, {0x5001000Fu, 0x0036A2ADu},
++            {0x81E6637Du, 0x00344550u}, {0x5A0017E4u, 0x01C032BCu}, {0x81E66B7Du, 0x01C04AA1u}};
++        const Node &x = program.nodes[n];
++        const auto pairsMatch = [](const Node &node, size_t first, size_t count, const std::vector<std::pair<uint8_t, size_t>> &saves)
++        {
++            if (node.pairs.size() != count || !node.exitCommits.empty())
++                return false;
++            for (size_t i = 0; i < count; ++i)
++            {
++                const PairCode &p = node.pairs[i];
++                uint8_t save = 0;
++                for (const auto &[lanes, at] : saves)
++                    if (at == i)
++                        save = lanes;
++                const std::vector<uint32_t> commits = (first == 0u && i == 9u) ? std::vector<uint32_t>{9u} : std::vector<uint32_t>{};
++                if (p.pc != node.pc + 8u * i || p.lower != kWords[first + i][0] || p.upper != kWords[first + i][1] ||
++                    p.issue != i || p.from != i || p.commits != commits || p.kick || p.saveUpper != save || p.saveLower != 0u ||
++                    p.viPending || p.saveVi)
++                    return false;
++            }
++            return true;
++        };
++        if (!pairsMatch(x, 0, 13, {{1u, 11u}, {1u, 12u}}) || x.exit.kind != Exit::Cond || x.exit.rel != 13u ||
++            x.exit.pc != x.pc + 0xD8u || x.exit.targets.empty() || x.exit.targets[0] < 0)
++            return false;
++        const Node &y = program.nodes[static_cast<size_t>(x.exit.targets[0])];
++        return y.pc == x.pc + 0xD8u && pairsMatch(y, 13, 2, {{14u, 1u}}) && y.exit.kind == Exit::Cond && y.exit.rel == 2u &&
++               y.exit.pc == x.pc && !y.exit.targets.empty() && y.exit.targets[0] == static_cast<int>(n);
++    }
++
+     void emitProgram(std::ostream &os, const Program &program, size_t index)
+     {
+         os << "namespace p" << index << "\n{\n";
+@@ -520,6 +560,11 @@ namespace
+         {
+             const Node &node = program.nodes[n];
+             os << "\n// " << hex(node.pc) << "\nVU1_NO_STACK_PROTECTOR int n" << n << "(VU &vu, uint64_t base, uint64_t budgetEnd)\n{\n";
++            if (transformClipHead(program, n))
++            {
++                os << "    base = L::transformClipLoop(vu, base, budgetEnd);\n";
++                ++g_kernelNodes;
++            }
+             emitPending(os, "kEntry", node.timing);
+             os << "    if (!L::enter(vu, base, budgetEnd, " << node.lastIssue << "u))\n        "
+                << leaveCall("kEntry", node.timing, "base", hex(node.pc)) << "\n";
+@@ -730,7 +775,7 @@ int main(int argc, char **argv)
+             out << "    {" << hex(entry) << ", static_cast<uint32_t>(std::size(p" << i << "::kPairs) / 3u), p" << i << "::kPairs, &p" << i << "::n0},\n";
+         out << "};\nstruct Register\n{\n    Register() { VU1Interpreter::registerLeanPrograms(kPrograms, std::size(kPrograms)); }\n} registerPrograms;\n}\n";
+     }
+-    std::printf("%zu entries -> %zu programs, %zu nodes, %zu pairs (%zu nodes leave to the interpreter) in %zu files\n", compiled,
+-                programs.size(), nodes, pairs, leaves, files);
++    std::printf("%zu entries -> %zu programs, %zu nodes, %zu pairs (%zu nodes leave to the interpreter, %zu call a loop kernel) in %zu files\n",
++                compiled, programs.size(), nodes, pairs, leaves, g_kernelNodes, files);
+     return 0;
+ }

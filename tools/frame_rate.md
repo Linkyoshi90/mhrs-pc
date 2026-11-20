@@ -74,11 +74,14 @@ set PS2_VU1_DUMP_DIR=build\vu1\dumps
 
 Only starts that have no lean program yet are recorded (`ps2recomp-vu1-dump-uncovered`), so a covered area
 writes nothing. Before that the capture wrote every code image the game composes, tens of thousands for about
-a thousand programs, and those file writes made new areas stutter. Afterwards run `make vu1`, copy `build/vu1/src/vu1_lean_*.cpp` into the
-PS2Recomp tree's `ps2xRuntime/src/runner/` and rebuild. If the number of programs `ps2x_vu1_lean_gen` reports
-did not grow, nothing new was captured. 1131 programs are known so far: 276 from the boot, the intro and the
-first room of mission 1, 465 from a play session up to the fire-extinguishing part, and 390 from one that went
-on to the deck (the Zero crashing into the AA gun).
+a thousand programs, and those file writes made new areas stutter. Afterwards run `make vu1` with
+`PS2RECOMP` set to the patched PS2Recomp tree (an older generator writes slower code), replace the
+`vu1_lean_*.cpp` files in that tree's `ps2xRuntime/src/runner/` with those from `build/vu1/src` (remove the old
+ones first: the build picks up every file of that name) and rebuild. If the number of programs
+`ps2x_vu1_lean_gen` reports did not grow, nothing new was captured. 2186 programs are known so far (2026-11-19):
+276 from the boot, the intro and the first room of mission 1, 465 from a play session up to the
+fire-extinguishing part, 390 from one that went on to the deck (the Zero crashing into the AA gun), and the
+rest from later play sessions.
 
 On deck a frame needs 10 to 14 million VU1 cycles (the first room: 7). The lean code runs about 190 million
 cycles a second, so those frames take 55 to 75 ms: 15 to 20 fps. A real VU1 runs 295 million cycles a second
@@ -124,18 +127,108 @@ Three things are needed together.
    BGEZ/BLTZ/BLEZ/BGTZ) and one up to patch 66 (SQRT.S): they had been regenerated with an older recompiler.
 2. **The GIF/VU1 worker under about 14 ms a frame**, from 27 ms (32 ms at 31 fps; the VU1 microprograms alone
    need 3.05 million cycles a flip in the first room). Micro-optimizing the lean code will not give a
-   factor of 2. Candidates, largest first:
+   factor of 2.
+   **Done 2026-11-19: relaxed VU1 floats** (`ps2recomp-vu1-relaxed-floats`, `PS2X_VU1_RELAXED` in
+   `ps2_vu1.h`, 1 by default), the way PCSX2 runs VU code: operands are still clamped to finite values, but
+   tiny results are flushed by the host (flush-to-zero) instead of per op, and the overflow/underflow edge
+   cases no longer fall back to the exact path. Offline replay: 1.18x (play recording) and 1.26x (game
+   recording) faster; the results differ from the exact ones in a few edge cases (2520 and 12560 mismatching
+   calls). Dropping the operand clamp too gave only 4% more but 30 times the mismatches (Inf/NaN), so it stays.
+   In the game: VU1 171 -> 214 million cycles a second, first room 57 -> 66 flips/s, frames looked right.
+   Two unit tests that check exact overflow/underflow flags run only with `PS2X_VU1_RELAXED=0`.
+   Other candidates, largest first:
+   - **Native kernels for the hot VU1 loops** (analysed 2026-11-19, not built). In all four recordings about
+     85% of the VU1 cycles are spent in short loops (5 to 40 pairs) that process one vertex per pass, and the
+     same loop bodies recur across programs: one 30-pair transform/clip loop (at 0x04E0 in many programs) takes
+     about 30% of all VU1 cycles alone, and the 8 largest loop bodies about 70%. These loops are software
+     pipelined by the game's own code, but vertices do not depend on each other: values are handed from one pass to
+     the next, and the only real link is the 3-vertex clip flag window (FCAND 0x3FFFF), with a per-vertex branch
+     for clipped triangles. A hand-written native version of that loop (`~/vec/kbench.cpp`, synthetic data, same
+     clamped float ops) takes 15 ns a vertex with SSE and 11 ns with AVX2 (2 vertices at once), against about
+     60 to 80 ns in the lean code (Linux replay with `VUREPLAY_NOHASH=1`, 240 to 250 million cycles a second,
+     15 to 20 cycles a pass). So most of the gain comes from running the loop natively (no per-pair
+     bookkeeping), not from the wider vectors. Estimate: the top 5 to 6 loop bodies (about 65% of the cycles)
+     at 4 times the speed would make VU1 about 1.9 times faster; 60 fps in the first room needs about 1.75. Not checked yet: bit-exact results, clip flag and Q timing,
+     and the loop exit state.
+     **Prototype 2026-11-19** (`ps2recomp-vu1-loop-kernel`; lean files must be regenerated with the patched
+     generator for it to take effect: 624 kernel call sites in the 2229 programs known on 2026-11-19): `LeanAccess::transformClipLoop` in `ps2_vu1_lean.h` runs the loop natively; the generator calls
+     it at the loop's head node when the node has exactly the expected words, issue cycles, Q commit and
+     chain-start saves (46 nodes in the small replay set). It runs only unclipped passes and always leaves 2
+     passes and their cycles to the lean code, then rebuilds the last two passes' MAC/status flag entries and
+     chain starts, so the state matches the lean code's (only sticky status bits of earlier passes are left out).
+     `PS2X_VU1_KERNELS=0` turns it off. Offline replay: every call of all four recordings gives the same state,
+     VU memory and GIF packets with and without it; play 0.035 -> 0.029 s (1.21x), game 0.051 -> 0.043 s
+     (1.19x). It takes about 22% of the VU1 cycles (clipped passes and the last two stay lean) at about 15 ns a
+     pass instead of about 46. Replacing lane reads through memory by shuffles changed nothing measurable.
+     In the game (Windows, unattended run into mission 1, same inputs): first room about 65 -> 72 flips/s
+     (last 10 samples 62-70 -> 67-77), VU1 215 -> 229 million cycles a second; frames looked right.
+     **Second kernel 2026-11-19** (`ps2recomp-vu1-light-kernel`, `LeanAccess::pointLightLoop`): the 26-pair
+     point-light loop (second by VU1 cycles, about 15%). Bit-exact on all four recordings, but only about 2%
+     faster in the replay: a third of its pairs are empty, so the lean code was already cheap there. **Lesson:
+     rank loops by host time, not by VU1 cycles.** The game build does not call it yet (it needs regenerated
+     lean files, which a full lean rebuild of ~2 hours compiles; do it with the next capture refresh).
+   - **Host-time profile of mission 1's first room (2026-11-19, `prof_m1.sh`-style run: no memory card, auto
+     press, tsample over 30 s)** showed both threads about 80% busy, so both bound the frame:
+     - GIF/VU1 worker: loop kernel 7%, PATH1 copy (`progressXgkick*`) 6%, decoded-code cache rebuilds 3.4%
+       plus binds 2.3% (`ps2recomp-vu1-code-cache`: the game swaps VU1 microcode ~10,000 times a second and the
+       first room cycles through more than 64 code images, which caused up to 5,000 binds a second; now CRC32C
+       content hash, SIMD compare, 256 images, unchanged MPG uploads skipped: rebuild 1.8%, binds 0),
+       `fesetround` per run 2% (now MXCSR directly), copying unpacked data into VU memory 11-12% (inline SSE
+       now, but the time stays: it is cross-core memory traffic), flag pipeline ~6%, lean nodes ~20%.
+     - EE (GameThread): `processVIF1Data` 20.5% -> 14.4% (`ps2recomp-vif1-unpack-simd`: the `cl == wl` unpack
+       loop decodes a vector at a time with SSE; a variable-size memcpy per vector had compiled to a slow
+       `rep movsb`), plus a leftover debug scan over every VIF1 DMA chain (`[mhrs-zeromatrix]`, came in with
+       `ps2recomp-sio2-dualshock`) removed.
+     - Result, same unattended run: first room about 72 -> 74 flips/s on average, last samples 63-77, VU1
+       ~236 million cycles a second, EE idle 27% and worker idle ~19%. Next: the unpack hand-off (EE writes
+       unpacked vectors, worker copies them: maybe let the worker read packed data instead), PATH1 copy, and
+       kernels for the loops that cost the most host time (p1129/p1373/p1537 nodes).
+   - **2026-11-20, with GPU present (forced on by the internal resolution, faster than the CPU present anyway):**
+     first room 78-86 flips/s. Profile (`~/mhrs-vurec/winprof/prof_m1.sh`): the GIF/VU1 worker is the
+     bottleneck (85% busy) while the EE idles 32%. Worker: copying unpacked vectors into VU memory 10% (the copy
+     loop waits on loads of data the EE core wrote: cross-core traffic, not instructions), transform/clip kernel
+     8%, the point-light loop 7.5% (`p1129::n7`, `p1373::n7`: kernel 2 was not in the game build yet), PATH1 6.6%,
+     the 6-pair copy loop at 0xE8 3.5% (`p1537::n3`, `p1128::n3`; `tools/leannode.py` prints a node).
+     Kernel 3 `ps2recomp-vu1-copy-kernel` (`LeanAccess::scaleOffsetLoop`) runs that copy loop; with kernels 1-3
+     the play replay is 23% faster than with none (19% with kernel 1 alone), bit-exact on all four recordings.
+     `ps2recomp-vu1-path1-step`: progressXgkickTo jumps to the cycle of the next qword copy instead of stepping
+     each cycle (same result). Frames are vblank-quantized: a frame the worker needs 17-33 ms for takes two
+     vblanks, so every ms the worker saves moves frames from 30 to 60 fps.
+     Built into the game together with the lean files regenerated from all captures (2418 programs, 977 kernel
+     call sites) and `ps2recomp-gs-clut-reuse` (the GS backend thread spent 12% reloading the same palette before
+     draws; a CSM1 load with the last load's parameters and unchanged source bytes is now skipped: 3%). Same
+     unattended run, mean of the last 10 samples, two runs each (runs vary by ±4): first room 80.6 -> 88.2
+     flips/s, VU1 237 -> 265 million cycles a second. Now three threads are at 75-85%: the VU1 worker, the GS backend thread (draw setup 30%, its first
+     loads of each batch wait on the frontend core's cache; prefetching batches ahead only moved that time) and
+     the EE.
+   - **Window stalls (2026-11-20, `ps2recomp-gs-present-pipeline`):** the game ran at 85-90 flips/s, but the
+     window dropped below 10 fps, because each window frame drained the whole GS queue first (about 155 ms at
+     scale 3). Now the GPU present is queued behind the draws (at most 2 in flight). It deswizzles into one of 4
+     output slots with a fence, the window shows the newest finished slot, and when nothing new has finished it
+     keeps the last frame. The async queue limit went up to 65536 commands. Window, new frames a second: about 54
+     at scale 1, about 45 at 2 (every game frame), and about 30 at 3 (limited by the GPU and backend thread).
+     `play_mingw.bat` now defaults to 2.
+     Tools: `~/vec/vustats` (cycles per program),
+     `~/vec/vuloops` (cycles per loop and loop body; needs a temporary pair hook in the interpreter, see
+     `~/vec/mkloops.py`), `~/vec/vudis.py` (disassembler).
    - Lean code without the cycle model: measured at about 5% of VU time (2026-11-18), so little to gain.
    - Wider host vectors (AVX2): measured 2 to 4%.
    - Host registers for VU registers within a node: prototyped, no gain (see above).
    - Splitting the worker: VIF1 unpacks on one thread, VU1 runs on another. Consecutive runs depend on each
      other (register state carries from one MSCNT to the next: measured, 97% of runs), so the runs themselves
-     cannot be spread over threads.
+     cannot be spread over threads. Retried 2026-11-19 with prediction (`~/mhrs-vurec/vuspec2.cpp`): the
+     register that breaks most runs is `vi14`, a pointer that steps each run, and predicting it by its last
+     step is as good as knowing it; then 51% of runs could start early, but only the short ones (0.5% of the VU1
+     cycles). Every heavy run still differs in two or three words of its first GIF packet (GS addresses that
+     step by 0x40 a run, a double-buffer bit), even with all registers exact and memory the previous run wrote
+     predicted. Running VU1 runs in parallel is not worth building.
 3. **The EE under about 14 ms a frame**, from 21 ms. By share of its busy time: VIF1 parsing
    (`processVIF1Data`) about 20%, guest function lookup through a hash table about 5%, IOP interpreter a few
    percent, the rest is recompiled game code. Parsing VIF1 on the worker instead of the EE is the largest
    single step, but the game reads VIF1 registers about 800 times a second, so those reads must then wait for
-   the worker.
+   the worker. Tried 2026-11-19: a copy-only path for unpacks with no write mask and no ROW offset took
+   `processVIF1Data` from 15.8% to 15.0% of the EE (most unpacks are not V4-32), dropped. With relaxed floats the
+   EE still waits for the worker 41% of its time, so EE work does not limit the frame rate yet.
 
 The GS backend thread is busy about 55% of the time at 30 fps; at 60 fps texture uploads and CLUT loads, which
 still run on the CPU, would saturate it. They need to move to the GPU as well.

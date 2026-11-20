@@ -44,8 +44,28 @@ ps2EntryRunner.exe extracted\MOH3RDVD.ELF "ISO\Medal of Honor - Rising Sun.iso"
 
 Env vars: `PS2X_SKIP_MOVIES=60` (end every movie after 60 pictures; Esc/Backspace skips one by hand),
 `PS2X_VBLANK_CLOCK=cycles` (old guest-cycle vblank clock: slow-motion gameplay), `PS2X_VK_RASTER=1` (sprites and triangles rasterized on the GPU; without it the Vulkan backend draws on the CPU),
-`PS2X_VK_STATS=<n>` (batch/readback counters every n presents), `MHRS_HUD=1`,
+`PS2X_VK_STATS=<n>` (batch/readback counters every n presents), `MHRS_HUD=1` (start with the FPS monitor on),
 `MHRS_WINDOW=1920x1080`, `MHRS_FILTER=point`.
+
+Internal resolution (`ps2recomp-gs-internal-resolution`): `PS2X_VK_SCALE=2..4` (with `PS2X_VK_RASTER=1`) draws every
+32-bit frame and depth buffer at that many times the native resolution as well, and shows the display at that
+size (3 = 1920x1344). It is a copy of GS memory with scale x scale samples per pixel next to the native one, which
+stays exactly as before, so everything the game reads back is unchanged; 32-bit textures drawn earlier (the frame
+a full-screen pass copies or filters) are sampled from the copy. 16-bit buffers stay native. `play_mingw.bat` sets
+2 unless `PS2X_VK_SCALE` is already set; the controls menu (F2, row "Internal resolution", Left/Right) changes it
+while the game runs (not saved). With `PS2X_VK_RASTER=1` the display is always copied out on the GPU (formerly
+`PS2X_VK_PRESENT=1`), which is also faster than the CPU copy. Costs GPU time only: mission 1's first room runs as fast at 3 as at 1;
+the mission-1 intro (heavy overdraw) drops from about 76 to 62 flips/s at 3 (72 at 2). The present runs
+behind the GS queue (`ps2recomp-gs-present-pipeline`), so the window never waits for drawing to finish. It shows
+every game frame at 2 and about 30 new frames a second at 3.
+
+In the game window: **F2** opens the controls menu (rebind keys, mouse and gamepad, mouse look settings; saved to
+`controls.ini`), **F5** the cheat menu (the game's 12 bonus cheats; saved to `cheats.ini`).
+
+FPS monitor (`ps2recomp-fps-monitor`): **F3** shows or hides it; `play_mingw.bat` starts with it on. The large
+number is game frames a second (the game writes DISPFB1 once a frame; green at 55+, yellow at 28+, red below).
+Below it: the slowest frame in the last half second, the emulated vsync rate (60/s when the game runs at full
+speed) and how often the window redraws.
 
 Controls: copy `tools/controls.example.ini` to `controls.ini` in the folder you start from (or set `PS2X_CONTROLS`)
 to rebind keys, mouse buttons and gamepad buttons/axes, and to set mouse look, dead zone, sensitivity and invert-Y.

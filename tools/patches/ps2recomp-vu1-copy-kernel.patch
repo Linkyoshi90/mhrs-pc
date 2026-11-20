@@ -1,0 +1,161 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_lean.h b/ps2xRuntime/include/runtime/ps2_vu1_lean.h
+index ee42462..53329ca 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_lean.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_lean.h
+@@ -185,6 +185,8 @@ struct VU1Interpreter::LeanAccess
+     static uint64_t transformClipLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd);
+     template <bool kMsubFlags>
+     static uint64_t pointLightLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd);
++    template <bool kMaddFlags>
++    static uint64_t scaleOffsetLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd);
+     static bool kernelsEnabled()
+     {
+         static const bool enabled = []
+@@ -748,4 +750,98 @@ inline uint64_t VU1Interpreter::LeanAccess::pointLightLoop(VU1Interpreter &vu, u
+ #undef VU1K_BC
+ }
+ 
++
++// A 6-pair copy loop of the game (texture coordinates and colours, a few % of the GIF/VU1 worker), run natively.
++// One node at cycles 0..5 that loops to itself:
++//   0 ADDA.xyz ACC, vf00, vf05        SQI vf09, (vi06++)
++//   1 MADD.xyz vf07, vf06, vf04       ISUBIU vi02, vi02, 1
++//   2 ITOF12.xy vf09, vf08            LQI vf08, (vi05++)
++//   3                                 LQI vf06, (vi03++)
++//   4                                 IBNE vi02, vi00 -> head
++//   5                                 SQI.xyz vf07, (vi04++)
++// Values as the lean code computes them; at least 2 passes and their cycles are left to the lean code. Only the
++// MADD may queue a flag entry (the generator checks); the last two passes' entries are queued as the lean code
++// queues them. Returns the base cycle of the head.
++template <bool kMaddFlags>
++inline uint64_t VU1Interpreter::LeanAccess::scaleOffsetLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd)
++{
++    using namespace ps2_vu1_simd;
++    constexpr uint64_t kPass = 6u;
++    VU1State &s = vu.m_state;
++    if (!kernelsEnabled() || static_cast<int16_t>(s.vi[2]) < 3 || base + 4u * kPass > budgetEnd || vu.m_stopRequested ||
++        vu.m_fdiv.valid || vu.m_efu[0].valid || vu.m_efu[1].valid || (vu.m_vfWriteMask | vu.m_viWriteMask) != 0u ||
++        vu.m_activeVuDataSize != 0x4000u ||
++        (vu.m_flagCount != 0u &&
++         vu.m_flagPipeline[(vu.m_flagHead + vu.m_flagCount - 1u) % vu.m_flagPipeline.size()].readyCycle > base))
++        return base;
++    // The previous passes' entries have landed by now; nothing reads flags in between.
++    vu.m_cycle = base;
++    vu.syncFlags();
++
++    uint8_t *const mem = vu.m_activeVuData;
++    const auto cl = [](__m128 v) VU1_LAMBDA_ALWAYS_INLINE { return clampOperands(v); };
++    const auto addr = [mem](int32_t vi) VU1_LAMBDA_ALWAYS_INLINE
++    { return reinterpret_cast<float *>(mem + ((static_cast<uint32_t>(static_cast<uint16_t>(vi)) * 16u) & 0x3FFFu)); };
++    const auto inc = [](int32_t vi) VU1_LAMBDA_ALWAYS_INLINE { return static_cast<int32_t>(static_cast<int16_t>(vi + 1)); };
++    const auto bxyz = [](__m128 d, __m128 v) VU1_LAMBDA_ALWAYS_INLINE { return _mm_blend_ps(d, v, 0x7); };
++    const auto bxy = [](__m128 d, __m128 v) VU1_LAMBDA_ALWAYS_INLINE { return _mm_blend_ps(d, v, 0x3); };
++
++    const __m128 c00 = cl(_mm_loadu_ps(s.vf[0])), c04 = cl(_mm_loadu_ps(s.vf[4])), c05 = cl(_mm_loadu_ps(s.vf[5]));
++    __m128 vf06 = _mm_loadu_ps(s.vf[6]), vf07 = _mm_loadu_ps(s.vf[7]), vf08 = _mm_loadu_ps(s.vf[8]),
++           vf09 = _mm_loadu_ps(s.vf[9]), acc = _mm_loadu_ps(s.acc);
++    int32_t vi02 = s.vi[2], vi03 = s.vi[3], vi04 = s.vi[4], vi05 = s.vi[5], vi06 = s.vi[6];
++
++    struct Last
++    {
++        __m128 acc, vf06, vf06Before;
++    } last[2]{};
++    uint64_t passes = 0;
++    for (uint64_t c = base; static_cast<int16_t>(vi02) >= 3 && c + 4u * kPass <= budgetEnd; c += kPass, ++passes)
++    {
++        acc = bxyz(acc, _mm_add_ps(c00, c05));                                       // 0 ADDA.xyz
++        if (vu.m_xgkick.active)                                                      //   SQI
++            kickTo(vu, c);
++        _mm_storeu_ps(addr(vi06), vf09), vi06 = inc(vi06);
++        last[0] = last[1];
++        last[1].acc = acc, last[1].vf06 = vf06;
++        vf07 = bxyz(vf07, _mm_add_ps(cl(acc), _mm_mul_ps(cl(vf06), c04)));            // 1 MADD.xyz
++        vi02 = static_cast<int16_t>(vi02 - 1);                                       //   ISUBIU
++        vf09 = bxy(vf09, _mm_div_ps(_mm_cvtepi32_ps(_mm_castps_si128(vf08)), _mm_set1_ps(4096.0f))); // 2 ITOF12.xy
++        vf08 = _mm_loadu_ps(addr(vi05)), vi05 = inc(vi05);                           //   LQI
++        last[1].vf06Before = vf06;
++        vf06 = _mm_loadu_ps(addr(vi03)), vi03 = inc(vi03);                           // 3 LQI
++        if (vu.m_xgkick.active)                                                      // 5 SQI.xyz
++            kickTo(vu, c + 5u);
++        float *const dst = addr(vi04);
++        _mm_storeu_ps(dst, bxyz(_mm_loadu_ps(dst), vf07)), vi04 = inc(vi04);
++    }
++    const uint64_t head = base + passes * kPass; // passes >= 1: the entry checks guarantee one
++
++    static constexpr DecodedInstructionPair kMadd = decodePair(0x12021001u, 0x1C431E9u, Unit::VU1);
++    const auto queueMadd = [&vu, &s](const Last &l, uint64_t passBase)
++    {
++        if constexpr (kMaddFlags)
++        {
++            _mm_storeu_ps(s.acc, l.acc);
++            _mm_storeu_ps(s.vf[6], l.vf06);
++            vu.m_cycle = passBase + 1u;
++            vu.execFmacInline<true, false>(kMadd);
++        }
++        else
++            (void)l, (void)passBase;
++    };
++    if (passes >= 2u)
++        queueMadd(last[0], head - 2u * kPass);
++    queueMadd(last[1], head - kPass);
++
++    _mm_storeu_ps(s.vf[6], vf06), _mm_storeu_ps(s.vf[7], vf07), _mm_storeu_ps(s.vf[8], vf08);
++    _mm_storeu_ps(s.vf[9], vf09), _mm_storeu_ps(s.acc, acc);
++    s.vi[2] = vi02, s.vi[3] = vi03, s.vi[4] = vi04, s.vi[5] = vi05, s.vi[6] = vi06;
++    // Chain start the lean code keeps for the load in flight at the head: LQI vf06.
++    _mm_storeu_ps(vu.m_vfChainStart[6].data(), last[1].vf06Before);
++    vu.m_viBranchBackupValid = false;
++    vu.m_cycle = head - 1u;
++    return head;
++}
++
+ #endif
+diff --git a/ps2xRuntime/tools/vu1_lean_gen.cpp b/ps2xRuntime/tools/vu1_lean_gen.cpp
+index 71fac37..519bc19 100644
+--- a/ps2xRuntime/tools/vu1_lean_gen.cpp
++++ b/ps2xRuntime/tools/vu1_lean_gen.cpp
+@@ -585,6 +585,32 @@ namespace
+         return msubFlags;
+     }
+ 
++    // The 6-pair copy loop LeanAccess::scaleOffsetLoop runs: node n has its pairs at cycles 0..5, saves vf06 at 3,
++    // loops to itself, and no FMAC but the MADD at 1 queues a flag entry. -1 if not, else whether the MADD does.
++    int scaleOffsetHead(const Program &program, size_t n)
++    {
++        static constexpr uint32_t kWords[6][2] = {
++            {0x81E64B7Du, 0x01C502BCu}, {0x12021001u, 0x01C431E9u}, {0x81E82B7Cu, 0x0189413Eu},
++            {0x81E61B7Cu, 0x000002FFu}, {0x520207FBu, 0x000002FFu}, {0x81C43B7Du, 0x000002FFu}};
++        const Node &x = program.nodes[n];
++        if (x.pairs.size() != 6u || !x.exitCommits.empty() || x.exit.kind != Exit::Cond || x.exit.rel != 6u ||
++            x.exit.pc != x.pc || x.exit.targets.empty() || x.exit.targets[0] != static_cast<int>(n))
++            return -1;
++        int maddFlags = 0;
++        for (size_t i = 0; i < 6u; ++i)
++        {
++            const PairCode &p = x.pairs[i];
++            if (p.pc != x.pc + 8u * i || p.lower != kWords[i][0] || p.upper != kWords[i][1] || p.issue != i || p.from != i ||
++                !p.commits.empty() || p.kick || p.saveUpper != 0u || p.saveLower != (i == 3u ? 15u : 0u) || p.viPending || p.saveVi)
++                return -1;
++            if (i == 1u)
++                maddFlags = p.fmacFlags && !p.elide ? 1 : 0;
++            else if (p.fmacFlags && !p.elide)
++                return -1;
++        }
++        return maddFlags;
++    }
++
+     void emitProgram(std::ostream &os, const Program &program, size_t index)
+     {
+         os << "namespace p" << index << "\n{\n";
+@@ -604,6 +630,11 @@ namespace
+                 os << "    base = L::pointLightLoop<" << (light ? "true" : "false") << ">(vu, base, budgetEnd);\n";
+                 ++g_kernelNodes;
+             }
++            else if (const int copy = scaleOffsetHead(program, n); copy >= 0)
++            {
++                os << "    base = L::scaleOffsetLoop<" << (copy ? "true" : "false") << ">(vu, base, budgetEnd);\n";
++                ++g_kernelNodes;
++            }
+             emitPending(os, "kEntry", node.timing);
+             os << "    if (!L::enter(vu, base, budgetEnd, " << node.lastIssue << "u))\n        "
+                << leaveCall("kEntry", node.timing, "base", hex(node.pc)) << "\n";

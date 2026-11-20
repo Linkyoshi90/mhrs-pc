@@ -1,42 +1,29 @@
-#!/usr/bin/env python3
-"""Convert binary PPM (P6) frame dumps to PNG with the standard library only.
-
-usage: ppm2png.py frame.ppm [...]   -> writes frame.png next to each input
-"""
-import struct
-import sys
-import zlib
-
+# ppm2png.py <in.ppm> <out.png> [x0 y0 x1 y1]: binary PPM (P6, maxval 255) to PNG with the standard library only,
+# optionally cropped. Used to look at build/frame_NNN.ppm and build/hires_NNN.ppm dumps.
+import struct, sys, zlib
 
 def read_ppm(path):
     data = open(path, "rb").read()
     fields, pos = [], 0
-    while len(fields) < 4:  # magic, width, height, maxval
+    while len(fields) < 4:
         while data[pos:pos + 1].isspace():
             pos += 1
-        start = pos
-        while not data[pos:pos + 1].isspace():
-            pos += 1
-        fields.append(data[start:pos])
-    assert fields[0] == b"P6" and fields[3] == b"255", f"{path}: not an 8-bit P6 PPM"
-    width, height = int(fields[1]), int(fields[2])
-    pixels = data[pos + 1:pos + 1 + width * height * 3]
-    assert len(pixels) == width * height * 3, f"{path}: truncated"
-    return width, height, pixels
+        end = pos
+        while not data[end:end + 1].isspace():
+            end += 1
+        fields.append(data[pos:end])
+        pos = end
+    w, h = int(fields[1]), int(fields[2])
+    return w, h, data[pos + 1:pos + 1 + w * h * 3]
 
-
-def write_png(path, width, height, rgb):
+def write_png(path, w, h, rows):
+    raw = b"".join(b"\0" + r for r in rows)
     def chunk(kind, body):
-        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
-    stride = width * 3
-    raw = b"".join(b"\x00" + rgb[y * stride:(y + 1) * stride] for y in range(height))
-    with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n")
-        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)))
-        f.write(chunk(b"IDAT", zlib.compress(raw, 6)))
-        f.write(chunk(b"IEND", b""))
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    open(path, "wb").write(png + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
-
-if __name__ == "__main__":
-    for ppm in sys.argv[1:]:
-        write_png(ppm.rsplit(".", 1)[0] + ".png", *read_ppm(ppm))
+w, h, rgb = read_ppm(sys.argv[1])
+x0, y0, x1, y1 = (int(v) for v in sys.argv[3:7]) if len(sys.argv) >= 7 else (0, 0, w, h)
+rows = [rgb[(y * w + x0) * 3:(y * w + x1) * 3] for y in range(y0, y1)]
+write_png(sys.argv[2], x1 - x0, y1 - y0, rows)

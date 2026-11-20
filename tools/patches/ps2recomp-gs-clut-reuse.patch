@@ -1,0 +1,46 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index b66b751..18b2604 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -139,6 +139,10 @@ private:
+     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
+     std::array<uint16_t, 512> m_clut{};
+     uint64_t m_clutId = 0; // changes whenever m_clut does (palette caches key on it)
++    // The last CSM1 load: its parameters, the 1 KB of VRAM it read from (4 blocks at cbp) and the CLUT id after it.
++    struct ClutLoadKey { uint32_t cbp = UINT32_MAX, cpsm = 0, csa = 0; bool fourBit = false; } m_lastClutLoad;
++    std::array<uint8_t, 1024> m_lastClutSource{};
++    uint64_t m_lastClutId = 0;
+     std::array<uint32_t, 2> m_clutCbp{};
+     GSMem::TexturePageCache m_texturePageCache;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index d53429e..0b191e7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1084,6 +1084,15 @@ bool GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+     if (!sixteenBit && !thirtyTwoBit)
+         return false;
+ 
++    // Games reload the same palette before most draws: a CSM1 load with the last one's parameters, from the same
++    // VRAM bytes, with nothing written to the CLUT since, would write what it holds already.
++    const uint32_t sourceByte = static_cast<uint32_t>(tex0.cbp) * 256u;
++    const bool cacheable = tex0.csm == 0u && sourceByte + m_lastClutSource.size() <= m_vramSize;
++    if (cacheable && m_lastClutLoad.cbp == tex0.cbp && m_lastClutLoad.cpsm == tex0.cpsm && m_lastClutLoad.csa == tex0.csa &&
++        m_lastClutLoad.fourBit == fourBit && m_lastClutId == m_clutId &&
++        std::memcmp(m_vram + sourceByte, m_lastClutSource.data(), m_lastClutSource.size()) == 0)
++        return false; // nothing read through the texture page cache
++
+     const uint32_t entryCount = fourBit ? 16u : 256u;
+     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
+     const uint32_t destinationBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
+@@ -1123,6 +1132,10 @@ bool GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+         }
+     }
+     m_clutId = nextClutId();
++    m_lastClutLoad = {cacheable ? static_cast<uint32_t>(tex0.cbp) : UINT32_MAX, tex0.cpsm, tex0.csa, fourBit};
++    if (cacheable)
++        std::memcpy(m_lastClutSource.data(), m_vram + sourceByte, m_lastClutSource.size());
++    m_lastClutId = m_clutId;
+     return true; // the loop always reads: firstEntry < entryCount
+ }
+ 

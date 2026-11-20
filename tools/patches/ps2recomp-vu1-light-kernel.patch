@@ -1,0 +1,275 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_lean.h b/ps2xRuntime/include/runtime/ps2_vu1_lean.h
+index bb0da4f..ee42462 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_lean.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_lean.h
+@@ -183,6 +183,17 @@ struct VU1Interpreter::LeanAccess
+     // ---- native loop kernels (called by generated nodes, see vu1_lean_gen.cpp transformClipHead) ----
+ 
+     static uint64_t transformClipLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd);
++    template <bool kMsubFlags>
++    static uint64_t pointLightLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd);
++    static bool kernelsEnabled()
++    {
++        static const bool enabled = []
++        {
++            const char *value = std::getenv("PS2X_VU1_KERNELS");
++            return value == nullptr || *value != '0';
++        }();
++        return enabled;
++    }
+ 
+     // ---- used by the generator: the interpreter's timing on a scratch VU1Interpreter ----
+ 
+@@ -384,13 +395,8 @@ inline uint64_t VU1Interpreter::LeanAccess::transformClipLoop(VU1Interpreter &vu
+ {
+     using namespace ps2_vu1_simd;
+     constexpr uint64_t kPass = 15u;
+-    static const bool enabled = []
+-    {
+-        const char *value = std::getenv("PS2X_VU1_KERNELS");
+-        return value == nullptr || *value != '0';
+-    }();
+     VU1State &s = vu.m_state;
+-    if (!enabled || static_cast<int16_t>(s.vi[2]) < 3 || base + 4u * kPass > budgetEnd || vu.m_stopRequested ||
++    if (!kernelsEnabled() || static_cast<int16_t>(s.vi[2]) < 3 || base + 4u * kPass > budgetEnd || vu.m_stopRequested ||
+         vu.m_fdiv.valid || (vu.m_vfWriteMask | vu.m_viWriteMask) != 0u || vu.m_activeVuDataSize != 0x4000u ||
+         (vu.m_viBranchBackupValid && vu.m_viBranchBackupReg != 6u))
+         return base;
+@@ -566,4 +572,180 @@ inline uint64_t VU1Interpreter::LeanAccess::transformClipLoop(VU1Interpreter &vu
+ #undef VU1K_LANE
+ }
+ 
++
++// The game's per-vertex point-light loop (about 15% of all VU1 cycles), run natively. One node of 26 pairs at
++// cycles 0..25 that loops to itself; the RSQRT of a pass lands as Q at cycle 9 of the next (the generator checks
++// the words, issue cycles, Q commit, chain-start saves and that only MSUBw (20) may queue a flag entry):
++//   1 SUB vf19, vf12, vf13          LQI vf14, (vi05++)     14 MULA.x ACC, vf19, vf19
++//   4 MUL.x vf24, vf22, vf22        LQI vf13, (vi03++)     15 MADDAy.x ACC, vf10, vf20y
++//   5 MUL.xyz vf21, vf18, vf19                             16 MADDz.x vf20, vf10, vf20z  LOI 255
++//   6 MUL.xyz vf20, vf19, vf19                             17 MINIi vf16, vf16
++//   8 MULA.x ACC, vf18, vf19                               18 MAX.x vf23, vf21, vf00
++//   9 MULq.x vf25, vf24 (Q lands)   LQI vf18, (vi04++)     19 MULAw.x ACC, vf10, vf00w   ISUBIU vi02, vi02, 1
++//  10 MADDAy.x ACC, vf10, vf21y                            20 MSUBw.x vf22, vf20, vf12w
++//  11 MADDz.x vf21, vf10, vf21z                            21 FTOI0 vf17, vf16
++//  12 MULAw.xyz ACC, vf15, vf00w                           22                            RSQRT Q, vf23x, vf20x
++//  13 MADDx.xyz vf16, vf11, vf25x                          24 MAX.x vf22, vf22, vf00     IBNE vi02, vi00 -> head
++//  (other pairs: NOP / MOVE vf00)                          25 ITOF0 vf15, vf14           SQI.xyz vf17, (vi06++)
++// Values as the lean code computes them (see transformClipLoop). At least 2 passes and their cycles are left to
++// the lean code; the state left is the lean code's at the head after the same passes, except the sticky status
++// bits of the MSUB flag entries before the last two passes. Returns the base cycle of the head.
++template <bool kMsubFlags>
++inline uint64_t VU1Interpreter::LeanAccess::pointLightLoop(VU1Interpreter &vu, uint64_t base, uint64_t budgetEnd)
++{
++    using namespace ps2_vu1_simd;
++    constexpr uint64_t kPass = 26u;
++    VU1State &s = vu.m_state;
++    if (!kernelsEnabled() || static_cast<int16_t>(s.vi[2]) < 3 || base + 4u * kPass > budgetEnd || vu.m_stopRequested ||
++        !vu.m_fdiv.valid || vu.m_fdiv.readyCycle != base + 9u || vu.m_efu[0].valid || vu.m_efu[1].valid ||
++        (vu.m_vfWriteMask | vu.m_viWriteMask) != 0u || vu.m_activeVuDataSize != 0x4000u ||
++        (vu.m_flagCount != 0u &&
++         vu.m_flagPipeline[(vu.m_flagHead + vu.m_flagCount - 1u) % vu.m_flagPipeline.size()].readyCycle > base + 9u))
++        return base;
++    // The first pass's Q (the previous pass's RSQRT) and flag entries land as the lean code lands them.
++    vu.m_cycle = base + 9u;
++    vu.commitDuePipelines();
++
++    uint8_t *const mem = vu.m_activeVuData;
++    const auto cl = [](__m128 v) VU1_LAMBDA_ALWAYS_INLINE { return clampOperands(v); };
++#define VU1K_BC(v, i) _mm_shuffle_ps((v), (v), _MM_SHUFFLE(i, i, i, i))
++    const auto addr = [mem](int32_t vi) VU1_LAMBDA_ALWAYS_INLINE
++    { return reinterpret_cast<float *>(mem + ((static_cast<uint32_t>(static_cast<uint16_t>(vi)) * 16u) & 0x3FFFu)); };
++    const auto inc = [](int32_t vi) VU1_LAMBDA_ALWAYS_INLINE { return static_cast<int32_t>(static_cast<int16_t>(vi + 1)); };
++    const auto bx = [](__m128 d, __m128 v) VU1_LAMBDA_ALWAYS_INLINE { return _mm_blend_ps(d, v, 0x1); };
++    const auto bxyz = [](__m128 d, __m128 v) VU1_LAMBDA_ALWAYS_INLINE { return _mm_blend_ps(d, v, 0x7); };
++
++    const __m128 vf00 = _mm_loadu_ps(s.vf[0]), vf10 = _mm_loadu_ps(s.vf[10]), vf11 = _mm_loadu_ps(s.vf[11]),
++                 vf12 = _mm_loadu_ps(s.vf[12]);
++    const __m128 c10 = cl(vf10), c11 = cl(vf11), c12w = cl(VU1K_BC(vf12, 3)), c12 = cl(vf12), one = cl(VU1K_BC(vf00, 3));
++    const __m128 n00 = normalizeOperands(vf00);
++    constexpr uint32_t kIBits = 0x437F0000u; // LOI 255.0
++    float iValue;
++    std::memcpy(&iValue, &kIBits, 4);
++    const __m128 nI = _mm_set1_ps(normalizeOperand(iValue));
++    __m128 vf13 = _mm_loadu_ps(s.vf[13]), vf14 = _mm_loadu_ps(s.vf[14]), vf15 = _mm_loadu_ps(s.vf[15]),
++           vf16 = _mm_loadu_ps(s.vf[16]), vf17 = _mm_loadu_ps(s.vf[17]), vf18 = _mm_loadu_ps(s.vf[18]),
++           vf19 = _mm_loadu_ps(s.vf[19]), vf20 = _mm_loadu_ps(s.vf[20]), vf21 = _mm_loadu_ps(s.vf[21]),
++           vf22 = _mm_loadu_ps(s.vf[22]), vf23 = _mm_loadu_ps(s.vf[23]), vf24 = _mm_loadu_ps(s.vf[24]),
++           vf25 = _mm_loadu_ps(s.vf[25]), acc = _mm_loadu_ps(s.acc);
++    float q = s.q;
++    int32_t vi02 = s.vi[2], vi03 = s.vi[3], vi04 = s.vi[4], vi05 = s.vi[5], vi06 = s.vi[6];
++
++    // Per pass: the MSUB's operands, its RSQRT's result and D/I bits, chain starts ([1] = last pass).
++    struct Last
++    {
++        __m128 acc, vf20, vf22Before, vf15Before;
++        float q;
++        uint32_t di;
++    } last[2]{};
++    uint32_t diSticky = 0u; // D/I of the RSQRTs landed by passes 1 .. n-2
++    uint64_t passes = 0;
++    for (uint64_t c = base; static_cast<int16_t>(vi02) >= 3 && c + 4u * kPass <= budgetEnd; c += kPass, ++passes)
++    {
++        if (passes >= 2u)
++            diSticky |= last[0].di;
++        vf19 = _mm_sub_ps(c12, cl(vf13));                                                   // 1 SUB
++        vf14 = _mm_loadu_ps(addr(vi05)), vi05 = inc(vi05);                                  //   LQI
++        const __m128 c22 = cl(vf22);
++        vf24 = bx(vf24, _mm_mul_ps(c22, c22));                                              // 4 MUL.x
++        vf13 = _mm_loadu_ps(addr(vi03)), vi03 = inc(vi03);                                  //   LQI
++        const __m128 c18 = cl(vf18), c19 = cl(vf19);
++        vf21 = bxyz(vf21, _mm_mul_ps(c18, c19));                                            // 5 MUL.xyz
++        vf20 = bxyz(vf20, _mm_mul_ps(c19, c19));                                            // 6 MUL.xyz
++        acc = bx(acc, _mm_mul_ps(c18, c19));                                                // 8 MULA.x
++        if (passes != 0u)                                                                   // 9 Q lands
++            q = last[1].q;
++        vf25 = bx(vf25, _mm_mul_ps(cl(vf24), cl(_mm_set1_ps(q))));                          //   MULq.x
++        vf18 = _mm_loadu_ps(addr(vi04)), vi04 = inc(vi04);                                  //   LQI
++        acc = bx(acc, _mm_add_ps(cl(acc), _mm_mul_ps(c10, cl(VU1K_BC(vf21, 1)))));          // 10 MADDAy.x
++        vf21 = bx(vf21, _mm_add_ps(cl(acc), _mm_mul_ps(c10, cl(VU1K_BC(vf21, 2)))));        // 11 MADDz.x
++        acc = bxyz(acc, _mm_mul_ps(cl(vf15), one));                                         // 12 MULAw.xyz
++        vf16 = bxyz(vf16, _mm_add_ps(cl(acc), _mm_mul_ps(c11, cl(VU1K_BC(vf25, 0)))));      // 13 MADDx.xyz
++        const __m128 c19b = cl(vf19);
++        acc = bx(acc, _mm_mul_ps(c19b, c19b));                                              // 14 MULA.x
++        acc = bx(acc, _mm_add_ps(cl(acc), _mm_mul_ps(c10, cl(VU1K_BC(vf20, 1)))));          // 15 MADDAy.x
++        vf20 = bx(vf20, _mm_add_ps(cl(acc), _mm_mul_ps(c10, cl(VU1K_BC(vf20, 2)))));        // 16 MADDz.x
++        vf16 = _mm_min_ps(normalizeOperands(vf16), nI);                                     // 17 MINIi
++        vf23 = bx(vf23, _mm_max_ps(normalizeOperands(vf21), n00));                          // 18 MAX.x
++        acc = bx(acc, _mm_mul_ps(c10, one));                                                // 19 MULAw.x
++        vi02 = static_cast<int16_t>(vi02 - 1);                                              //    ISUBIU
++        last[0] = last[1];
++        last[1].acc = acc, last[1].vf20 = vf20;
++        vf22 = bx(vf22, _mm_sub_ps(cl(acc), _mm_mul_ps(cl(vf20), c12w)));                   // 20 MSUBw.x
++        {                                                                                   // 21 FTOI0
++            const __m128 x = normalizeOperands(vf16);
++            const __m128i t = _mm_cvttps_epi32(x);
++            const __m128 high = _mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f));
++            vf17 = _mm_blendv_ps(_mm_castsi128_ps(t), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)), high);
++        }
++        {                                                                                   // 22 RSQRT
++            const float num = normalizeOperand(_mm_cvtss_f32(vf23));
++            const float radicand = normalizeOperand(_mm_cvtss_f32(vf20));
++            const float den = std::sqrt(std::fabs(radicand));
++            uint32_t di = radicand < 0.0f ? 0x10u : 0u, ignored = 0u;
++            float result;
++            if (den != 0.0f)
++                result = num / den;
++            else
++            {
++                di = num == 0.0f ? 0x10u : 0x20u;
++                result = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
++            }
++            last[1].q = vu.normalizeResult(vu.normalizeResult(result, ignored), ignored);
++            last[1].di = di;
++        }
++        last[1].vf22Before = vf22;
++        vf22 = bx(vf22, _mm_max_ps(normalizeOperands(vf22), n00));                          // 24 MAX.x
++        last[1].vf15Before = vf15;
++        vf15 = _mm_cvtepi32_ps(_mm_castps_si128(vf14));                                      // 25 ITOF0
++        if (vu.m_xgkick.active)                                                             //    SQI.xyz
++            kickTo(vu, c + 25u);
++        float *const dst = addr(vi06);
++        _mm_storeu_ps(dst, bxyz(_mm_loadu_ps(dst), vf17));
++        vi06 = inc(vi06);
++    }
++    const uint64_t head = base + passes * kPass; // passes >= 1: the entry checks guarantee one
++
++    static constexpr DecodedInstructionPair kMsub = decodePair(0x8000033Cu, 0x10CA58Fu, Unit::VU1);
++    const auto queueMsub = [&vu, &s](const Last &l, uint64_t passBase)
++    {
++        if constexpr (kMsubFlags)
++        {
++            _mm_storeu_ps(s.acc, l.acc);
++            _mm_storeu_ps(s.vf[20], l.vf20);
++            vu.m_cycle = passBase + 20u;
++            vu.execFmacInline<true, false>(kMsub);
++        }
++        else
++            (void)l, (void)passBase;
++    };
++    if (passes >= 2u)
++    {
++        // The pass before the last: its MSUB entry and RSQRT land at the last pass's cycle 9.
++        s.status |= diSticky << 6;
++        queueMsub(last[0], head - 2u * kPass);
++        vu.m_fdiv = {head - kPass + 9u, last[0].q, last[0].di, true};
++        vu.m_cycle = head - kPass + 9u;
++        vu.commitDuePipelines();
++    }
++    queueMsub(last[1], head - kPass);
++    vu.m_fdiv = {head + 9u, last[1].q, last[1].di, true};
++    vu.noteReadyCycle(head + 9u);
++
++    _mm_storeu_ps(s.vf[13], vf13), _mm_storeu_ps(s.vf[14], vf14), _mm_storeu_ps(s.vf[15], vf15);
++    _mm_storeu_ps(s.vf[16], vf16), _mm_storeu_ps(s.vf[17], vf17), _mm_storeu_ps(s.vf[18], vf18);
++    _mm_storeu_ps(s.vf[19], vf19), _mm_storeu_ps(s.vf[20], vf20), _mm_storeu_ps(s.vf[21], vf21);
++    _mm_storeu_ps(s.vf[22], vf22), _mm_storeu_ps(s.vf[23], vf23), _mm_storeu_ps(s.vf[24], vf24);
++    _mm_storeu_ps(s.vf[25], vf25), _mm_storeu_ps(s.acc, acc);
++    s.i = iValue;
++    s.vi[2] = vi02, s.vi[3] = vi03, s.vi[4] = vi04, s.vi[5] = vi05, s.vi[6] = vi06;
++    // Chain starts the lean code keeps for the writes in flight at the head: MAX.x on vf22, ITOF0 on vf15.
++    vu.m_vfChainStart[22][0] = _mm_cvtss_f32(last[1].vf22Before);
++    _mm_storeu_ps(vu.m_vfChainStart[15].data(), last[1].vf15Before);
++    vu.m_viBranchBackupValid = false;
++    vu.m_cycle = head - 1u;
++    return head;
++#undef VU1K_BC
++}
++
+ #endif
+diff --git a/ps2xRuntime/tools/vu1_lean_gen.cpp b/ps2xRuntime/tools/vu1_lean_gen.cpp
+index 3f3d308..71fac37 100644
+--- a/ps2xRuntime/tools/vu1_lean_gen.cpp
++++ b/ps2xRuntime/tools/vu1_lean_gen.cpp
+@@ -551,6 +551,40 @@ namespace
+                y.exit.pc == x.pc && !y.exit.targets.empty() && y.exit.targets[0] == static_cast<int>(n);
+     }
+ 
++    // The game's point-light loop in its steady timing state, which LeanAccess::pointLightLoop runs: node n has
++    // the loop's 26 pairs at cycles 0..25 (Q lands at 9), saves vf22.x at 24 and vf15 at 25, loops to itself, and
++    // no FMAC but the MSUBw at 20 queues a flag entry. Returns -1 if not, else whether the MSUBw queues one.
++    int pointLightHead(const Program &program, size_t n)
++    {
++        static constexpr uint32_t kWords[26][2] = {
++            {0x8000033Cu, 0x000002FFu}, {0x81EE2B7Cu, 0x01ED64ECu}, {0x8000033Cu, 0x000002FFu}, {0x8000033Cu, 0x000002FFu},
++            {0x81ED1B7Cu, 0x0116B62Au}, {0x8000033Cu, 0x01D3956Au}, {0x8000033Cu, 0x01D39D2Au}, {0x8000033Cu, 0x000002FFu},
++            {0x8000033Cu, 0x011392BEu}, {0x81F2237Cu, 0x0100C65Cu}, {0x8000033Cu, 0x011550BDu}, {0x8000033Cu, 0x0115554Au},
++            {0x8000033Cu, 0x01C079BFu}, {0x8000033Cu, 0x01D95C08u}, {0x8000033Cu, 0x01139ABEu}, {0x8000033Cu, 0x011450BDu},
++            {0x437F0000u, 0x8114550Au}, {0x8000033Cu, 0x01E0841Fu}, {0x8000033Cu, 0x0100ADEBu}, {0x12021001u, 0x010051BFu},
++            {0x8000033Cu, 0x010CA58Fu}, {0x8000033Cu, 0x01F1817Cu}, {0x8014BBBEu, 0x000002FFu}, {0x8000033Cu, 0x000002FFu},
++            {0x520207E7u, 0x0100B5ABu}, {0x81C68B7Du, 0x01EF713Cu}};
++        const Node &x = program.nodes[n];
++        if (x.pairs.size() != 26u || !x.exitCommits.empty() || x.exit.kind != Exit::Cond || x.exit.rel != 26u ||
++            x.exit.pc != x.pc || x.exit.targets.empty() || x.exit.targets[0] != static_cast<int>(n))
++            return -1;
++        int msubFlags = 0;
++        for (size_t i = 0; i < 26u; ++i)
++        {
++            const PairCode &p = x.pairs[i];
++            const std::vector<uint32_t> commits = i == 9u ? std::vector<uint32_t>{9u} : std::vector<uint32_t>{};
++            const uint8_t save = i == 24u ? 8u : i == 25u ? 15u : 0u;
++            if (p.pc != x.pc + 8u * i || p.lower != kWords[i][0] || p.upper != kWords[i][1] || p.issue != i || p.from != i ||
++                p.commits != commits || p.kick || p.saveUpper != save || p.saveLower != 0u || p.viPending || p.saveVi)
++                return -1;
++            if (i == 20u)
++                msubFlags = p.fmacFlags && !p.elide ? 1 : 0;
++            else if (p.fmacFlags && !p.elide)
++                return -1;
++        }
++        return msubFlags;
++    }
++
+     void emitProgram(std::ostream &os, const Program &program, size_t index)
+     {
+         os << "namespace p" << index << "\n{\n";
+@@ -565,6 +599,11 @@ namespace
+                 os << "    base = L::transformClipLoop(vu, base, budgetEnd);\n";
+                 ++g_kernelNodes;
+             }
++            else if (const int light = pointLightHead(program, n); light >= 0)
++            {
++                os << "    base = L::pointLightLoop<" << (light ? "true" : "false") << ">(vu, base, budgetEnd);\n";
++                ++g_kernelNodes;
++            }
+             emitPending(os, "kEntry", node.timing);
+             os << "    if (!L::enter(vu, base, budgetEnd, " << node.lastIssue << "u))\n        "
+                << leaveCall("kEntry", node.timing, "base", hex(node.pc)) << "\n";

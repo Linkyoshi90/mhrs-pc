@@ -1,0 +1,127 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 4fc6c01..3f74f2d 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -297,6 +297,10 @@ PS2Memory::~PS2Memory()
+ }
+ 
+ 
++namespace
++{
++    std::vector<uint8_t> g_spareChainBuf; // EE thread only: see the DMA chain walk
++}
+ std::atomic<uint64_t> g_mhrsVuCycles{0}, g_mhrsVuRuns{0}; // TEMP-DEBUG(mhrs)
+ std::atomic<uint64_t> g_mhrsDrain[4]; std::atomic<uint64_t> g_mhrsUnpacks; // TEMP-DEBUG(mhrs) drains: unpack, gspriv, vumem
+ // TEMP-DEBUG(mhrs) fps: game frames = DISPFB1/2 writes (the game flips by writing them once a frame)
+@@ -1443,7 +1447,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                     // One tag per quadword of RAM: only a cyclic chain is longer. (4096 cut off long display lists.)
+                     const int kMaxChainTags = PS2_RAM_SIZE / 16;
+-                    std::vector<uint8_t> chainBuf;
++                    // A VIF1 chain's buffer is reused once processed (processPendingTransfers): chains are hundreds of KB,
++                    // and a fresh allocation that size comes from the OS and faults in every page again.
++                    std::vector<uint8_t> chainBuf = std::move(g_spareChainBuf);
++                    chainBuf.clear();
+                     // Chains of a channel tend to be alike in size: start from the last one's.
+                     static size_t lastChainBytes[3] = {0u, 0u, 0u};
+                     size_t &chainHint = lastChainBytes[channelBase == 0x1000A000u ? 0 : channelBase == 0x10009000u ? 1 : 2];
+@@ -1967,6 +1974,8 @@ void PS2Memory::processPendingTransfers()
+         {
+             m_vif1SourceSpans = std::move(p.chainSpans);
+             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
++            if (p.chainData.capacity() > g_spareChainBuf.capacity())
++                g_spareChainBuf = std::move(p.chainData);
+         }
+         else if (p.qwc > 0)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index a27f456..3feff41 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -185,7 +185,9 @@ namespace
+         bool wrapped = false;
+     };
+ 
+-    thread_local DispatchHistory g_dispatchHistory;
++    // Not thread_local: guest code runs on the game thread, and mingw's thread_local is emulated (a library call
++    // per access, on every guest branch dispatch).
++    DispatchHistory g_dispatchHistory;
+ 
+     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 7db542c..3c4ba5d 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,3 +1,4 @@
++#include <mutex>
+ #include <smmintrin.h>
+ #include <algorithm> // TEMP-DEBUG(mhrs)
+ #include <iostream> // TEMP-DEBUG(mhrs)
+@@ -320,17 +321,41 @@ void PS2Memory::flushUnpackBlocks() const
+ {
+     if (std::this_thread::get_id() != m_unpackOwner.load(std::memory_order_relaxed) || m_unpackBlocks.empty())
+         return;
+-    std::vector<UnpackBlock> blocks;
+-    std::vector<uint32_t> words;
+-    std::vector<uint8_t> masks;
+-    blocks.swap(m_unpackBlocks);
+-    words.swap(m_unpackData);
+-    masks.swap(m_unpackMasks);
+-    m_unpackBlocks.reserve(blocks.size());
+-    m_unpackData.reserve(words.size());
+-    m_unpackMasks.reserve(masks.size());
+-    m_gifVuWorker.post([this, blocks = std::move(blocks), words = std::move(words), masks = std::move(masks)]
++    // Unpack buffers go to the GIF/VU worker with each flush and come back emptied, capacity kept: allocating
++    // them per flush on the EE and freeing them on the worker took ~5% of the EE thread.
++    struct UnpackBuffers
++    {
++        std::vector<UnpackBlock> blocks;
++        std::vector<uint32_t> words;
++        std::vector<uint8_t> masks;
++    };
++    static std::mutex g_unpackPoolMutex;
++    static std::vector<UnpackBuffers> g_unpackPool;
++    UnpackBuffers out;
++    {
++        std::lock_guard<std::mutex> lock(g_unpackPoolMutex);
++        if (!g_unpackPool.empty())
++        {
++            out = std::move(g_unpackPool.back());
++            g_unpackPool.pop_back();
++        }
++    }
++    out.blocks.swap(m_unpackBlocks);
++    out.words.swap(m_unpackData);
++    out.masks.swap(m_unpackMasks);
++    // The buffers the next flush fills: room for the largest flush so far, so they grow once, not per flush.
++    static size_t maxBlocks = 0, maxWords = 0, maxMasks = 0;
++    maxBlocks = std::max(maxBlocks, out.blocks.size());
++    maxWords = std::max(maxWords, out.words.size());
++    maxMasks = std::max(maxMasks, out.masks.size());
++    m_unpackBlocks.reserve(maxBlocks);
++    m_unpackData.reserve(maxWords);
++    m_unpackMasks.reserve(maxMasks);
++    m_gifVuWorker.post([this, buffers = std::move(out)]() mutable
+                        {
++                           const std::vector<UnpackBlock> &blocks = buffers.blocks;
++                           const std::vector<uint32_t> &words = buffers.words;
++                           const std::vector<uint8_t> &masks = buffers.masks;
+                            uint8_t *const vu1 = m_vu1Data;
+                            for (const UnpackBlock &b : blocks)
+                            {
+@@ -357,7 +382,13 @@ void PS2Memory::flushUnpackBlocks() const
+                                        }
+                                    i += run;
+                                }
+-                           } });
++                           }
++                           buffers.blocks.clear();
++                           buffers.words.clear();
++                           buffers.masks.clear();
++                           std::lock_guard<std::mutex> lock(g_unpackPoolMutex);
++                           if (g_unpackPool.size() < 8u)
++                               g_unpackPool.push_back(std::move(buffers)); });
+ }
+ 
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)

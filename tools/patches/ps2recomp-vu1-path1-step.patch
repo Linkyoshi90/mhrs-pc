@@ -1,0 +1,60 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 688104c..9f67424 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -455,17 +455,17 @@ void VU1Interpreter::progressXgkick()
+ }
+ 
+ // progressXgkick for every cycle through cycle (the lean engine's lazy PATH1). Inside a GIF tag's data the per-cycle
+-// step only copies a qword every second cycle, so those qwords are copied in one go, up to the tag's last one:
+-// that one, the tags themselves and a wrap around VU memory go through the per-cycle step.
++// step only copies a qword every second cycle, so those qwords are copied in one go, through the tag's last one;
++// the tags themselves and a wrap around VU memory go through the per-cycle step.
+ void VU1Interpreter::progressXgkickTo(uint64_t cycle)
+ {
+     while (m_xgkick.active && m_xgkick.progressedCycle < cycle)
+     {
+-        if (m_activeVuData && m_activeVuDataSize != 0u && m_xgkick.currentTagEnd > m_xgkick.copiedBytes + 16u)
++        if (m_activeVuData && m_activeVuDataSize != 0u && m_xgkick.currentTagEnd > m_xgkick.copiedBytes)
+         {
+             const uint64_t byCredit = (m_xgkick.cycleCredit + (cycle - m_xgkick.progressedCycle)) / 2u;
+             const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+-            const uint64_t qwords = std::min<uint64_t>({byCredit, (m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u - 1u,
++            const uint64_t qwords = std::min<uint64_t>({byCredit, (m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u,
+                                                         (m_activeVuDataSize - source) / 16u});
+             if (qwords != 0u)
+             {
+@@ -473,11 +473,31 @@ void VU1Interpreter::progressXgkickTo(uint64_t cycle)
+                 m_xgkick.copiedBytes += static_cast<uint32_t>(qwords * 16u);
+                 m_xgkick.progressedCycle += qwords * 2u - m_xgkick.cycleCredit; // the cycle the last of them is copied in
+                 m_xgkick.cycleCredit = 0u;
++                // The tag's last qword: what the per-cycle step does after it (packets end on EOP, else a tag follows).
++                if (m_xgkick.copiedBytes >= m_xgkick.currentTagEnd)
++                {
++                    if (m_xgkick.currentTagEop)
++                        finishXgkick();
++                    else
++                    {
++                        m_xgkick.currentTagEnd = 0u;
++                        m_xgkick.currentTagEop = false;
++                    }
++                }
+                 continue;
+             }
+         }
+-        ++m_xgkick.progressedCycle;
+-        progressXgkick();
++        // The per-cycle step copies a qword in the cycle its credit reaches 2: go straight to that cycle.
++        const uint64_t need = m_xgkick.cycleCredit >= 1u ? 1u : 2u;
++        if (m_xgkick.progressedCycle + need > cycle)
++        {
++            m_xgkick.cycleCredit += static_cast<uint32_t>(cycle - m_xgkick.progressedCycle);
++            m_xgkick.progressedCycle = cycle;
++            break;
++        }
++        m_xgkick.progressedCycle += need;
++        m_xgkick.cycleCredit = 1u;
++        progressXgkick(); // credit 2: copies the qword
+     }
+ }
+ 

@@ -1,0 +1,106 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -301,11 +301,31 @@
+ std::atomic<uint64_t> g_mhrsDrain[4]; std::atomic<uint64_t> g_mhrsUnpacks; // TEMP-DEBUG(mhrs) drains: unpack, gspriv, vumem
+ // TEMP-DEBUG(mhrs) fps: game frames = DISPFB1/2 writes (the game flips by writing them once a frame)
+ #include <chrono>
++// Game frames for the HUD (F3): the game writes DISPFB1 once a frame, so count those and keep the longest gap.
++std::atomic<uint64_t> g_gameFrames{0}, g_gameFrameMaxNs{0};
++static void countGameFrame()
++{
++    static int64_t lastNs = 0;
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                            std::chrono::steady_clock::now().time_since_epoch()).count();
++    if (lastNs != 0)
++    {
++        const uint64_t gap = static_cast<uint64_t>(now - lastNs);
++        uint64_t prev = g_gameFrameMaxNs.load(std::memory_order_relaxed);
++        while (gap > prev && !g_gameFrameMaxNs.compare_exchange_weak(prev, gap, std::memory_order_relaxed))
++        {
++        }
++    }
++    lastNs = now;
++    g_gameFrames.fetch_add(1, std::memory_order_relaxed);
++}
+ static void mhrsCountGsPrivWrite(uint32_t address)
+ {
+     const uint32_t reg = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+     if (reg != 0x70u && reg != 0x90u)
+         return;
++    if (reg == 0x70u)
++        countGameFrame();
+     static uint64_t frames = 0;
+     static auto last = std::chrono::steady_clock::now();
+     static uint64_t lastFrames = 0;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -47,6 +47,7 @@
+ 
+ 
+ extern std::atomic<uint64_t> g_mhrsPresents; // TEMP-DEBUG(mhrs) vurec
++extern std::atomic<uint64_t> g_gameFrames, g_gameFrameMaxNs; // ps2_memory.cpp: DISPFB1 writes
+ std::atomic<uint64_t> g_mhrsVurecGif{0}; std::atomic<uint32_t> g_mhrsVurecGifN{0}; // TEMP-DEBUG(mhrs) vurec: XGKICK packet hash
+ static FILE *g_vurec = nullptr; static long g_vurecLeft = -1; static uint64_t g_vurecCodeGen = ~0ull; // TEMP-DEBUG(mhrs) vurec
+ static uint64_t mhrsFnv(const void *p, size_t n, uint64_t h = 1469598103934665603ull) // TEMP-DEBUG(mhrs) vurec
+@@ -2676,11 +2677,15 @@
+         }();
+         SetTextureFilter(frameTex, pointFilter ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+     }
+-    // MHRS_HUD=1 overlays host FPS and emulated vsync rate.
+-    static const bool hudEnabled = std::getenv("MHRS_HUD") != nullptr;
++    // FPS monitor: F3 toggles it, MHRS_HUD=1 starts with it on. Shows the game's frames a second, its slowest frame
++    // in the last half second, the emulated vsync rate and the window's redraw rate.
++    bool hudEnabled = std::getenv("MHRS_HUD") != nullptr;
+     uint64_t hudLastVsync = 0;
++    uint64_t hudLastFrames = 0;
+     double hudLastTime = 0.0;
+     float hudVsyncRate = 0.0f;
++    float hudGameFps = 0.0f;
++    float hudWorstMs = 0.0f;
+ 
+     std::atomic<bool> gameThreadFinished{false};
+ 
+@@ -2801,23 +2806,38 @@
+             dstWidth,
+             dstHeight};
+         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (IsKeyPressed(KEY_F3))
++            hudEnabled = !hudEnabled;
+         if (hudEnabled)
+         {
+             const uint64_t tick = m_eeScheduler->currentVSyncTick();
++            const uint64_t frames = g_gameFrames.load(std::memory_order_relaxed);
+             const double now = GetTime();
+             if (hudLastTime > 0.0 && now > hudLastTime + 0.5)
+             {
+-                hudVsyncRate = static_cast<float>(static_cast<double>(tick - hudLastVsync) / (now - hudLastTime));
++                const double dt = now - hudLastTime;
++                hudVsyncRate = static_cast<float>(static_cast<double>(tick - hudLastVsync) / dt);
++                hudGameFps = static_cast<float>(static_cast<double>(frames - hudLastFrames) / dt);
++                hudWorstMs = static_cast<float>(static_cast<double>(g_gameFrameMaxNs.exchange(0)) / 1e6);
+                 hudLastVsync = tick;
++                hudLastFrames = frames;
+                 hudLastTime = now;
+             }
+             else if (hudLastTime == 0.0)
+             {
+                 hudLastVsync = tick;
++                hudLastFrames = frames;
+                 hudLastTime = now;
++                g_gameFrameMaxNs.store(0);
+             }
+-            DrawText(TextFormat("fps=%d vsync/s=%.1f", GetFPS(), static_cast<double>(hudVsyncRate)),
+-                     8, 8, 20, LIME);
++            // Green at 55+ fps, yellow at 28+, red below.
++            const Color fpsColor = hudGameFps >= 55.0f ? LIME : (hudGameFps >= 28.0f ? YELLOW : RED);
++            const char *line1 = TextFormat("%.0f fps", static_cast<double>(hudGameFps));
++            const char *line2 = TextFormat("slowest %.1f ms  vsync %.0f/s  window %d fps",
++                                           static_cast<double>(hudWorstMs), static_cast<double>(hudVsyncRate), GetFPS());
++            DrawRectangle(4, 4, std::max(MeasureText(line1, 32), MeasureText(line2, 18)) + 12, 62, Color{0, 0, 0, 160});
++            DrawText(line1, 10, 8, 32, fpsColor);
++            DrawText(line2, 10, 42, 18, RAYWHITE);
+         }
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {

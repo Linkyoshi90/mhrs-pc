@@ -1,0 +1,105 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -1,6 +1,11 @@
+ #ifndef PS2_VU1_H
+ #define PS2_VU1_H
+ 
++// 1: VU1 float math like PCSX2 (operands clamped, flush-to-zero, no exact fallback for edge results), faster; 0: exact.
++#ifndef PS2X_VU1_RELAXED
++#define PS2X_VU1_RELAXED 1
++#endif
++
+ #include <array>
+ #include <memory>
+ #include <vector>
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.h b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.h
+@@ -878,6 +878,12 @@
+             const __m128i productDenormal = _mm_and_si128(_mm_cmpgt_epi32(productMagnitude, _mm_setzero_si128()),
+                                                           _mm_cmplt_epi32(productMagnitude, _mm_set1_epi32(0x00800000)));
+             const __m128i productExact = _mm_or_si128(_mm_cmpeq_epi32(productMagnitude, _mm_set1_epi32(0x7F7FFFFF)), productDenormal);
++#if PS2X_VU1_RELAXED
++            (void)productExact;
++            (void)lanes;
++            ps2_vu1_simd::storeDest(decoded.fmacToAcc ? m_state.acc : m_state.vf[VFD(instr)], value, dest);
++            return;
++#endif
+             if (!fused || (static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(productExact))) & lanes) == 0u)
+             {
+                 const __m128i bits = _mm_castps_si128(value);
+@@ -889,9 +895,15 @@
+         }
+     }
+ 
++#if PS2X_VU1_RELAXED
++    a = ps2_vu1_simd::clampOperands(a);
++    b = ps2_vu1_simd::clampOperands(b);
++    const __m128 acc = ps2_vu1_simd::clampOperands(_mm_loadu_ps(m_state.acc));
++#else
+     a = ps2_vu1_simd::normalizeOperands(a);
+     b = ps2_vu1_simd::normalizeOperands(b);
+     const __m128 acc = ps2_vu1_simd::normalizeOperands(_mm_loadu_ps(m_state.acc));
++#endif
+ 
+     if constexpr (kFastFlags)
+     {
+@@ -945,7 +957,12 @@
+                 ok = _mm_or_si128(ok, exactZero);
+             }
+             const uint32_t fastDest = ps2_vu1_simd::reverseLanes[dest];
++#if PS2X_VU1_RELAXED
++            (void)ok;
++            if (true)
++#else
+             if ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(ok))) & fastDest) == fastDest)
++#endif
+             {
+                 const uint32_t macSign = static_cast<uint32_t>(_mm_movemask_ps(fast)) & fastDest;
+                 const uint32_t macZero = static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpeq_ps(fast, zeroPs))) & fastDest;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -842,8 +842,12 @@
+     // before host arithmetic anyway. With the mode set the host does that itself (ps2_vu1_simd::clampOperands).
+     constexpr unsigned kDenormalsAreZero = 0x0040u;
+     const unsigned previousCsr = _mm_getcsr();
++#if PS2X_VU1_RELAXED
++    _mm_setcsr(previousCsr | kDenormalsAreZero | 0x8000u); // and flush-to-zero: tiny results become signed zero
++#else
+     _mm_setcsr(previousCsr | kDenormalsAreZero);
+ #endif
++#endif
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     const bool codeCached = prepareDecodedCodeCache(vuCode, codeSize, memory);
+     // Only a start that has no lean program is recorded: the game composes tens of thousands of code images out of
+@@ -938,7 +942,7 @@
+     syncFlags();
+     m_state.cycles = m_cycle;
+ #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+-    _mm_setcsr((_mm_getcsr() & ~kDenormalsAreZero) | (previousCsr & kDenormalsAreZero));
++    _mm_setcsr((_mm_getcsr() & ~(kDenormalsAreZero | 0x8000u)) | (previousCsr & (kDenormalsAreZero | 0x8000u)));
+ #endif
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -1633,6 +1633,7 @@
+                      "CLIP should shift and commit the six new comparison bits");
+         });
+ 
++#if !PS2X_VU1_RELAXED // relaxed VU1 floats do not report overflow/underflow edge cases exactly
+         tc.Run("VU1 FMAC normalizes overflow and underflow before writing results", [](TestCase &t)
+         {
+             Vu1Fixture fx;
+@@ -1690,6 +1691,8 @@
+                      "the underflowing product should set sticky Z and U");
+         });
+ 
++#endif
++
+         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
+         {
+             Vu1Fixture fx;

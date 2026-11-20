@@ -1,0 +1,113 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index a85b71d..688104c 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,3 +1,4 @@
++#include <nmmintrin.h>
+ #include "runtime/ps2_vu1_exec.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -603,26 +604,52 @@ bool VU1Interpreter::leanEntryReady() const
+ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+                                              const PS2Memory *memory, uint64_t generation)
+ {
+-    uint64_t contentHash = codeSize;
+-    for (uint32_t i = 0; i + 8u <= codeSize; i += 8u)
++    // The game swaps microcode thousands of times a second, so this runs that often: four independent CRC32C
++    // streams (the match is confirmed by a full compare below).
++    uint64_t c0 = codeSize, c1 = 1u, c2 = 2u, c3 = 3u;
++    uint32_t i = 0;
++    for (; i + 32u <= codeSize; i += 32u)
+     {
+-        uint64_t word = 0;
+-        std::memcpy(&word, vuCode + i, sizeof(word));
+-        contentHash = (contentHash ^ word) * 0x9E3779B97F4A7C15ull;
+-        contentHash ^= contentHash >> 29;
++        uint64_t w[4];
++        std::memcpy(w, vuCode + i, sizeof(w));
++        c0 = _mm_crc32_u64(c0, w[0]), c1 = _mm_crc32_u64(c1, w[1]), c2 = _mm_crc32_u64(c2, w[2]), c3 = _mm_crc32_u64(c3, w[3]);
+     }
++    for (; i + 8u <= codeSize; i += 8u)
++    {
++        uint64_t w;
++        std::memcpy(&w, vuCode + i, sizeof(w));
++        c0 = _mm_crc32_u64(c0, w);
++    }
++    const uint64_t contentHash = (c0 | (c1 << 32)) ^ ((c2 | (c3 << 32)) * 0x9E3779B97F4A7C15ull);
++    const auto sameCode = [](const uint8_t *a, const uint8_t *b, uint32_t size)
++    {
++        uint32_t k = 0;
++        for (; k + 64u <= size; k += 64u)
++        {
++            __m128i d = _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(a + k)),
++                                      _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + k)));
++            for (uint32_t o = 16u; o < 64u; o += 16u)
++                d = _mm_or_si128(d, _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(a + k + o)),
++                                                  _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + k + o))));
++            if (!_mm_testz_si128(d, d))
++                return false;
++        }
++        return std::memcmp(a + k, b + k, size - k) == 0;
++    };
+     const bool blocksEnabled = compiledBlocksEnabled();
+     DecodedImage *image = nullptr;
+     for (const auto &candidate : m_decodedImages)
+         if (candidate->hash == contentHash && candidate->blocksEnabled == blocksEnabled && candidate->code.size() == codeSize &&
+-            std::memcmp(candidate->code.data(), vuCode, codeSize) == 0)
++            sameCode(candidate->code.data(), vuCode, codeSize))
+         {
+             image = candidate.get();
+             break;
+         }
+     if (!image)
+     {
+-        if (m_decodedImages.size() < kMaxDecodedImages)
++        // More than the header's 64: the first room of mission 1 cycles through more code images than that.
++        constexpr size_t kImageCap = 4u * kMaxDecodedImages;
++        if (m_decodedImages.size() < kImageCap)
+             image = m_decodedImages.emplace_back(std::make_unique<DecodedImage>()).get();
+         else
+             image = std::min_element(m_decodedImages.begin(), m_decodedImages.end(),
+@@ -835,18 +862,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     m_activeGs = &gs;
+     m_activeMemory = memory;
+ 
+-    const int previousRoundingMode = std::fegetround();
+-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+ #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+-    // Denormals-are-zero for the run: the VU has no denormals, and every op here normalizes them to signed zeros
+-    // before host arithmetic anyway. With the mode set the host does that itself (ps2_vu1_simd::clampOperands).
+-    constexpr unsigned kDenormalsAreZero = 0x0040u;
++    // Round toward zero (the VU's rounding) and denormals-are-zero for the run: the VU has no denormals, and every
++    // op here normalizes them to signed zeros before host arithmetic anyway. With the mode set the host does that
++    // itself (ps2_vu1_simd::clampOperands). Set in MXCSR directly: the host float math is SSE, and mingw's
++    // fesetround/fegetround (x87 and SSE, through msvcrt) took ~2% of the GIF/VU1 worker at ~100k runs a second.
++    constexpr unsigned kDenormalsAreZero = 0x0040u, kRoundTowardZero = 0x6000u;
+     const unsigned previousCsr = _mm_getcsr();
+ #if PS2X_VU1_RELAXED
+-    _mm_setcsr(previousCsr | kDenormalsAreZero | 0x8000u); // and flush-to-zero: tiny results become signed zero
++    constexpr unsigned kRunCsrBits = kDenormalsAreZero | 0x8000u | kRoundTowardZero; // and flush-to-zero: tiny results become signed zero
+ #else
+-    _mm_setcsr(previousCsr | kDenormalsAreZero);
++    constexpr unsigned kRunCsrBits = kDenormalsAreZero | kRoundTowardZero;
+ #endif
++    _mm_setcsr((previousCsr & ~kRoundTowardZero) | kRunCsrBits);
++#else
++    const int previousRoundingMode = std::fegetround();
++    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+ #endif
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     const bool codeCached = prepareDecodedCodeCache(vuCode, codeSize, memory);
+@@ -942,8 +973,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     syncFlags();
+     m_state.cycles = m_cycle;
+ #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+-    _mm_setcsr((_mm_getcsr() & ~(kDenormalsAreZero | 0x8000u)) | (previousCsr & (kDenormalsAreZero | 0x8000u)));
+-#endif
++    constexpr unsigned kRestore = kRunCsrBits | 0x8000u;
++    _mm_setcsr((_mm_getcsr() & ~kRestore) | (previousCsr & kRestore));
++#else
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
++#endif
+ }
