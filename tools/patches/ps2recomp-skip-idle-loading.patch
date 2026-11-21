@@ -1,0 +1,219 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index a17c619..0596b76 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -269,6 +269,14 @@ public:
+     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
+ 
+     explicit EeScheduler(PS2Runtime &runtime);
++
++    // While `whileFn(rdram)` is true (a game's loading screens, say), host time the EE would only wait out is
++    // skipped: guest time runs as fast as the host executes it. Null turns it off. Set once, by a game override.
++    using SkipIdleFn = bool (*)(const uint8_t *rdram);
++    static void setSkipIdleWhile(SkipIdleFn whileFn);
++    // Host milliseconds since the EE last wrote a GS display register (PMODE..BGCOLOR, a flip); large before the
++    // first one.
++    static int64_t hostMsSinceDisplayWrite();
+     ~EeScheduler();
+ 
+     EeScheduler(const EeScheduler &) = delete;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index ba119fd..ccc4b18 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -58,6 +58,18 @@ namespace
+ 
+     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+ 
++    std::atomic<EeScheduler::SkipIdleFn> g_skipIdleWhile{nullptr};
++
++    // Host deadlines re-anchored to the guest clock: each one is as far from now as its cycle is from `eeCycle`.
++    // After skipped idle time they would otherwise lie in the future by the time skipped, and the EE would wait it
++    // out once skipping stops.
++    template <typename Events>
++    void anchorHostDeadlines(Events &deadlines, uint64_t eeCycle, std::chrono::steady_clock::time_point now)
++    {
++        for (auto &item : deadlines)
++            item.hostDeadline = now + eeCyclesToHostDuration(item.deadlineCycle > eeCycle ? item.deadlineCycle - eeCycle : 0u);
++    }
++
+     // Fast forward (ps2_pad_keys.h): guest time runs kFastForward times faster than host time, so the host wait
+     // for a guest duration (a vblank period, an alarm) shrinks by that factor.
+     constexpr int kFastForward = 8;
+@@ -1930,6 +1942,32 @@ void EeScheduler::processPendingEvents()
+     applyPendingPreemption();
+ }
+ 
++void EeScheduler::setSkipIdleWhile(SkipIdleFn whileFn)
++{
++    g_skipIdleWhile.store(whileFn, std::memory_order_relaxed);
++}
++
++int64_t EeScheduler::hostMsSinceDisplayWrite()
++{
++    extern std::atomic<int64_t> g_lastDisplayWriteNs; // ps2_memory.cpp
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    return (now - g_lastDisplayWriteNs.load(std::memory_order_relaxed)) / 1000000;
++}
++
++// Set by sceMpegGetPicture, which a playing movie calls for every picture.
++std::atomic<int64_t> g_lastMoviePictureNs{0};
++
++static bool skipIdleNow(PS2Runtime &runtime)
++{
++    const EeScheduler::SkipIdleFn whileFn = g_skipIdleWhile.load(std::memory_order_relaxed);
++    if (whileFn == nullptr || !whileFn(runtime.memory().getRDRAM()))
++        return false;
++    // Never during a movie: its pictures follow the guest clock, and a load can run under one.
++    constexpr int64_t kMovieQuietNs = 200 * 1000000ll;
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    return now - g_lastMoviePictureNs.load(std::memory_order_relaxed) >= kMovieQuietNs;
++}
++
+ void EeScheduler::processDueDeadlines()
+ {
+     catchUpToHostVBlank();
+@@ -1958,7 +1996,14 @@ void EeScheduler::processDueDeadlines()
+ 
+             // A wait far below the host timer resolution still sleeps a whole timer tick (15.6 ms by default on
+             // Windows): an alarm due in 20 us each vblank put the EE to sleep for nearly all of the time.
+-            if (now + kPacingSlack < pacingDeadline)
++            if (now + kPacingSlack < pacingDeadline && skipIdleNow(m_runtime))
++            {
++                // The guest clock is ahead of host time: let it be, instead of stopping the EE until host time
++                // catches up.
++                anchorHostDeadlines(m_deadlines, m_eeCycle, now);
++                m_nextVBlankHost = now + eeCyclesToHostDuration(m_nextVBlankCycle > m_eeCycle ? m_nextVBlankCycle - m_eeCycle : 0u);
++            }
++            else if (now + kPacingSlack < pacingDeadline)
+             {
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                      { return !m_events.empty() ||
+@@ -2201,9 +2246,13 @@ void EeScheduler::waitForEvent()
+     }
+ 
+     const int mhrsPrevState = mhrs_debug::g_state.exchange(3, std::memory_order_relaxed); // TEMP-DEBUG(mhrs)
+-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+-                                               { return !m_events.empty() ||
+-                                                        m_stopRequested.load(std::memory_order_acquire); });
++    // Every thread waits for the next deadline: jump to it now when idle time is skipped (processDueDeadlines then
++    // fires it without waiting for its host time).
++    const bool skip = hostDeadline != std::chrono::steady_clock::time_point::max() && skipIdleNow(m_runtime);
++    const bool signaled = skip ? (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
++                               : m_eventCv.wait_until(lock, hostDeadline, [this]()
++                                                      { return !m_events.empty() ||
++                                                               m_stopRequested.load(std::memory_order_acquire); });
+     mhrs_debug::g_state.store(mhrsPrevState, std::memory_order_relaxed); // TEMP-DEBUG(mhrs)
+     if (!signaled)
+     {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 3cc89b8..ba3d9ad 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -23,6 +23,8 @@ extern "C"
+ 
+ #include "Syscalls/Helpers/State.h"
+ 
++extern std::atomic<int64_t> g_lastMoviePictureNs; // EeScheduler.cpp: no idle skipping while a movie plays
++
+ namespace ps2_stubs
+ {
+     namespace
+@@ -2357,6 +2359,10 @@ namespace ps2_stubs
+ 
+     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        {
++            g_lastMoviePictureNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
++                                       std::memory_order_relaxed);
++        }
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         const uint32_t imageAddr = getRegU32(ctx, 5);
+         uint32_t width = kStubMovieWidth;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 5b81934..7c64e28 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -820,8 +820,11 @@ uint16_t PS2Memory::read16(uint32_t address)
+ // and GS stage finishing the last frame (~20% of the EE waited there).
+ // ponytail: the throttle counters are process-wide (one PS2Memory runs the game); per instance if that changes.
+ static std::atomic<uint64_t> g_displayWritesPosted{0}, g_displayWritesDone{0};
++std::atomic<int64_t> g_lastDisplayWriteNs{0}; // steady clock; read by EeScheduler::hostMsSinceDisplayWrite
+ static void writeDisplayReg(PS2Memory &memory, uint64_t *reg, uint64_t mask, uint64_t bits)
+ {
++    g_lastDisplayWriteNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
++                               std::memory_order_relaxed);
+     const uint64_t n = g_displayWritesPosted.fetch_add(1u, std::memory_order_relaxed) + 1u;
+     memory.postGsAfterGifVu([reg, mask, bits]()
+                             {
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index 4261bfa..e7c437c 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -175,6 +175,37 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    // Skip-idle test: 36 vblank waits one after another; idle time skipped for the first 30 only.
++    constexpr uint32_t kVBlankLoopPc = 0x00160140u;
++    std::atomic<bool> g_skipIdle{false};
++    int g_vblanksLeft = 0;
++    std::chrono::steady_clock::time_point g_loopStart, g_loopSwitch, g_loopEnd;
++    bool skipIdleWhileSet(const uint8_t *) { return g_skipIdle.load(std::memory_order_relaxed); }
++    void schedulerVBlankLoop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const auto now = std::chrono::steady_clock::now();
++        if (g_vblanksLeft == 36)
++        {
++            g_loopStart = now;
++            g_skipIdle = true;
++        }
++        if (g_vblanksLeft == 6)
++        {
++            g_loopSwitch = now;
++            g_skipIdle = false;
++        }
++        if (g_vblanksLeft-- <= 0)
++        {
++            g_loopEnd = now;
++            ctx->pc = 0u;
++            runtime->requestStop();
++            return;
++        }
++        EeScheduler &scheduler = runtime->eeScheduler();
++        ctx->pc = kVBlankLoopPc;
++        scheduler.waitVSync(scheduler.currentVSyncTick());
++    }
++
+     void schedulerIntcHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+     {
+         g_dispatchTrace.push_back(2);
+@@ -525,6 +556,28 @@ void register_ps2_runtime_interrupt_tests()
+                      "the first VBlank should publish GS CSR.FIELD before resuming guest code");
+         });
+ 
++        tc.Run("skipped idle time runs vblanks without host waits, and the clock is host-paced again afterwards", [](TestCase &t)
++        {
++            TestEnv env;
++            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
++            env.runtime.registerFunction(kVBlankLoopPc, schedulerVBlankLoop);
++            EeScheduler::setSkipIdleWhile(&skipIdleWhileSet);
++            g_vblanksLeft = 36;
++            R5900Context mainContext{};
++            mainContext.pc = kVBlankLoopPc;
++            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++            env.runtime.eeScheduler().run();
++            EeScheduler::setSkipIdleWhile(nullptr);
++            g_skipIdle = false;
++            const auto ms = [](auto from, auto to) { return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count(); };
++            const auto skipped = ms(g_loopStart, g_loopSwitch); // 30 vblanks: 500 ms of guest time
++            const auto paced = ms(g_loopSwitch, g_loopEnd);     // 6 vblanks: 100 ms
++            t.IsTrue(g_vblanksLeft < 0, "all 36 vblank waits return");
++            t.IsTrue(skipped < 250, "30 vblanks with idle time skipped take far less than 500 ms");
++            t.IsTrue(paced >= 60 && paced < 400, "6 vblanks afterwards take host time again, without waiting out the skipped time");
++            cleanupRuntime(env);
++        });
++
+         tc.Run("VBlank IRQ invocation completes before the resumed base context", [](TestCase &t)
+         {
+             TestEnv env;

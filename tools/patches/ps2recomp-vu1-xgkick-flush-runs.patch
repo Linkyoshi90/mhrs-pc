@@ -1,0 +1,33 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 9f67424..86ab29d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -560,7 +560,28 @@ bool VU1Interpreter::pipelinesPending() const
+ void VU1Interpreter::flushPipelines()
+ {
+     while (pipelinesPending())
++    {
++        // Only PATH1 left (the program's last XGKICK, often hundreds of cycles): finish it in runs, as the per-cycle
++        // steps would, and land on the cycle its last qword is copied in. Nothing writes VU memory any more.
++        if (m_xgkick.active)
++        {
++            m_xgkick.active = false;
++            const bool others = pipelinesPending();
++            m_xgkick.active = true;
++            if (!others)
++            {
++                m_xgkick.progressedCycle = m_cycle; // the per-cycle steps kept cycleCredit current through m_cycle
++                progressXgkickTo(UINT64_MAX);
++                if (m_xgkick.progressedCycle > m_cycle)
++                {
++                    m_cycle = m_xgkick.progressedCycle;
++                    m_state.cycles = m_cycle;
++                }
++                continue;
++            }
++        }
+         advanceOneCycle();
++    }
+ }
+ 
+ namespace

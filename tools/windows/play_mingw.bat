@@ -13,6 +13,7 @@ rem FPS monitor in the top-left corner; F3 hides it.
 set MHRS_HUD=1
 rem Mouse aim (moves the right stick, captures the cursor; Alt+Tab to leave). controls.ini mouse_look overrides it.
 set PS2X_MOUSE_LOOK=8
+rem Loading screens skip the time the game only waits out (tools\frame_rate.md). set MHRS_FAST_LOAD=0 for real-time loads.
 rem In the game window: F2 rebinds the controls (saved to controls.ini), F5 opens the cheat menu (saved to cheats.ini).
 set EXEDIR=%~1
 if "%EXEDIR%"=="" set EXEDIR=build\mingw_play

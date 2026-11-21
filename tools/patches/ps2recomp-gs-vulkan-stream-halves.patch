@@ -1,0 +1,152 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index 3bbb808..ce7ee20 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -567,11 +567,13 @@ struct GSVulkanBackend::VkState
+ {
+     static constexpr uint32_t kNone = UINT32_MAX;
+     static constexpr uint32_t kMaxStates = 16384u;
+-    static constexpr uint32_t kMaxGeoms = 131072u;
+-    static constexpr uint32_t kTileWords = 4u * 1024u * 1024u;
+-    static constexpr uint32_t kClutSlots = 2048u;
+-    static constexpr uint32_t kUploadBytes = 16u * 1024u * 1024u;
+-    static constexpr uint32_t kCommandBuffers = 64u;
++    // Used in two halves (see switchHalf). Gameplay sends ~48k primitives, ~1.2M tile words and ~500 palettes per
++    // present: a half holds a few presents.
++    static constexpr uint32_t kMaxGeoms = 262144u;
++    static constexpr uint32_t kTileWords = 8u * 1024u * 1024u;
++    static constexpr uint32_t kClutSlots = 8192u;
++    static constexpr uint32_t kUploadBytes = 32u * 1024u * 1024u;
++    static constexpr uint32_t kCommandBuffers = 256u;
+     static constexpr uint32_t kBatchPrims = 4096u; // also the most primitives left unsubmitted
+ 
+     VkInstance instance = VK_NULL_HANDLE;
+@@ -664,6 +666,14 @@ struct GSVulkanBackend::VkState
+     std::array<VkCommandBuffer, kCommandBuffers> commandBuffers{};
+     uint32_t commandIndex = 0;
+     bool commandOpen = false;
++    // The streams, the upload buffer and the command buffers are used in two halves. A full half waits only for the GPU
++    // work recorded in the other half (its fence), not for the GPU to go idle: in gameplay the streams filled every
++    // ~3 presents, and each drain cost ~3.5 ms at 2x internal resolution.
++    uint32_t half = 0;
++    std::array<VkFence, 2> halfFences{};
++    bool switchPending = false; // the command buffers of this half are nearly used up
++    static uint32_t halfStart(uint32_t half, uint32_t capacity) { return half * (capacity / 2u); }
++    uint32_t halfEnd(uint32_t capacity) const { return (half + 1u) * (capacity / 2u); }
+ 
+     // The open batch: geoms[geoms.used - batchGeoms ..) with one tile box each.
+     struct TileBox
+@@ -712,6 +722,7 @@ struct GSVulkanBackend::VkState
+     void idleReset();
+     void drain();
+     void waitIdle();
++    void switchHalf();
+     void stageCpuDirty();
+     void closeBatch();
+     void syncToCpu();
+@@ -988,6 +999,11 @@ bool GSVulkanBackend::initVulkan()
+     for (VkFence &fence : vk.slotFences)
+         if (vkCreateFence(vk.device, &fenceInfo, nullptr, &fence) != VK_SUCCESS)
+             return false;
++    VkFenceCreateInfo signaledInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++    signaledInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // no work in the other half yet
++    for (VkFence &fence : vk.halfFences)
++        if (vkCreateFence(vk.device, &signaledInfo, nullptr, &fence) != VK_SUCCESS)
++            return false;
+ 
+     VkPhysicalDeviceProperties props{};
+     vkGetPhysicalDeviceProperties(vk.phys, &props);
+@@ -1006,6 +1022,9 @@ void GSVulkanBackend::shutdownVulkan()
+         for (VkFence fence : vk.slotFences)
+             if (fence != VK_NULL_HANDLE)
+                 vkDestroyFence(vk.device, fence, nullptr);
++        for (VkFence fence : vk.halfFences)
++            if (fence != VK_NULL_HANDLE)
++                vkDestroyFence(vk.device, fence, nullptr);
+         if (vk.commandPool)
+             vkDestroyCommandPool(vk.device, vk.commandPool, nullptr);
+         if (vk.pipeline)
+@@ -1063,10 +1082,17 @@ void GSVulkanBackend::VkState::barrier(VkCommandBuffer cb)
+ // The queue is idle: everything submitted has run, so its inputs can be overwritten.
+ void GSVulkanBackend::VkState::idleReset()
+ {
++    switchPending = false;
++    if (batchGeoms != 0u)
++    {
++        // The open batch still lives in this half of the streams: stay in it (the GPU is idle, all of it is free).
++        commandIndex = halfStart(half, kCommandBuffers);
++        uploadUsed = halfStart(half, kUploadBytes);
++        return;
++    }
++    half = 0; // both halves are free
+     commandIndex = 0;
+     uploadUsed = 0;
+-    if (batchGeoms != 0u)
+-        return; // the open batch still lives in the streams
+     for (Stream *stream : {&states, &geoms, &tiles, &cluts})
+         stream->used = stream->copied = 0;
+     stateIndex = kNone;
+@@ -1087,13 +1113,40 @@ void GSVulkanBackend::VkState::submit(VkFence fence)
+     commandOpen = false;
+     unsubmitted = 0;
+     ++stats.submits;
+-    if (++commandIndex == kCommandBuffers)
++    // The switch to the other half happens at the next draw (switchHalf records into the streams); a few spare command
++    // buffers cover the submits before it. Out of them anyway: wait for the GPU as before.
++    if (++commandIndex + 8u >= halfEnd(kCommandBuffers))
++        switchPending = true;
++    if (commandIndex == halfEnd(kCommandBuffers))
+     {
+         vkQueueWaitIdle(queue);
+         idleReset();
+     }
+ }
+ 
++// The open batch goes out, this half's work gets a fence, and recording continues in the other half once the GPU is
++// done with what was recorded there before.
++void GSVulkanBackend::VkState::switchHalf()
++{
++    closeBatch();
++    submit();
++    vkResetFences(device, 1, &halfFences[half]);
++    vkQueueSubmit(queue, 0, nullptr, halfFences[half]); // signals once everything submitted so far has run
++    half ^= 1u;
++    const auto t0 = std::chrono::steady_clock::now();
++    vkWaitForFences(device, 1, &halfFences[half], VK_TRUE, UINT64_MAX);
++    stats.waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    switchPending = false;
++    commandIndex = halfStart(half, kCommandBuffers);
++    uploadUsed = halfStart(half, kUploadBytes);
++    states.used = states.copied = halfStart(half, kMaxStates);
++    geoms.used = geoms.copied = halfStart(half, kMaxGeoms);
++    tiles.used = tiles.copied = halfStart(half, kTileWords);
++    cluts.used = cluts.copied = halfStart(half, kClutSlots);
++    stateIndex = kNone; // both point into the half left behind
++    clutSlot = kNone;
++}
++
+ void GSVulkanBackend::VkState::drain()
+ {
+     submit();
+@@ -1121,7 +1174,7 @@ void GSVulkanBackend::VkState::stageCpuDirty()
+ {
+     if (cpuDirty.none())
+         return;
+-    if (uploadUsed + cpuDirty.count() * kPageBytes > kUploadBytes)
++    if (uploadUsed + cpuDirty.count() * kPageBytes > halfEnd(kUploadBytes)) // rare: a half holds many presents
+         drain();
+     regions.clear();
+     forPageRuns(cpuDirty, [&](uint32_t first, uint32_t count)
+@@ -1551,9 +1604,9 @@ void GSVulkanBackend::VkState::draw(const GSPrimitiveBatch &batch)
+                       static_cast<uint8_t>(g.maxX >> 3), static_cast<uint8_t>(g.maxY >> 3)};
+     const uint32_t entries = (box.x1 - box.x0 + 1u) * (box.y1 - box.y0 + 1u);
+     // Tile headers take at most three words per list word.
+-    if (geoms.used == kMaxGeoms || states.used == kMaxStates || cluts.used == kClutSlots ||
+-        tiles.used + 4u * (batchEntries + entries) > kTileWords)
+-        waitIdle();
++    if (switchPending || geoms.used == halfEnd(kMaxGeoms) || states.used == halfEnd(kMaxStates) ||
++        cluts.used == halfEnd(kClutSlots) || tiles.used + 4u * (batchEntries + entries) > halfEnd(kTileWords))
++        switchHalf();
+ 
+     uint32_t clutBase = 0u;
+     if (p.tme != 0u && isOneOf(p.texPsm, {GS_PSM_T8, GS_PSM_T4, GS_PSM_T8H, GS_PSM_T4HL, GS_PSM_T4HH}))

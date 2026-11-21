@@ -1,0 +1,48 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index b37bb37..5d7c2c1 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1006,14 +1006,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     // mask cycle: data (mask 0) where the format supplies the lane, ROW (1), COL (2); 3 and kept lanes
+                     // stay (kept lanes in modes 1/2 went to readsMemory above).
+                     uint8_t laneMask[4];
+-                    uint8_t specs[4][4];
+                     for (uint32_t c = 0; c < 4u; ++c)
+                     {
+                         laneMask[c] = 0u;
+                         for (uint32_t field = 0; field < 4u; ++field)
+                         {
+                             const uint32_t spec = maskSpecAt(c, field);
+-                            specs[c][field] = static_cast<uint8_t>(spec);
+                             if ((spec == 0u && ((sourceLanes >> field) & 1u) != 0u) || spec == 1u || spec == 2u)
+                                 laneMask[c] |= static_cast<uint8_t>(1u << field);
+                         }
+@@ -1036,19 +1034,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     // Per mask cycle, as lane masks for blends: lanes taken from the data (mask 0 where the format
+                     // supplies the lane), from ROW (1), from COL (2). Other lanes stay 0 (not written: laneMask).
+                     __m128i dataSel[4], rowSel[4], colSel[4], colVec[4];
++                    // Straight from the MASK bits (two per field, see maskSpecAt): selectors written to stack arrays and
++                    // loaded as vectors stalled on store forwarding, about a fifth of this function in gameplay.
++                    const __m128i laneBits = _mm_setr_epi32(1, 2, 4, 8);
++                    const __m128i sourceSel = _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(sourceLanes), laneBits), laneBits);
+                     for (uint32_t c = 0; c < usedCycles; ++c)
+                     {
+-                        alignas(16) int32_t dl[4], rl[4], cl4[4];
+-                        for (uint32_t field = 0; field < 4u; ++field)
+-                        {
+-                            const uint32_t spec = specs[c][field];
+-                            dl[field] = spec == 0u && ((sourceLanes >> field) & 1u) != 0u ? -1 : 0;
+-                            rl[field] = spec == 1u ? -1 : 0;
+-                            cl4[field] = spec == 2u ? -1 : 0;
+-                        }
+-                        dataSel[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(dl));
+-                        rowSel[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(rl));
+-                        colSel[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(cl4));
++                        const uint32_t cycleBits = maskEnable ? (vif1_regs.mask >> (c * 8u)) & 0xFFu : 0u;
++                        const __m128i fields = _mm_and_si128(_mm_set1_epi32(static_cast<int32_t>(cycleBits)), _mm_setr_epi32(0x03, 0x0C, 0x30, 0xC0));
++                        dataSel[c] = _mm_and_si128(_mm_cmpeq_epi32(fields, _mm_setzero_si128()), sourceSel);
++                        rowSel[c] = _mm_cmpeq_epi32(fields, _mm_setr_epi32(0x01, 0x04, 0x10, 0x40));
++                        colSel[c] = _mm_cmpeq_epi32(fields, _mm_setr_epi32(0x02, 0x08, 0x20, 0x80));
+                         colVec[c] = _mm_set1_epi32(static_cast<int32_t>(vif1_regs.col[c]));
+                     }
+                     __m128i rowVec = _mm_loadu_si128(reinterpret_cast<const __m128i *>(vif1_regs.row));

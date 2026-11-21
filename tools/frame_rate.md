@@ -257,6 +257,88 @@ Three things are needed together.
      Measured while ComfyUI shared the GPU (8 GB of VRAM, generating now and then; runs ranged 57–94), so the
      size of the gain is uncertain. The new build won all three pairs: 64 vs 57, 82 vs 79, 88 vs 71.
      `ab2.sh` (scratchpad) logs GPU utilization per run to spot such load.
+
+## Vulkan GS streams (2026-11-21, `ps2recomp-gs-vulkan-stream-halves`)
+
+At 2× the game ran at 84–95 flips/s, against ~104 at 1×. The GS backend thread waited ~10% of its time on the GPU
+(`PS2X_VK_STATS` waitMs ~450 per 400 presents at 2×, ~160 at 1×). The waits were full GPU drains to rewind the
+batch streams, which are linear buffers reset only when the GPU is idle:
+- Gameplay sends ~48k primitives and ~1.2M tile words per present. The geometry stream (131k) filled every
+  ~2.7 presents, the tile stream (4M words) every ~3.6.
+- The CLUT stream (2048 palettes) filled every ~4 presents.
+
+First step: streams 4–8× larger, so they no longer filled in gameplay. Waits ~450 → ~110 ms per 400 presents.
+A/B at 2×, three rounds: 93.9 / 94.6 / 93.1 → 97.6 / 97.2 / 97.7 flips/s, steadier (96–98.7).
+
+Final version: the streams, the upload buffer and the command buffers are used in two halves with a fence each
+(`switchHalf`). A full half waits only for the GPU work recorded in the other half, usually finished long ago.
+Totals are back to 2× the original sizes (geometry 262144, tiles 8M words, CLUTs 8192, upload 32 MB, 256
+command buffers): ~110 MB more than before instead of ~290 MB. GPU waits fell to ~0.4 ms per 400 presents. The
+frame rate is unchanged against the larger buffers (97.7 vs 97.4): at 2× the VU1 worker is the bound again.
+Upload overflow inside `closeBatch` and running out of command buffers without a draw still drain the GPU as
+before (neither happens in gameplay). At 3× the GPU is the bound (94–96% busy, ~70–73 flips/s with or without
+this change): faster 3× needs a cheaper raster shader.
+
+## XGKICK at program end (2026-11-21, `ps2recomp-vu1-xgkick-flush-runs`)
+
+All VU1 runs in mission 1 are lean programs, yet the worker made ~17M `progressXgkick` calls a second. They came
+from `flushPipelines()` at the end of each program, which stepped `advanceOneCycle()` per cycle through the
+program's last XGKICK, often hundreds of cycles. Once only PATH1 is left, it now finishes the packet with
+`progressXgkickTo()`, which copies tag data in runs, and lands on the cycle the last qword is copied in. Nothing
+writes VU memory after the program has ended, so the bytes are the same. cycles/flip unchanged (~3.05M). A/B at
+2×, four rounds: 98.4 / 96.8 / 98.4 / 97.8 → 101.1 / 101.8 / 100.0 / 100.1 flips/s.
+
+## EE UNPACK lane selectors (2026-11-21, `ps2recomp-vif1-unpack-selectors`)
+
+About a fifth of `processVIF1Data` on the EE was a store-forwarding stall. Per UNPACK and mask cycle, three lane
+selectors were written to stack arrays as four 32-bit values and loaded back as one vector. They are now built with
+SSE compares from the MASK bits. EE share 18.9% → 17.8%. The frame rate is unchanged (the VU1 worker is the
+bound), but the EE was ~87% busy.
+
+## Loading screens (2026-11-21, `ps2recomp-skip-idle-loading` + `src/game/fast_load.cpp`)
+
+Loads were paced by real time, not by the disc or the CPU. The emulated DVD has no speed model, so reads are
+instant. The EE clock is held to host time, though: vblanks, `SetAlarm` alarms and EE timers wait for their
+real-time deadline, and the IOP advances with EE cycles. Mission 1 from "Start Mission" to gameplay:
+- About 7 s of disc reads with the main thread blocked and no frames: one 5.7 s stretch had the EE idle 89%.
+- Then the loader state machine (func_0026DC80, state word D_004BB870 2..4, 5 when done): 7.8 s, EE idle 78%.
+  Each of its steps takes ~200 ms of frame and alarm waits. Halving the IOP's speed changed nothing.
+
+The fast-forward key doesn't help here: at 8× vblanks the main thread's loading-screen frame no longer fits in the
+limiter's 2 vblanks, so it never sleeps, and the loader thread only runs while it sleeps (level load 7.8 → 21.5 s).
+
+Now the scheduler skips idle time while a game-supplied predicate holds
+(`EeScheduler::setSkipIdleWhile`):
+- When every guest thread waits, it jumps straight to the next deadline.
+- When the guest clock is ahead of host time, it doesn't stop the EE.
+- Host deadlines are re-anchored to the guest clock, so nothing waits out the skipped time afterwards.
+
+Every guest wait stays as long in guest time, so the loader keeps its share. Never while a movie plays
+(`sceMpegGetPicture` within 200 ms): the game loads its front end under the opening movie, which ran too fast
+before that guard.
+
+The game's predicate: loader state 0..4, or no display-register write for 200 ms
+(`EeScheduler::hostMsSinceDisplayWrite`). Movies, menus and gameplay flip every 17–40 ms. The game's own
+frame counter doesn't work for this, because the movie player bypasses the main loop. State 0 lasts from boot
+to the first load, which covers the "Checking for memory card" screen (4.5 s, EE idle ~85%). The THX and EA
+logo movies still play at normal speed because of the movie guard.
+
+| Phase | Before | After |
+| --- | --- | --- |
+| Mission 1 disc reads (no frames) | ~7 s | ~0.8 s |
+| Mission 1 loader state machine | 7.8 s | 1.3 s |
+| Launch to front end loaded, movies skipped | 17.1–17.3 s | 6.7–9.8 s |
+| Launch to front end loaded, movies playing | 20.0 s | 13.4 s |
+| Launch to front end loaded, movies skipped, memory cards present, with state 0 | 7.3–7.8 s (states 2..4 only) | 2.1–3.9 s |
+| Launch to mission 1 loaded, auto-press, movies skipped | 140.6 s | 119.3–121.2 s |
+
+(Auto-press taps buttons on a fixed schedule, so the launch-to-mission times also include its waits.)
+
+`MHRS_FAST_LOAD=0` turns it off (real-time loads), e.g. if a loading screen's narration gets cut.
+
+Audio during a skipped load: the IOP and SPU advance with the guest clock, so loading-screen sound plays
+compressed or partly dropped for those 1–2 s. The SPU stream drops blocks once it runs more than ~170 ms ahead
+(`SpuTimeStretch::kMaxQueue`), so sound can trail by at most that much after a load. Not checked by ear.
      Tools: `~/vec/vustats` (cycles per program),
      `~/vec/vuloops` (cycles per loop and loop body; needs a temporary pair hook in the interpreter, see
      `~/vec/mkloops.py`), `~/vec/vudis.py` (disassembler).

@@ -104,3 +104,7 @@ ps2recomp-gs-present-pipeline.patch
 ps2recomp-gs-backend-speedups.patch
 ps2recomp-gs-display-writes-ordered.patch
 ps2recomp-gifvu-worker-pools.patch
+ps2recomp-skip-idle-loading.patch
+ps2recomp-gs-vulkan-stream-halves.patch
+ps2recomp-vu1-xgkick-flush-runs.patch
+ps2recomp-vif1-unpack-selectors.patch

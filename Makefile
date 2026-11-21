@@ -84,7 +84,7 @@ runner: recomp vu1
 	rsync -rc --delete --filter='P mhrs_*' --include='*.cpp' --exclude='*' build/recomp/ $(PS2RECOMP)/ps2xRuntime/src/runner/
 	rsync -c build/recomp/*.h $(PS2RECOMP)/ps2xRuntime/include/
 	# Our hand-written host code (game overrides, native IOP functions) builds into the same runner.
-	for f in src/iop/*.cpp; do rsync -c $$f $(PS2RECOMP)/ps2xRuntime/src/runner/mhrs_$$(basename $$f); done
+	for f in src/iop/*.cpp src/game/*.cpp; do rsync -c $$f $(PS2RECOMP)/ps2xRuntime/src/runner/mhrs_$$(basename $$f); done
 	# VU1 microcode compiled into blocks (see vu1 above).
 	for f in $(VU1_OUT)/*.cpp; do [ -e "$$f" ] && rsync -c $$f $(PS2RECOMP)/ps2xRuntime/src/runner/mhrs_$$(basename $$f); done
 	cmake -S $(PS2RECOMP) -B $(RECOMP_BIN) -DCMAKE_BUILD_TYPE=RelWithDebInfo \
