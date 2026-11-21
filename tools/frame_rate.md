@@ -407,6 +407,21 @@ With `PS2_VU1_DUMP_DIR` set (`play_mingw.bat`), the GIF/VU worker also wrote eac
 the whole code image byte by byte at every code swap (~2900 a second). A background thread now writes the files,
 and the hash is computed only for a start that is dumped.
 
+## GIF packet batches (2026-11-21, `ps2recomp-gif-packet-batches`)
+
+The GIF/VU worker (still the bound at 100%) posted one GS-stage job per GIF packet, ~150 k a second, each with a
+queue lock, a `std::function` and a pooled buffer. It now hands them on in batches of up to 32 packets or 64 KB.
+A batch is also handed on at the end of each batch of worker jobs (`OrderedWorker::s_flushHeld`, run before
+`drain()` counts them done) and before any other GS-stage job the worker posts (`postGsAfterGifVu`), so order and
+drains are unchanged. A/B at 1x, 2 rounds: 103.8/104.2 -> 105.8/107.2 flips/s.
+
+Measured and dropped the same day:
+- A larger unpack buffer pool (the EE runs thousands of flushes ahead and the pool of 8 runs dry): no change.
+- Triangle Z in float instead of double for high-resolution samples (consumer NVIDIA GPUs run doubles at 1/64
+  rate): GPU load 95% -> 88% at 2x but no fps change, +1 flip at 3x. Double Z is not what the GPU spends its time on.
+- At 2x the frame rate is ~10 flips below 1x (95 vs 105), but the GPU is not the limit there. The worker does the
+  same work in more time, so the threads are probably competing for memory and shared cores.
+
 ## To 60 fps in the menus
 
 The main menu is not a light 2D screen: it draws a 3D scene (the ship's bridge) behind the text and costs

@@ -112,3 +112,4 @@ ps2recomp-gs-vulkan-draw-prefetch.patch
 ps2recomp-mc-root-env.patch
 ps2recomp-mc-screen-fast-time.patch
 ps2recomp-vu1-dump-async.patch
+ps2recomp-gif-packet-batches.patch

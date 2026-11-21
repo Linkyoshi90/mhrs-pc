@@ -1,0 +1,190 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ab433a0..b919355 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -373,7 +373,10 @@ public:
+     void postGs(std::function<void()> job) { m_gsWorker.post(std::move(job)); }
+     void postGsAfterGifVu(std::function<void()> job)
+     {
+-        postGifVu([this, job = std::move(job)]() mutable { postGs(std::move(job)); });
++        postGifVu([this, job = std::move(job)]() mutable
++                  {
++                      OrderedWorker::flushHeld(); // GIF packets the worker holds back go first
++                      postGs(std::move(job)); });
+     }
+     bool gsStageInline() const { return m_gsWorker.mode() == OrderedWorker::Mode::Inline; }
+     void drainGifVu() const
+diff --git a/ps2xRuntime/include/runtime/ps2_ordered_worker.h b/ps2xRuntime/include/runtime/ps2_ordered_worker.h
+index 6c382ee..591641e 100644
+--- a/ps2xRuntime/include/runtime/ps2_ordered_worker.h
++++ b/ps2xRuntime/include/runtime/ps2_ordered_worker.h
+@@ -85,6 +85,16 @@ public:
+         return fallback;
+     }
+ 
++    // Runs on a worker thread after each batch of jobs, before drain() counts them done, and before a job posts to
++    // the next stage in order: a stage that holds back what it posts onward (the GIF/VU worker batches GIF packets
++    // for the GS stage) hands it on here. Static, so the class layout stays as it is.
++    static inline std::atomic<void (*)()> s_flushHeld{nullptr};
++    static void flushHeld()
++    {
++        if (void (*const flush)() = s_flushHeld.load(std::memory_order_relaxed))
++            flush();
++    }
++
+     Mode mode() const { return m_mode; }
+     bool onWorkerThread() const { return m_mode != Mode::Inline && std::this_thread::get_id() == m_threadId; }
+ 
+@@ -173,6 +183,7 @@ private:
+                     std::fprintf(stderr, "[OrderedWorker] job failed\n");
+                 }
+             }
++            flushHeld();
+             {
+                 const QueueLock lock(m_mutex);
+                 m_done += batch.size();
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 7fc25bc..e1600f3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -823,6 +823,32 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
+     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
+ }
+ 
++namespace
++{
++    // GIF packets the GIF/VU worker hands to the GS stage, several per GS-stage job: a job per packet (queue lock,
++    // std::function, pooled buffer) cost the worker ~6% in gameplay.
++    struct GifBatch
++    {
++        std::vector<uint8_t> bytes;
++        std::vector<uint32_t> sizes;
++    };
++    // A spin lock: the worker and the GS stage take it per batch, for a few instructions.
++    struct GifBatchPool
++    {
++        std::atomic_flag busy = ATOMIC_FLAG_INIT;
++        std::vector<GifBatch *> free;
++        void lock()
++        {
++            while (busy.test_and_set(std::memory_order_acquire))
++                _mm_pause();
++        }
++        void unlock() { busy.clear(std::memory_order_release); }
++    };
++    GifBatchPool g_gifBatchPool;
++    thread_local GifBatch *t_gifBatch = nullptr; // the batch this thread is filling
++    PS2Runtime *g_gifBatchRuntime = nullptr;
++}
++
+ bool PS2Runtime::syncCoreSubsystems()
+ {
+     uint8_t *const rdram = m_memory.getRDRAM();
+@@ -838,6 +864,41 @@ bool PS2Runtime::syncCoreSubsystems()
+     }
+ 
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
++    // A batch goes on when full, at the end of each batch of worker jobs and before any other GS-stage job the worker
++    // posts (OrderedWorker::flushHeld), so the GS stage sees everything in the same order and drains still wait for it.
++    // ponytail: one runtime per process (g_gifBatchRuntime); per instance if that changes.
++    g_gifBatchRuntime = this;
++    OrderedWorker::s_flushHeld.store(+[]
++                                     {
++                                         GifBatch *const batch = t_gifBatch;
++                                         if (!batch)
++                                             return;
++                                         t_gifBatch = nullptr;
++                                         PS2Runtime *const runtime = g_gifBatchRuntime;
++                                         runtime->m_memory.postGs([runtime, batch]
++                                                                  {
++                                                                      const uint8_t *packet = batch->bytes.data();
++                                                                      for (const uint32_t size : batch->sizes)
++                                                                      {
++                                                                          runtime->m_gs.processGIFPacket(packet, size);
++                                                                          packet += size;
++                                                                      }
++                                                                      // Keep only small buffers, a bounded number, so image uploads cannot pin memory.
++                                                                      if (batch->bytes.capacity() <= 262144u)
++                                                                      {
++                                                                          batch->bytes.clear();
++                                                                          batch->sizes.clear();
++                                                                          std::lock_guard<GifBatchPool> lock(g_gifBatchPool);
++                                                                          if (g_gifBatchPool.free.size() < 256u)
++                                                                          {
++                                                                              g_gifBatchPool.free.push_back(batch);
++                                                                              return;
++                                                                          }
++                                                                      }
++                                                                      delete batch;
++                                                                  });
++                                     },
++                                     std::memory_order_relaxed);
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     {
+                                         if (m_memory.gsStageInline())
+@@ -845,48 +906,27 @@ bool PS2Runtime::syncCoreSubsystems()
+                                             m_gs.processGIFPacket(data, size);
+                                             return;
+                                         }
+-                                        // Buffers go back to the pool once the GS stage has processed them.
+-                                        // A spin lock: the worker and the GS stage both take it per packet, for a few
+-                                        // instructions, and a contended std::mutex waits in the kernel.
+-                                        struct PacketPool
+-                                        {
+-                                            std::atomic_flag busy = ATOMIC_FLAG_INIT;
+-                                            std::vector<std::vector<uint8_t> *> free;
+-                                            void lock()
+-                                            {
+-                                                while (busy.test_and_set(std::memory_order_acquire))
+-                                                    _mm_pause();
+-                                            }
+-                                            void unlock() { busy.clear(std::memory_order_release); }
+-                                        };
+-                                        static PacketPool pool;
+-                                        std::vector<uint8_t> *packet = nullptr;
++                                        GifBatch *batch = t_gifBatch;
++                                        if (!batch)
+                                         {
+-                                            std::lock_guard<PacketPool> lock(pool);
+-                                            if (!pool.free.empty())
+                                             {
+-                                                packet = pool.free.back();
+-                                                pool.free.pop_back();
++                                                std::lock_guard<GifBatchPool> lock(g_gifBatchPool);
++                                                if (!g_gifBatchPool.free.empty())
++                                                {
++                                                    batch = g_gifBatchPool.free.back();
++                                                    g_gifBatchPool.free.pop_back();
++                                                }
+                                             }
++                                            if (!batch)
++                                                batch = new GifBatch();
++                                            t_gifBatch = batch;
+                                         }
+-                                        if (!packet)
+-                                            packet = new std::vector<uint8_t>();
+-                                        packet->assign(data, data + size);
+-                                        m_memory.postGs([this, packet]
+-                                                        {
+-                                                            m_gs.processGIFPacket(packet->data(), static_cast<uint32_t>(packet->size()));
+-                                                            // Keep only small buffers, and a bounded number, so image uploads cannot pin memory.
+-                                                            if (packet->capacity() <= 65536u)
+-                                                            {
+-                                                                std::lock_guard<PacketPool> lock(pool);
+-                                                                if (pool.free.size() < 256u)
+-                                                                {
+-                                                                    pool.free.push_back(packet);
+-                                                                    return;
+-                                                                }
+-                                                            }
+-                                                            delete packet;
+-                                                        });
++                                        batch->bytes.insert(batch->bytes.end(), data, data + size);
++                                        batch->sizes.push_back(size);
++                                        // Only the worker thread flushes at batch ends: a packet from elsewhere goes on at once.
++                                        constexpr size_t kBatchPackets = 32u, kBatchBytes = 65536u;
++                                        if (!m_memory.onGifVuWorker() || batch->sizes.size() >= kBatchPackets || batch->bytes.size() >= kBatchBytes)
++                                            OrderedWorker::flushHeld();
+                                     });
+     m_memory.setGifArbiter(&m_gifArbiter);
+     // VIF1 MSCAL/MSCNT: the run goes to the GIF/VU worker. VPU_STAT's D/T stop bits come from the run only when
