@@ -1,0 +1,119 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 0596b76..1d79cf9 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -274,6 +274,11 @@ public:
+     // skipped: guest time runs as fast as the host executes it. Null turns it off. Set once, by a game override.
+     using SkipIdleFn = bool (*)(const uint8_t *rdram);
+     static void setSkipIdleWhile(SkipIdleFn whileFn);
++    // While `whileFn()` is true, guest time runs as many times faster than host time as with the fast-forward key,
++    // but everything is still drawn: for screens the game times itself in front of a scene too heavy for the EE to
++    // ever idle (memory card messages over a 3D menu). Null turns it off. Set once, by a game override.
++    using FastTimeFn = bool (*)();
++    static void setFastTimeWhile(FastTimeFn whileFn);
+     // Host milliseconds since the EE last wrote a GS display register (PMODE..BGCOLOR, a flip); large before the
+     // first one.
+     static int64_t hostMsSinceDisplayWrite();
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index ccc4b18..0c89982 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -59,6 +59,7 @@ namespace
+     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+ 
+     std::atomic<EeScheduler::SkipIdleFn> g_skipIdleWhile{nullptr};
++    std::atomic<EeScheduler::FastTimeFn> g_fastTimeWhile{nullptr};
+ 
+     // Host deadlines re-anchored to the guest clock: each one is as far from now as its cycle is from `eeCycle`.
+     // After skipped idle time they would otherwise lie in the future by the time skipped, and the EE would wait it
+@@ -76,7 +77,8 @@ namespace
+     template <typename Duration>
+     Duration hostWait(Duration guestDuration)
+     {
+-        return ps2PadFastForward() ? guestDuration / kFastForward : guestDuration;
++        const EeScheduler::FastTimeFn fastTime = g_fastTimeWhile.load(std::memory_order_relaxed);
++        return ps2PadFastForward() || (fastTime && fastTime()) ? guestDuration / kFastForward : guestDuration;
+     }
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+@@ -1947,6 +1949,11 @@ void EeScheduler::setSkipIdleWhile(SkipIdleFn whileFn)
+     g_skipIdleWhile.store(whileFn, std::memory_order_relaxed);
+ }
+ 
++void EeScheduler::setFastTimeWhile(FastTimeFn whileFn)
++{
++    g_fastTimeWhile.store(whileFn, std::memory_order_relaxed);
++}
++
+ int64_t EeScheduler::hostMsSinceDisplayWrite()
+ {
+     extern std::atomic<int64_t> g_lastDisplayWriteNs; // ps2_memory.cpp
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 0055aad..18f8770 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -1,6 +1,13 @@
+ #include "Common.h"
+ #include "MemoryCard.h"
+ 
++#include <atomic>
++#include <chrono>
++
++// Host time (steady_clock ns) of the last sceMcSync. Games poll it every frame while a memory card screen is up and
++// not otherwise; a game's skip-idle predicate uses it to fast-forward those timed screens.
++std::atomic<int64_t> g_lastMcSyncNs{0};
++
+ namespace ps2_stubs
+ {
+     namespace
+@@ -1201,6 +1208,9 @@ namespace ps2_stubs
+ 
+     void sceMcSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        g_lastMcSyncNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                 std::chrono::steady_clock::now().time_since_epoch()).count(),
++                             std::memory_order_relaxed);
+         const uint32_t cmdPtr = getRegU32(ctx, 5);
+         const uint32_t resultPtr = getRegU32(ctx, 6);
+         int32_t cmd = 0;
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index e7c437c..75fc2e5 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -181,6 +181,7 @@ namespace
+     int g_vblanksLeft = 0;
+     std::chrono::steady_clock::time_point g_loopStart, g_loopSwitch, g_loopEnd;
+     bool skipIdleWhileSet(const uint8_t *) { return g_skipIdle.load(std::memory_order_relaxed); }
++    bool fastTimeWhileSet() { return g_skipIdle.load(std::memory_order_relaxed); }
+     void schedulerVBlankLoop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const auto now = std::chrono::steady_clock::now();
+@@ -578,6 +579,28 @@ void register_ps2_runtime_interrupt_tests()
+             cleanupRuntime(env);
+         });
+ 
++        tc.Run("fast time runs vblanks eight times faster, and host-paced again afterwards", [](TestCase &t)
++        {
++            TestEnv env;
++            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
++            env.runtime.registerFunction(kVBlankLoopPc, schedulerVBlankLoop);
++            EeScheduler::setFastTimeWhile(&fastTimeWhileSet);
++            g_vblanksLeft = 36;
++            R5900Context mainContext{};
++            mainContext.pc = kVBlankLoopPc;
++            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++            env.runtime.eeScheduler().run();
++            EeScheduler::setFastTimeWhile(nullptr);
++            g_skipIdle = false;
++            const auto ms = [](auto from, auto to) { return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count(); };
++            const auto fast = ms(g_loopStart, g_loopSwitch); // 30 vblanks: 500 ms of guest time
++            const auto paced = ms(g_loopSwitch, g_loopEnd);  // 6 vblanks: 100 ms
++            t.IsTrue(g_vblanksLeft < 0, "all 36 vblank waits return");
++            t.IsTrue(fast < 250, "30 vblanks in fast time take far less than 500 ms");
++            t.IsTrue(paced >= 60 && paced < 400, "6 vblanks afterwards take host time again");
++            cleanupRuntime(env);
++        });
++
+         tc.Run("VBlank IRQ invocation completes before the resumed base context", [](TestCase &t)
+         {
+             TestEnv env;

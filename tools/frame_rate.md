@@ -381,6 +381,32 @@ compressed or partly dropped for those 1–2 s. The SPU stream drops blocks once
 The GS backend thread is busy about 55% of the time at 30 fps; at 60 fps texture uploads and CLUT loads, which
 still run on the CPU, would saturate it. They need to move to the GPU as well.
 
+## Memory card screens (2026-11-21, `ps2recomp-mc-screen-fast-time` + `src/game/fast_load.cpp`)
+
+The memory card stubs answer at once, but the game holds its messages for a fixed time: "Checking for memory
+card" ~6 s, "Saving game data…" ~4 s, "Save complete." ~8 s. They draw the 3D menu behind them, so the EE never idles
+and skipping idle time changes nothing. While one is up, guest time now runs 8× faster than host time, as with the
+fast-forward key, but microprograms still run, so nothing disappears (`EeScheduler::setFastTimeWhile`). Such a
+screen is detected by its polling: the game calls `sceMcSync` ~30 times a second while one is up, and never in
+menus, on the profile name entry or in gameplay (`g_lastMcSyncNs`, 150 ms). Each screen now lasts about a second.
+`MHRS_FAST_LOAD=0` turns this off too.
+
+`PS2X_MC_ROOT=<dir>` (`ps2recomp-mc-root-env`) moves the memory card folder away from `<ELF folder>/mc0`. The
+unattended test scripts use it, because their button presses create a new profile named PLAYER1 and save it over an
+existing one on the real card.
+
+## VU1 captures and dumping (2026-11-21, `ps2recomp-vu1-dump-async`)
+
+In a play session, scenes ran at 20–35 flips/s with the VU1 at only 110–170 M cycles/s (vs ~290 M in mission 1). The
+cause was microprograms seen for the first time, which run interpreted until they are compiled: 23 new programs
+(12.6 k pairs) since the last regeneration, now in `vu1_lean_130.cpp`. The generator numbers programs in sequence,
+so a full regeneration changes all 130 files. Generating only the new dumps into one more file avoids recompiling
+the others. Use the generator in `out/linux-test`; the one in `out/linux` predates the loop kernels.
+
+With `PS2_VU1_DUMP_DIR` set (`play_mingw.bat`), the GIF/VU worker also wrote each new dump file itself and hashed
+the whole code image byte by byte at every code swap (~2900 a second). A background thread now writes the files,
+and the hash is computed only for a start that is dumped.
+
 ## To 60 fps in the menus
 
 The main menu is not a light 2D screen: it draws a 3D scene (the ship's bridge) behind the text and costs

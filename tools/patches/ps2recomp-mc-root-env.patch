@@ -1,0 +1,16 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9d85c21..7fc25bc 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1313,6 +1313,11 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
+     {
+         normalized.mcRoot = normalized.elfDirectory / "mc0";
+     }
++    // Test runs point this at a scratch folder so they never touch the player's card next to the ELF.
++    if (const char *mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot && *mcRoot)
++    {
++        normalized.mcRoot = normalizeAbsolutePath(std::filesystem::path(mcRoot));
++    }
+ 
+     runtimeIoPaths() = normalized;
+ }

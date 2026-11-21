@@ -1,0 +1,117 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 86ab29d..1a0578f 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -14,8 +14,11 @@
+ #include <filesystem>
+ #include <limits>
+ #include <atomic> // TEMP-DEBUG(mhrs) vurec
++#include <condition_variable>
++#include <deque>
+ #include <mutex>
+ #include <set>
++#include <thread>
+ #include <vector>
+ #include <ps2_log.h>
+ 
+@@ -712,13 +715,7 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     }
+     image->lastUse = ++m_imageUses;
+     m_image = image;
+-    if (vu1DumpDir() != nullptr)
+-    {
+-        uint64_t hash = 1469598103934665603ull;
+-        for (uint32_t i = 0; i < codeSize; ++i)
+-            hash = (hash ^ vuCode[i]) * 1099511628211ull;
+-        m_cachedCodeHash = hash;
+-    }
++    m_cachedCodeHash = 0; // computed when a start is dumped (dumpCodeForCompiler)
+ 
+     m_cachedVuCode = vuCode;
+     m_cachedMemory = memory;
+@@ -778,27 +775,69 @@ void VU1Interpreter::bindCompiledBlocks(DecodedImage &image, const uint8_t *vuCo
+ // start at to vu1-<hash>.entries: the input for compiling the microcode into blocks.
+ void VU1Interpreter::dumpCodeForCompiler(const uint8_t *vuCode, uint32_t codeSize)
+ {
+-    static std::mutex mutex;
+-    static std::set<std::pair<uint64_t, uint32_t>> seen;
+-    std::lock_guard<std::mutex> lock(mutex);
+-    if (!seen.insert({m_cachedCodeHash, m_state.pc}).second)
+-        return;
+-    char name[64];
+-    std::snprintf(name, sizeof(name), "vu1-%016llx", static_cast<unsigned long long>(m_cachedCodeHash));
+-    const std::string base = (std::filesystem::path(vu1DumpDir()) / name).string();
+-    if (!std::filesystem::exists(base + ".bin"))
++    if (m_cachedCodeHash == 0)
++    {
++        uint64_t hash = 1469598103934665603ull;
++        for (uint32_t i = 0; i < codeSize; ++i)
++            hash = (hash ^ vuCode[i]) * 1099511628211ull;
++        m_cachedCodeHash = hash;
++    }
++    // Files are written by a background thread: creating them on this (drawing) thread stalled a frame whenever a
++    // new effect brought a start without a lean program in a new code image.
++    struct Dump
+     {
+-        if (FILE *f = std::fopen((base + ".bin").c_str(), "wb"))
++        uint64_t hash;
++        uint32_t pc;
++        std::vector<uint8_t> code;
++    };
++    struct Writer
++    {
++        std::mutex mutex;
++        std::condition_variable wake;
++        std::deque<Dump> queue;
++        std::set<std::pair<uint64_t, uint32_t>> seen;
++        Writer()
+         {
+-            std::fwrite(vuCode, 1, codeSize, f);
+-            std::fclose(f);
++            std::thread([this]
++                        {
++                            for (;;)
++                            {
++                                Dump dump;
++                                {
++                                    std::unique_lock<std::mutex> lock(mutex);
++                                    wake.wait(lock, [this] { return !queue.empty(); });
++                                    dump = std::move(queue.front());
++                                    queue.pop_front();
++                                }
++                                char name[64];
++                                std::snprintf(name, sizeof(name), "vu1-%016llx", static_cast<unsigned long long>(dump.hash));
++                                const std::string base = (std::filesystem::path(vu1DumpDir()) / name).string();
++                                if (!std::filesystem::exists(base + ".bin"))
++                                {
++                                    if (FILE *f = std::fopen((base + ".bin").c_str(), "wb"))
++                                    {
++                                        std::fwrite(dump.code.data(), 1, dump.code.size(), f);
++                                        std::fclose(f);
++                                    }
++                                }
++                                if (FILE *f = std::fopen((base + ".entries").c_str(), "a"))
++                                {
++                                    std::fprintf(f, "%04x\n", dump.pc);
++                                    std::fclose(f);
++                                }
++                            }
++                        })
++                .detach();
+         }
+-    }
+-    if (FILE *f = std::fopen((base + ".entries").c_str(), "a"))
++    };
++    static Writer writer;
+     {
+-        std::fprintf(f, "%04x\n", m_state.pc);
+-        std::fclose(f);
++        std::lock_guard<std::mutex> lock(writer.mutex);
++        if (!writer.seen.insert({m_cachedCodeHash, m_state.pc}).second)
++            return;
++        writer.queue.push_back({m_cachedCodeHash, m_state.pc, std::vector<uint8_t>(vuCode, vuCode + codeSize)});
+     }
++    writer.wake.notify_one();
+ }
+ 
+ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const

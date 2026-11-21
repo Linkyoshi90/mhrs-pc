@@ -109,3 +109,6 @@ ps2recomp-gs-vulkan-stream-halves.patch
 ps2recomp-vu1-xgkick-flush-runs.patch
 ps2recomp-vif1-unpack-selectors.patch
 ps2recomp-gs-vulkan-draw-prefetch.patch
+ps2recomp-mc-root-env.patch
+ps2recomp-mc-screen-fast-time.patch
+ps2recomp-vu1-dump-async.patch
