@@ -1,0 +1,512 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_hires.h b/ps2xRuntime/include/runtime/gs/gs_hires.h
+index 648ec60..b19ea8b 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_hires.h
++++ b/ps2xRuntime/include/runtime/gs/gs_hires.h
+@@ -2,6 +2,7 @@
+ #define GS_HIRES_H
+ 
+ #include <cstdint>
++#include <functional>
+ #include <vector>
+ 
+ // Internal resolution of the Vulkan GS backend: 2..4 draws 32-bit frame buffers at that many times the native
+@@ -23,6 +24,26 @@ void gsHiresPublishShared(const uint8_t *pixels, uint32_t width, uint32_t height
+ void gsHiresRelease(const uint8_t *begin, const uint8_t *end);
+ // Whether a present completed since the last call; if so, pixels is swapped with what it published.
+ bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height);
++// Like gsHiresTake without a copy: use gets the frame where it is, pixels in host memory or (pixels null) gpuOffset
++// bytes into the shared GPU memory below. The backend does not overwrite it until use returns.
++bool gsHiresTakeWith(const std::function<void(const uint8_t *pixels, uint64_t gpuOffset, uint32_t width, uint32_t height)> &use);
++
++// Frames that never reach the CPU (Windows): the backend offers device memory exported as an opaque NT handle, the
++// window's OpenGL context imports it and answers. Once it has, frames are published with gsHiresPublishGpu: the
++// window copies them into its texture on the GPU. A CPU texture upload of the 4.6 MB frame at 2x cost ~12% of the
++// game's frame rate.
++struct GsHiresShare
++{
++    void *win32Handle = nullptr;
++    uint64_t bytes = 0; // the whole allocation
++    uint8_t deviceUuid[16] = {};
++};
++void gsHiresOfferShare(const GsHiresShare &share); // backend, once
++bool gsHiresShareOffer(GsHiresShare &share);        // window: the offer, if one was made and not answered yet
++void gsHiresShareAnswer(bool imported);             // window
++bool gsHiresShareImported();                        // backend
++// gsHiresPublishShared for a frame in the shared memory; token is its host slot, for gsHiresRelease.
++void gsHiresPublishGpu(const uint8_t *token, uint64_t gpuOffset, uint32_t width, uint32_t height);
+ // True while the Vulkan backend presents on the GPU: presents then run behind the queued draws (asynchronously) and
+ // gsHiresTake says when one completed.
+ bool gsHiresActive();
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index 1cda7f1..ecbf570 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -462,11 +462,54 @@ namespace
+     const uint8_t *g_hiresReading = nullptr; // the window is copying from here
+     uint32_t g_hiresWidth = 0, g_hiresHeight = 0;
+     bool g_hiresFresh = false;
++    uint64_t g_hiresGpuOffset = UINT64_MAX; // the published frame is in the shared GPU memory (gsHiresPublishGpu)
++    GsHiresShare g_hiresShareOffer;
++    bool g_hiresShareOffered = false;
++    std::atomic<bool> g_hiresShareImported{false};
++}
++
++void gsHiresOfferShare(const GsHiresShare &share)
++{
++    std::lock_guard<std::mutex> lock(g_hiresMutex);
++    g_hiresShareOffer = share;
++    g_hiresShareOffered = true;
++}
++
++bool gsHiresShareOffer(GsHiresShare &share)
++{
++    std::lock_guard<std::mutex> lock(g_hiresMutex);
++    if (!g_hiresShareOffered)
++        return false;
++    share = g_hiresShareOffer;
++    return true;
++}
++
++void gsHiresShareAnswer(bool imported)
++{
++    std::lock_guard<std::mutex> lock(g_hiresMutex);
++    g_hiresShareOffered = false;
++    g_hiresShareImported.store(imported, std::memory_order_release);
++}
++
++bool gsHiresShareImported()
++{
++    return g_hiresShareImported.load(std::memory_order_acquire);
++}
++
++void gsHiresPublishGpu(const uint8_t *token, uint64_t gpuOffset, uint32_t width, uint32_t height)
++{
++    std::lock_guard<std::mutex> lock(g_hiresMutex);
++    g_hiresShared = token;
++    g_hiresGpuOffset = gpuOffset;
++    g_hiresWidth = width;
++    g_hiresHeight = height;
++    g_hiresFresh = true;
+ }
+ 
+ void gsHiresPublish(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t height)
+ {
+     std::lock_guard<std::mutex> lock(g_hiresMutex);
++    g_hiresGpuOffset = UINT64_MAX;
+     g_hiresPixels = std::move(pixels);
+     g_hiresShared = nullptr;
+     g_hiresWidth = width;
+@@ -477,6 +520,7 @@ void gsHiresPublish(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t heig
+ void gsHiresPublishCopy(const uint8_t *pixels, uint32_t width, uint32_t height)
+ {
+     std::lock_guard<std::mutex> lock(g_hiresMutex);
++    g_hiresGpuOffset = UINT64_MAX;
+     g_hiresPixels.assign(pixels, pixels + static_cast<size_t>(width) * height * 4u); // keeps the capacity
+     g_hiresShared = nullptr;
+     g_hiresWidth = width;
+@@ -487,6 +531,7 @@ void gsHiresPublishCopy(const uint8_t *pixels, uint32_t width, uint32_t height)
+ void gsHiresPublishShared(const uint8_t *pixels, uint32_t width, uint32_t height)
+ {
+     std::lock_guard<std::mutex> lock(g_hiresMutex);
++    g_hiresGpuOffset = UINT64_MAX;
+     g_hiresShared = pixels;
+     g_hiresWidth = width;
+     g_hiresHeight = height;
+@@ -504,12 +549,42 @@ void gsHiresRelease(const uint8_t *begin, const uint8_t *end)
+     g_hiresCopied.wait(lock, [&] { return !(g_hiresReading >= begin && g_hiresReading < end); });
+ }
+ 
+-bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height)
++bool gsHiresTakeWith(const std::function<void(const uint8_t *pixels, uint64_t gpuOffset, uint32_t width, uint32_t height)> &use)
+ {
+     std::unique_lock<std::mutex> lock(g_hiresMutex);
+     if (!g_hiresFresh)
+         return false;
+     g_hiresFresh = false;
++    const uint32_t width = g_hiresWidth, height = g_hiresHeight;
++    if (!g_hiresShared)
++    {
++        static std::vector<uint8_t> taken; // the window's thread only
++        taken.swap(g_hiresPixels);
++        lock.unlock();
++        if (taken.size() >= static_cast<size_t>(width) * height * 4u)
++            use(taken.data(), UINT64_MAX, width, height);
++        else
++            use(nullptr, UINT64_MAX, 0u, 0u); // native only
++        return true;
++    }
++    // Used on this (the window's) thread, outside the lock: gsHiresRelease waits for it.
++    const uint8_t *const src = g_hiresReading = g_hiresShared;
++    const uint64_t gpuOffset = g_hiresGpuOffset;
++    g_hiresShared = nullptr;
++    lock.unlock();
++    use(gpuOffset == UINT64_MAX ? src : nullptr, gpuOffset, width, height);
++    lock.lock();
++    g_hiresReading = nullptr;
++    g_hiresCopied.notify_all();
++    return true;
++}
++
++bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height)
++{
++    std::unique_lock<std::mutex> lock(g_hiresMutex);
++    if (!g_hiresFresh || g_hiresGpuOffset != UINT64_MAX) // a frame in GPU memory is only for gsHiresTakeWith
++        return false;
++    g_hiresFresh = false;
+     width = g_hiresWidth;
+     height = g_hiresHeight;
+     if (!g_hiresShared)
+@@ -634,6 +709,7 @@ struct GSVulkanBackend::VkState
+     {
+         bool pending = false;
+         uint32_t width = 0, height = 0, fbp = 0, hiresWidth = 0, hiresHeight = 0;
++        bool shared = false; // the high-resolution frame went to shareBuffer
+     };
+     std::array<PresentSlot, kSlots> slots{};
+     std::array<VkFence, kSlots> slotFences{};
+@@ -660,6 +736,11 @@ struct GSVulkanBackend::VkState
+     VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
+     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
++    // The present output's high-resolution part in exported device memory (gsHiresOfferShare), laid out like
++    // outBuffer; shareSet is descriptorSet with it as binding 1.
++    VkBuffer shareBuffer = VK_NULL_HANDLE;
++    VkDescriptorSet shareSet = VK_NULL_HANDLE;
++    bool createShareBuffer();
+     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+     VkPipeline pipeline = VK_NULL_HANDLE;       // present deswizzle
+     VkPipeline rasterPipeline = VK_NULL_HANDLE; // needs shaderFloat64
+@@ -780,6 +861,70 @@ bool GSVulkanBackend::VkState::createBuffer(VkDeviceSize size, VkBufferUsageFlag
+     return !outMapped || vkMapMemory(device, memory, 0, size, 0, outMapped) == VK_SUCCESS;
+ }
+ 
++#if defined(_WIN32)
++bool GSVulkanBackend::VkState::createShareBuffer()
++{
++    VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
++    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++    bufferInfo.pNext = &external;
++    bufferInfo.size = static_cast<VkDeviceSize>(kSlots) * kSlotWords * 4u;
++    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
++    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    if (vkCreateBuffer(device, &bufferInfo, nullptr, &shareBuffer) != VK_SUCCESS)
++        return false;
++    allocations.emplace_back(shareBuffer, VK_NULL_HANDLE);
++    VkMemoryRequirements reqs{};
++    vkGetBufferMemoryRequirements(device, shareBuffer, &reqs);
++    VkPhysicalDeviceMemoryProperties props{};
++    vkGetPhysicalDeviceMemoryProperties(phys, &props);
++    uint32_t typeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < props.memoryTypeCount && typeIndex == UINT32_MAX; ++i)
++        if ((reqs.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++            typeIndex = i;
++    if (typeIndex == UINT32_MAX)
++        return false;
++    VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
++    dedicated.buffer = shareBuffer;
++    VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
++    exportInfo.pNext = &dedicated;
++    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++    allocInfo.pNext = &exportInfo;
++    allocInfo.allocationSize = reqs.size;
++    allocInfo.memoryTypeIndex = typeIndex;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    if (vkAllocateMemory(device, &allocInfo, nullptr, &memory) != VK_SUCCESS)
++        return false;
++    allocations.back().second = memory;
++    if (vkBindBufferMemory(device, shareBuffer, memory, 0) != VK_SUCCESS)
++        return false;
++    // VkMemoryGetWin32HandleInfoKHR and its function, declared here: vulkan_win32.h needs <windows.h>.
++    struct GetHandleInfo
++    {
++        VkStructureType sType;
++        const void *pNext;
++        VkDeviceMemory memory;
++        VkExternalMemoryHandleTypeFlagBits handleType;
++    } handleInfo{VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR, nullptr, memory, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT};
++    using GetHandleFn = VkResult(VKAPI_PTR *)(VkDevice, const GetHandleInfo *, void **);
++    const auto getHandle = reinterpret_cast<GetHandleFn>(vkGetDeviceProcAddr(device, "vkGetMemoryWin32HandleKHR"));
++    GsHiresShare share;
++    if (!getHandle || getHandle(device, &handleInfo, &share.win32Handle) != VK_SUCCESS || !share.win32Handle)
++        return false;
++    share.bytes = reqs.size;
++    VkPhysicalDeviceIDProperties ids{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
++    VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
++    props2.pNext = &ids;
++    vkGetPhysicalDeviceProperties2(phys, &props2);
++    std::memcpy(share.deviceUuid, ids.deviceUUID, sizeof(share.deviceUuid));
++    gsHiresOfferShare(share);
++    return true;
++}
++#else
++bool GSVulkanBackend::VkState::createShareBuffer() { return false; } // ponytail: Windows only; Linux would export an fd
++#endif
++
+ bool GSVulkanBackend::VkState::createStream(Stream &stream, uint32_t stride, uint32_t capacity)
+ {
+     stream.stride = stride;
+@@ -858,6 +1003,27 @@ bool GSVulkanBackend::initVulkan()
+     deviceInfo.queueCreateInfoCount = 1;
+     deviceInfo.pQueueCreateInfos = &queueInfo;
+     deviceInfo.pEnabledFeatures = &enabledFeatures;
++    // Exported memory for the window's high-resolution frames (createShareBuffer). PS2X_VK_SHARE=0 turns it off;
++    // high-resolution frame dumps (MHRS_HIRES_EVERY) read them from host memory.
++    const char *const shareExtension = "VK_KHR_external_memory_win32";
++    bool wantShare = false;
++#if defined(_WIN32)
++    {
++        const char *env = std::getenv("PS2X_VK_SHARE");
++        wantShare = !(env && std::strcmp(env, "0") == 0) && !std::getenv("MHRS_HIRES_EVERY");
++        uint32_t extensionCount = 0;
++        vkEnumerateDeviceExtensionProperties(vk.phys, nullptr, &extensionCount, nullptr);
++        std::vector<VkExtensionProperties> extensions(extensionCount);
++        vkEnumerateDeviceExtensionProperties(vk.phys, nullptr, &extensionCount, extensions.data());
++        wantShare = wantShare && std::any_of(extensions.begin(), extensions.end(), [&](const VkExtensionProperties &e)
++                                             { return std::strcmp(e.extensionName, shareExtension) == 0; });
++    }
++#endif
++    if (wantShare)
++    {
++        deviceInfo.enabledExtensionCount = 1;
++        deviceInfo.ppEnabledExtensionNames = &shareExtension;
++    }
+     if (vkCreateDevice(vk.phys, &deviceInfo, nullptr, &vk.device) != VK_SUCCESS)
+     {
+         std::cerr << "[gs-vulkan] vkCreateDevice failed, CPU fallback" << std::endl;
+@@ -889,6 +1055,11 @@ bool GSVulkanBackend::initVulkan()
+         std::cerr << "[gs-vulkan] no memory for internal resolution, drawing at native resolution" << std::endl;
+         vk.maxScale = 1u;
+     }
++    if (wantShare && vk.maxScale > 1u && !vk.createShareBuffer())
++    {
++        std::cerr << "[gs-vulkan] no exported memory for window frames, they go through the CPU" << std::endl;
++        vk.shareBuffer = VK_NULL_HANDLE;
++    }
+ 
+     // Bindings: 0 = VRAM, 1 = present output, 2 = CLUT snapshots, 3 = states, 4 = geoms,
+     // 5 = tile lists, 6 = high-resolution copy (VRAM itself as a stand-in at native resolution, never accessed).
+@@ -910,9 +1081,9 @@ bool GSVulkanBackend::initVulkan()
+     if (vkCreateDescriptorSetLayout(vk.device, &layoutInfo, nullptr, &vk.descriptorLayout) != VK_SUCCESS)
+         return false;
+ 
+-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kBindings};
++    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u * kBindings};
+     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+-    poolInfo.maxSets = 1;
++    poolInfo.maxSets = 2;
+     poolInfo.poolSizeCount = 1;
+     poolInfo.pPoolSizes = &poolSize;
+     if (vkCreateDescriptorPool(vk.device, &poolInfo, nullptr, &vk.descriptorPool) != VK_SUCCESS)
+@@ -925,19 +1096,27 @@ bool GSVulkanBackend::initVulkan()
+     if (vkAllocateDescriptorSets(vk.device, &setInfo, &vk.descriptorSet) != VK_SUCCESS)
+         return false;
+ 
+-    VkDescriptorBufferInfo bufferDescs[kBindings]{};
+-    VkWriteDescriptorSet writes[kBindings]{};
+-    for (uint32_t i = 0; i < kBindings; ++i)
++    if (vk.shareBuffer != VK_NULL_HANDLE && vkAllocateDescriptorSets(vk.device, &setInfo, &vk.shareSet) != VK_SUCCESS)
++        vk.shareSet = VK_NULL_HANDLE;
++
++    for (const VkDescriptorSet set : {vk.descriptorSet, vk.shareSet})
+     {
+-        bufferDescs[i] = {bound[i], 0, VK_WHOLE_SIZE};
+-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-        writes[i].dstSet = vk.descriptorSet;
+-        writes[i].dstBinding = i;
+-        writes[i].descriptorCount = 1;
+-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+-        writes[i].pBufferInfo = &bufferDescs[i];
++        if (set == VK_NULL_HANDLE)
++            continue;
++        VkDescriptorBufferInfo bufferDescs[kBindings]{};
++        VkWriteDescriptorSet writes[kBindings]{};
++        for (uint32_t i = 0; i < kBindings; ++i)
++        {
++            bufferDescs[i] = {i == 1u && set == vk.shareSet ? vk.shareBuffer : bound[i], 0, VK_WHOLE_SIZE};
++            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++            writes[i].dstSet = set;
++            writes[i].dstBinding = i;
++            writes[i].descriptorCount = 1;
++            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++            writes[i].pBufferInfo = &bufferDescs[i];
++        }
++        vkUpdateDescriptorSets(vk.device, kBindings, writes, 0, nullptr);
+     }
+-    vkUpdateDescriptorSets(vk.device, kBindings, writes, 0, nullptr);
+ 
+     VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes};
+     VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+@@ -1848,8 +2027,11 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+             hp.outOffset = base + VkState::kSlotNativeWords;
+             meta.hiresWidth = result.width * vk.scale;
+             meta.hiresHeight = result.height * vk.scale;
++            meta.shared = vk.shareSet != VK_NULL_HANDLE && gsHiresShareImported();
+             const uint32_t groups = (meta.hiresWidth * meta.hiresHeight + 63u) / 64u;
+             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.hiresPresentPipeline);
++            if (meta.shared) // the same slot layout in the window's shared memory
++                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk.pipelineLayout, 0, 1, &vk.shareSet, 0, nullptr);
+             vkCmdPushConstants(cb, vk.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hp), &hp);
+             vkCmdDispatch(cb, std::min(groups, 65535u), (groups + 65534u) / 65535u, 1);
+         }
+@@ -1871,7 +2053,11 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+         // A black frame at fbp 0: the synchronous path looks for another source (the boot screens use that).
+         if (!(done.fbp == 0u && countNonBlackPixels(frame.pixels, frame.width, frame.height) == 0u))
+         {
+-            if (done.hiresWidth != 0u)
++            if (done.hiresWidth != 0u && done.shared)
++                gsHiresPublishGpu(src + VkState::kSlotNativeWords * 4u,
++                                  (static_cast<uint64_t>(ready) * VkState::kSlotWords + VkState::kSlotNativeWords) * 4u,
++                                  done.hiresWidth, done.hiresHeight);
++            else if (done.hiresWidth != 0u)
+             {
+                 debugDumpHires(src + VkState::kSlotNativeWords * 4u, done.hiresWidth, done.hiresHeight);
+                 gsHiresPublishShared(src + VkState::kSlotNativeWords * 4u, done.hiresWidth, done.hiresHeight);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index e1600f3..ff66e69 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -454,6 +454,88 @@ namespace
+     }
+ }
+ 
++#if defined(_WIN32)
++// The window's side of gsHiresOfferShare: imports the backend's exported memory as an OpenGL buffer and copies frames
++// from it into the window texture on the GPU (GL_EXT_memory_object_win32). Declared here: <windows.h> and
++// <GL/gl.h> clash with raylib's names.
++namespace
++{
++    extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *name);
++    extern "C" __declspec(dllimport) void __stdcall glBindTexture(unsigned target, unsigned texture);
++    extern "C" __declspec(dllimport) void __stdcall glTexSubImage2D(unsigned target, int level, int x, int y, int w, int h,
++                                                                    unsigned format, unsigned type, const void *pixels);
++    extern "C" __declspec(dllimport) void __stdcall glPixelStorei(unsigned name, int value);
++    extern "C" __declspec(dllimport) unsigned __stdcall glGetError();
++
++    struct GlFrameShare
++    {
++        unsigned buffer = 0;
++        void(__stdcall *bindBuffer)(unsigned, unsigned) = nullptr;
++        void *(__stdcall *fenceSync)(unsigned, unsigned) = nullptr;
++        unsigned(__stdcall *clientWaitSync)(void *, unsigned, uint64_t) = nullptr;
++        void(__stdcall *deleteSync)(void *) = nullptr;
++
++        template <typename Fn>
++        static bool load(Fn &fn, const char *name)
++        {
++            fn = reinterpret_cast<Fn>(wglGetProcAddress(name));
++            return fn != nullptr;
++        }
++
++        bool import(const GsHiresShare &share)
++        {
++            void(__stdcall *createMemoryObjects)(int, unsigned *) = nullptr;
++            void(__stdcall *memoryObjectParameteriv)(unsigned, unsigned, const int *) = nullptr;
++            void(__stdcall *importMemoryWin32Handle)(unsigned, uint64_t, unsigned, void *) = nullptr;
++            void(__stdcall *genBuffers)(int, unsigned *) = nullptr;
++            void(__stdcall *bufferStorageMem)(unsigned, int64_t, unsigned, uint64_t) = nullptr;
++            void(__stdcall *getUnsignedBytei)(unsigned, unsigned, uint8_t *) = nullptr;
++            if (!load(createMemoryObjects, "glCreateMemoryObjectsEXT") || !load(memoryObjectParameteriv, "glMemoryObjectParameterivEXT") ||
++                !load(importMemoryWin32Handle, "glImportMemoryWin32HandleEXT") || !load(genBuffers, "glGenBuffers") ||
++                !load(bufferStorageMem, "glBufferStorageMemEXT") || !load(getUnsignedBytei, "glGetUnsignedBytei_vEXT") ||
++                !load(bindBuffer, "glBindBuffer") || !load(fenceSync, "glFenceSync") || !load(clientWaitSync, "glClientWaitSync") ||
++                !load(deleteSync, "glDeleteSync"))
++                return false;
++            constexpr unsigned kDeviceUuid = 0x9597u, kDedicated = 0x9581u, kOpaqueWin32 = 0x9587u, kCopyRead = 0x8F36u;
++            uint8_t uuid[16] = {};
++            getUnsignedBytei(kDeviceUuid, 0u, uuid); // the window's GPU must be the Vulkan backend's
++            if (std::memcmp(uuid, share.deviceUuid, sizeof(uuid)) != 0)
++                return false;
++            while (glGetError() != 0u)
++            {
++            }
++            unsigned memory = 0;
++            createMemoryObjects(1, &memory);
++            const int dedicated = 1; // the Vulkan allocation is dedicated to its buffer
++            memoryObjectParameteriv(memory, kDedicated, &dedicated);
++            importMemoryWin32Handle(memory, share.bytes, kOpaqueWin32, share.win32Handle);
++            genBuffers(1, &buffer);
++            bindBuffer(kCopyRead, buffer);
++            bufferStorageMem(kCopyRead, static_cast<int64_t>(share.bytes), memory, 0u);
++            bindBuffer(kCopyRead, 0u);
++            return glGetError() == 0u;
++        }
++
++        // Waits until the copy has run: the backend may overwrite the slot once gsHiresTakeWith's use returns.
++        void upload(unsigned texture, uint64_t offset, uint32_t width, uint32_t height)
++        {
++            constexpr unsigned kTexture2D = 0x0DE1u, kUnpackBuffer = 0x88ECu, kUnpackAlignment = 0x0CF5u, kRgba = 0x1908u,
++                               kUnsignedByte = 0x1401u, kGpuCommandsComplete = 0x9117u, kFlushCommands = 0x1u;
++            bindBuffer(kUnpackBuffer, buffer);
++            glBindTexture(kTexture2D, texture);
++            glPixelStorei(kUnpackAlignment, 4);
++            glTexSubImage2D(kTexture2D, 0, 0, 0, static_cast<int>(width), static_cast<int>(height), kRgba, kUnsignedByte,
++                            reinterpret_cast<const void *>(static_cast<uintptr_t>(offset)));
++            glBindTexture(kTexture2D, 0u);
++            bindBuffer(kUnpackBuffer, 0u);
++            void *const done = fenceSync(kGpuCommandsComplete, 0u);
++            clientWaitSync(done, kFlushCommands, 1000000000ull);
++            deleteSync(done);
++        }
++    };
++}
++#endif
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -548,9 +630,34 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         const char *filter = std::getenv("MHRS_FILTER");
+         SetTextureFilter(tex, filter && std::strcmp(filter, "point") == 0 ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+     };
+-    static std::vector<uint8_t> s_hires;
+-    uint32_t hiresWidth = 0u, hiresHeight = 0u;
+-    const bool presented = gsHiresTake(s_hires, hiresWidth, hiresHeight);
++#if defined(_WIN32)
++    static GlFrameShare s_share;
++    if (GsHiresShare offer; gsHiresShareOffer(offer))
++    {
++        const bool imported = s_share.import(offer);
++        std::cerr << (imported ? "[window] high-resolution frames stay on the GPU" : "[window] high-resolution frames go through the CPU")
++                  << std::endl;
++        gsHiresShareAnswer(imported);
++    }
++#endif
++    bool uploaded = false;
++    const bool presented = gsHiresTakeWith([&](const uint8_t *pixels, uint64_t gpuOffset, uint32_t w, uint32_t h)
++                                           {
++                                               if (w == 0u || h == 0u)
++                                                   return; // native only
++                                               fitTexture(w, h);
++                                               if (pixels)
++                                                   UpdateTexture(tex, pixels);
++#if defined(_WIN32)
++                                               else
++                                                   s_share.upload(tex.id, gpuOffset, w, h);
++#endif
++                                               outWidth = s_lastWidth = w;
++                                               outHeight = s_lastHeight = h;
++                                               s_hasUploadedFrame = uploaded = true;
++                                           });
++    if (uploaded)
++        return;
+     if (gsHiresActive() && !presented && s_hasUploadedFrame)
+     {
+         // GPU presents run behind the GS queue: nothing new completed since the last window frame, keep showing it.
+@@ -558,15 +665,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         outHeight = s_lastHeight;
+         return;
+     }
+-    if (presented && hiresWidth != 0u && hiresHeight != 0u && s_hires.size() >= static_cast<size_t>(hiresWidth) * hiresHeight * 4u)
+-    {
+-        fitTexture(hiresWidth, hiresHeight);
+-        UpdateTexture(tex, s_hires.data());
+-        outWidth = s_lastWidth = hiresWidth;
+-        outHeight = s_lastHeight = hiresHeight;
+-        s_hasUploadedFrame = true;
+-        return;
+-    }
+     fitTexture(FB_WIDTH, FB_HEIGHT);
+     s_lastWidth = width;
+     s_lastHeight = height;

@@ -419,8 +419,20 @@ Measured and dropped the same day:
 - A larger unpack buffer pool (the EE runs thousands of flushes ahead and the pool of 8 runs dry): no change.
 - Triangle Z in float instead of double for high-resolution samples (consumer NVIDIA GPUs run doubles at 1/64
   rate): GPU load 95% -> 88% at 2x but no fps change, +1 flip at 3x. Double Z is not what the GPU spends its time on.
-- At 2x the frame rate is ~10 flips below 1x (95 vs 105), but the GPU is not the limit there. The worker does the
-  same work in more time, so the threads are probably competing for memory and shared cores.
+- At 2x the frame rate was ~10 flips below 1x (95 vs 105) although the GPU was not the limit: see the next section.
+
+## Window frames stay on the GPU (2026-11-21, `ps2recomp-gs-window-frames-on-gpu`)
+
+At 2x and above each window frame went GPU -> host memory -> `UpdateTexture` (glTexSubImage2D, 4.6 MB at 2x, 10 MB
+at 3x). The upload alone cost ~12% of the game's frame rate. Measured: dropping the upload gave 109.6 instead of 95;
+copying without uploading 107; uploading straight from the mapped slot, as BGRA, or into two textures in turn changed
+nothing. Now on Windows the high-resolution frame is written into device memory exported as an opaque NT handle
+(`VK_KHR_external_memory_win32`, a second descriptor set with it as binding 1). The window's OpenGL context imports it
+(`GL_EXT_memory_object_win32`, same GPU checked by device UUID) and copies a frame into its texture with a pixel
+unpack buffer, on the GPU. If any step is missing, frames go through the CPU as before. `PS2X_VK_SHARE=0` forces that,
+and `MHRS_HIRES_EVERY` dumps also use it. The log says which: `[window] high-resolution frames stay on the GPU`.
+
+A/B in mission 1: 2x 94.7 -> 110.5 flips/s (and steadier), 3x 70.4 -> 89.9.
 
 ## To 60 fps in the menus
 

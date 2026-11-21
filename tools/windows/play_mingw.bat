@@ -6,7 +6,8 @@ cd /d %~dp0..\..
 set PS2X_GS_BACKEND=vulkan
 set PS2X_VK_RASTER=1
 rem Internal resolution: 1 = native 640x448, 2..4 = that many times sharper (2 = 1280x896, 3 = 1920x1344).
-rem 2 shows every game frame; at 3 the GPU shows about 30 new frames a second. F2 changes it while playing.
+rem 2 shows every game frame; 3 costs about a fifth of the frame rate. F2 changes it while playing.
+rem Frames go from the Vulkan renderer to the window on the GPU; set PS2X_VK_SHARE=0 to copy them through the CPU.
 if "%PS2X_VK_SCALE%"=="" set PS2X_VK_SCALE=2
 set PS2_VU1_DUMP_DIR=build\vu1\dumps
 rem FPS monitor in the top-left corner; F3 hides it.
