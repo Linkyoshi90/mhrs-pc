@@ -1,0 +1,37 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index ce7ee20..1cda7f1 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -8,6 +8,7 @@
+ #include <atomic>
+ #include <array>
+ #include <bitset>
++#include <xmmintrin.h>
+ #include <chrono>
+ #include <cmath>
+ #include <cstddef>
+@@ -2046,8 +2047,24 @@ void GSVulkanBackend::SubmitMany(const GSDrawStep *steps, size_t count)
+         m_cpu.SubmitMany(steps, count);
+         return;
+     }
++    // The frontend built these batches on another core, so each one's first loads missed (~60% of draw()): fetch
++    // the vertex lines (and vertexCount/stateId right after them) a few draws ahead.
++    constexpr size_t kAhead = 6;
++    const auto prefetchDraw = [&](size_t k)
++    {
++        if (k < count && steps[k].draw)
++        {
++            const char *p = reinterpret_cast<const char *>(steps[k].draw);
++            _mm_prefetch(p, _MM_HINT_T0);
++            _mm_prefetch(p + 64, _MM_HINT_T0);
++            _mm_prefetch(p + offsetof(GSPrimitiveBatch, state) - 1, _MM_HINT_T0);
++        }
++    };
++    for (size_t k = 0; k < kAhead; ++k)
++        prefetchDraw(k);
+     for (size_t i = 0; i < count; ++i)
+     {
++        prefetchDraw(i + kAhead);
+         if (steps[i].draw)
+             m_vk->draw(*steps[i].draw);
+         else

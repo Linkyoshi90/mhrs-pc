@@ -295,6 +295,23 @@ selectors were written to stack arrays as four 32-bit values and loaded back as 
 SSE compares from the MASK bits. EE share 18.9% → 17.8%. The frame rate is unchanged (the VU1 worker is the
 bound), but the EE was ~87% busy.
 
+## GS backend draw prefetch (2026-11-21, `ps2recomp-gs-vulkan-draw-prefetch`)
+
+Once the VU1 worker was relieved, the GS backend thread was ~93% busy, and `VkState::draw()` was 44% of it. By
+address, ~60% of `draw()`'s samples were on the first loads of each `GSPrimitiveBatch`: `vertexCount`, then the
+vertices. The frontend builds the batches on another core, and a batch is ~312 bytes of which `draw()` reads the
+first 128, so the hardware prefetcher doesn't follow them. `SubmitMany` now prefetches the vertex lines six draws
+ahead. `draw()` went from 44% to 19% of the thread, which now waits ~31% of its time. A/B at 2×, three rounds:
+90.1 / 90.1 / 89.5 → 94.5 / 95.3 / 93.8 flips/s. A remote-desktop session was running, so every run was ~10
+flips/s below the earlier numbers; the runs were interleaved, so the difference holds.
+
+Tried at the same time and dropped, no measurable gain:
+- The VU1 decoded-image lookup hashes and compares all 16 KB of code on every code change: ~2900 a second, all
+  hits, 2.5–2.9% of the worker. Two fixes were tried. Keeping the list most-recently-used first changed nothing.
+  Finding the image from the previous image plus the MPG uploads skipped every full hash. Neither moved the frame
+  rate: 94.7 vs 94.4 with the prefetch.
+- `closeBatch` (8% of the backend thread) is its tile-binning counters, not misses.
+
 ## Loading screens (2026-11-21, `ps2recomp-skip-idle-loading` + `src/game/fast_load.cpp`)
 
 Loads were paced by real time, not by the disc or the CPU. The emulated DVD has no speed model, so reads are

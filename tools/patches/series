@@ -108,3 +108,4 @@ ps2recomp-skip-idle-loading.patch
 ps2recomp-gs-vulkan-stream-halves.patch
 ps2recomp-vu1-xgkick-flush-runs.patch
 ps2recomp-vif1-unpack-selectors.patch
+ps2recomp-gs-vulkan-draw-prefetch.patch
