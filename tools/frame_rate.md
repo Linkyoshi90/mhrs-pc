@@ -434,6 +434,22 @@ and `MHRS_HIRES_EVERY` dumps also use it. The log says which: `[window] high-res
 
 A/B in mission 1: 2x 94.7 -> 110.5 flips/s (and steadier), 3x 70.4 -> 89.9.
 
+## What is left at ~115 flips/s (2026-11-22, nothing kept)
+
+Mission 1 now runs about 115 flips/s at 1x and at 2x alike. The EE waits in `writeDisplayReg`'s one-frame-ahead
+pacing, so the GIF/VU1 worker (~92% busy) sets the rate. Its largest item is copying the decoded unpack words into
+VU1 memory (~18%), and ~80% of that is the load of words the EE just wrote on another core. A VIF1 DMA chain is
+~2.5 MB and ~1600 tags per frame, and its copy on the EE (`chainBuf.insert`, ~10% of the EE thread) is the first read
+of that cold guest memory. Tried, no gain (A/B flips/s at 1x):
+- Only VIF1 chains reuse the spare chain buffer (GIF chains took it, so each VIF1 chain allocated fresh): 110 vs 115,
+  slower.
+- The interpreter copies the chain's spans lazily, 32 KB ahead of where it parses, instead of all up front: 113.6 vs
+  115.6, slower. The cost is the cold reads, not the second pass.
+- Software prefetch 2 KB ahead in the worker's unpack copy: 115.3 vs 116.2.
+
+Not built: posting the unpack copy and the VU1 run as one worker job. The worker's job machinery is ~1% of it
+(`OrderedWorker::loop` 0.4%, its spin lock 0.4%, no allocations), so that is all it could save.
+
 ## To 60 fps in the menus
 
 The main menu is not a light 2D screen: it draws a 3D scene (the ship's bridge) behind the text and costs
