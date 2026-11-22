@@ -461,6 +461,17 @@ Kept (`ps2recomp-vu1-xgkick-wrap-mask`): `progressXgkickTo` wrapped the PATH1 so
 a long chain of operand clamps and float ops with no single hot spot, `syncFlagsDue` (~3%) is already a tight
 loop over a power-of-two ring, and the lean code already elides unread flag entries (`kElideFlags`).
 
+Tried, exact but not kept: memoizing VU1 code swaps. `rebuildDecodedCodeCache` (~3200 calls/s, ~2.4% of the worker)
+CRC-hashes the 16 KB of code and compares it with a cached image whose copy is out of the caches. MPG uploads logged
+with the code generation each produced let a rebuild go from the previous image straight to the image the same
+uploads led to before (99.8% hits, 0 mismatches against the live code over 640k rebuilds). The worker's share
+vanished, but A/B 107.6 vs 107.1 flips/s (noise).
+
+Why gains here stay small: the game's frame limiter waits for at least one vblank per frame, so mission 1 at
+~54 fps is close to its 60 fps cap. The EE idles ~17% (frames done before the next vblank), and since the code memo
+the worker is not saturated either (89%). Only the slower frames gain from speedups. Worker or EE work is better
+measured in a heavier scene, where frames take longer than a vblank throughout.
+
 Not built: posting the unpack copy and the VU1 run as one worker job. The worker's job machinery is ~1% of it
 (`OrderedWorker::loop` 0.4%, its spin lock 0.4%, no allocations), so that is all it could save.
 
