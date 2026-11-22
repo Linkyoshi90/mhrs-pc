@@ -447,6 +447,20 @@ of that cold guest memory. Tried, no gain (A/B flips/s at 1x):
   115.6, slower. The cost is the cold reads, not the second pass.
 - Software prefetch 2 KB ahead in the worker's unpack copy: 115.3 vs 116.2.
 
+Measured (2026-11-22): 155k unpack flushes/s, ~5 blocks each; 127 MB/s of UNPACK source becomes 450 MB/s of decoded
+words (mostly V2-16, V3-16, V3-8, V4-32, V4-8). More tried, no gain:
+- The worker decodes raw CL == WL UNPACKs itself (EE sends source + format, 3.5x fewer bytes): 111.2 vs 116.7. Each
+  small block still starts with a cold miss (header, source), and the decode lands on the busiest thread.
+- The worker prefetches the next flush's buffers at the end of each unpack job, ahead of the VU1 run in between:
+  111.9 vs 116.2.
+- EE, worker, GS frontend and GS backend pinned to their own physical cores (i9-9900K, SMT): 114.2 vs 116.2.
+
+Kept (`ps2recomp-vu1-xgkick-wrap-mask`): `progressXgkickTo` wrapped the PATH1 source address with a 32-bit `div`,
+~45% of that function (~1.5% of the worker). VU data memory is a power of two, so it is a mask now. A/B 2x, 3 rounds:
+107.6 -> 108.6 flips/s, ahead in every round. The worker's other compute is spread thin: `transformClipLoop` (~10%) is
+a long chain of operand clamps and float ops with no single hot spot, `syncFlagsDue` (~3%) is already a tight
+loop over a power-of-two ring, and the lean code already elides unread flag entries (`kElideFlags`).
+
 Not built: posting the unpack copy and the VU1 run as one worker job. The worker's job machinery is ~1% of it
 (`OrderedWorker::loop` 0.4%, its spin lock 0.4%, no allocations), so that is all it could save.
 

@@ -1,0 +1,38 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 1a0578f..dcea142 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -457,6 +457,15 @@ void VU1Interpreter::progressXgkick()
+     }
+ }
+ 
++namespace
++{
++    // address % size without a divide for the power-of-two sizes VU data memory has (16 KB VU1, 4 KB VU0).
++    inline uint32_t wrapVuData(uint32_t address, uint32_t size)
++    {
++        return (size & (size - 1u)) == 0u ? address & (size - 1u) : address % size;
++    }
++}
++
+ // progressXgkick for every cycle through cycle (the lean engine's lazy PATH1). Inside a GIF tag's data the per-cycle
+ // step only copies a qword every second cycle, so those qwords are copied in one go, through the tag's last one;
+ // the tags themselves and a wrap around VU memory go through the per-cycle step.
+@@ -467,7 +476,7 @@ void VU1Interpreter::progressXgkickTo(uint64_t cycle)
+         if (m_activeVuData && m_activeVuDataSize != 0u && m_xgkick.currentTagEnd > m_xgkick.copiedBytes)
+         {
+             const uint64_t byCredit = (m_xgkick.cycleCredit + (cycle - m_xgkick.progressedCycle)) / 2u;
+-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++            const uint32_t source = wrapVuData(m_xgkick.sourceAddress + m_xgkick.copiedBytes, m_activeVuDataSize);
+             const uint64_t qwords = std::min<uint64_t>({byCredit, (m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u,
+                                                         (m_activeVuDataSize - source) / 16u});
+             if (qwords != 0u)
+@@ -532,7 +541,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
+         return;
+ 
+-    const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
++    const uint32_t sourceAddress = wrapVuData(qwordAddress * 16u, m_activeVuDataSize);
+     m_xgkick = {};
+     m_xgkick.active = true;
+     m_xgkick.sourceAddress = sourceAddress;

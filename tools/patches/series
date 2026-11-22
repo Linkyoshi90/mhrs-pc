@@ -114,3 +114,4 @@ ps2recomp-mc-screen-fast-time.patch
 ps2recomp-vu1-dump-async.patch
 ps2recomp-gif-packet-batches.patch
 ps2recomp-gs-window-frames-on-gpu.patch
+ps2recomp-vu1-xgkick-wrap-mask.patch
