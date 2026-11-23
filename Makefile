@@ -59,8 +59,8 @@ RECOMP_BIN := $(PS2RECOMP)/out/linux
 # stays interpreted. Both are game code, so they live in build/.
 VU1_DUMPS := build/vu1/dumps
 VU1_OUT   := build/vu1/src
-# Under 2 MB of lean source per file keeps one compile under 2 GB of memory (2186 programs: 130 files).
-VU1_LEAN_FILES ?= 130
+# Under 2 MB of lean source per file keeps one compile under 2 GB of memory (2622 programs: 150 files).
+VU1_LEAN_FILES ?= 150
 vu1:
 	@mkdir -p $(VU1_DUMPS)
 	python3 tools/vu1_compile.py $(VU1_OUT) $(VU1_DUMPS)

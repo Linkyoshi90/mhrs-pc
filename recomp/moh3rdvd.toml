@@ -1462,8 +1462,10 @@ instructions = [
   # 1 + (D_004BB870 < 5): 2 while the level loader's state machine (func_0026DC80, state 5 = done) runs, as the
   # loader thread only gets the CPU while the main thread sleeps there; 1 (60 fps) otherwise. $s0 holds the limit:
   # the function loaded 0x360000 into $s0/$a0 four times, and $s4 already holds it, so those slots are free.
-  { address = "0x0015A0C0", value = "0x3C10004C" }, # limiter: lui   $s0, 0x4C           (was lui $s0, 0x36)
-  { address = "0x0015A0EC", value = "0x8E10B870" }, # limiter: lw    $s0, -0x4790($s0)   (was lui $a0, 0x36)
+  # The word read is 0xE0000, not D_004BB870 itself: the runner's frame tick wrapper (mhrs_frame_limit.cpp) copies
+  # the loader state there, or 0 while the front-end level is loaded, so menus stay at 30 fps.
+  { address = "0x0015A0C0", value = "0x3C10000E" }, # limiter: lui   $s0, 0xE            (was lui $s0, 0x36)
+  { address = "0x0015A0EC", value = "0x8E100000" }, # limiter: lw    $s0, 0($s0)         (was lui $a0, 0x36)
   { address = "0x0015A0F0", value = "0x8E829DC4" }, # limiter: lw    $v0, -0x623C($s4)   (was ($a0))
   { address = "0x0015A0FC", value = "0xAE839DBC" }, # limiter: sw    $v1, -0x6244($s4)   (was ($s0))
   { address = "0x0015A100", value = "0xAE839DC4" }, # limiter: sw    $v1, -0x623C($s4)   (was ($a0))

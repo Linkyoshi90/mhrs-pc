@@ -11,6 +11,8 @@
 //   tableA/tableB (int16[4]) and ptrTable live in SNDDRV's data; their addresses are read from the
 //   relocated lui/addiu and lui/lw pairs in the function itself, so no load address is assumed.
 // SNDI_memcpy (+0x4600): hand-written memmove(a0 = dst, a1 = src, a2 = n); n <= 0 copies nothing.
+// mixiop (+0x36d0): acc[i] += src[i] * (a1 >> 8) for a0 int32 samples (a2 = src, a3 = acc); the hot loop of
+//   SNDDRV's software voices, so scenes with many sounds (explosions) ran the IOP interpreter flat out.
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -92,6 +94,26 @@ namespace mhrs::snddrv
         return 20u + size * 35u / 64u; // the original moves 64 bytes per ~35 instructions
     }
 
+    uint32_t mixIop(uint32_t, uint32_t *gpr, std::span<uint8_t> ram)
+    {
+        const uint32_t count = gpr[4];
+        const int32_t gain = static_cast<int32_t>(gpr[5]) >> 8;
+        const uint32_t src = gpr[6];
+        const uint32_t acc = gpr[7];
+        // The original never ends for a count of 0 (its pair loop runs at least once); never seen, so do nothing.
+        if (count == 0u || count > kRamSize / 4u)
+            return 4u;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            int32_t s, a;
+            std::memcpy(&s, ram.data() + phys(src + 4u * i), sizeof(s));
+            std::memcpy(&a, ram.data() + phys(acc + 4u * i), sizeof(a));
+            a = static_cast<int32_t>(static_cast<uint32_t>(a) + static_cast<uint32_t>(s) * static_cast<uint32_t>(gain)); // mult/mflo + add, wrapping
+            std::memcpy(ram.data() + phys(acc + 4u * i), &a, sizeof(a));
+        }
+        return 20u + (count & 3u) * 9u + (count & ~3u) * 7u;
+    }
+
     // Masks: all bits checked except relocated fields at the given word indices.
     std::vector<uint32_t> masks(uint32_t words, std::initializer_list<uint32_t> hiLoWords, std::initializer_list<uint32_t> jumpWords)
     {
@@ -120,6 +142,7 @@ namespace mhrs::snddrv
         // Hashes from tools/irx_native_sig.py extracted/MOHRS/IOP/SNDDRV.IRX <start> <end>.
         add(runtime, 0x5824u, masks(122u, {6, 7, 16, 17, 38, 40}, {51, 55, 66, 70, 81, 85, 96, 100}), 0x0AA430FEu, mixEe48Iop48);
         add(runtime, 0x4600u, masks(201u, {}, {153}), 0x5674C270u, memmoveNative);
+        add(runtime, 0x36D0u, masks(49u, {}, {}), 0x6A1CFBD3u, mixIop);
     }
 }
 
