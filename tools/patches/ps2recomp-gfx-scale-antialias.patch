@@ -1,0 +1,788 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_hires.h b/ps2xRuntime/include/runtime/gs/gs_hires.h
+index b19ea8b..1d6c2cc 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_hires.h
++++ b/ps2xRuntime/include/runtime/gs/gs_hires.h
+@@ -5,12 +5,17 @@
+ #include <functional>
+ #include <vector>
+ 
+-// Internal resolution of the Vulkan GS backend: 2..4 draws 32-bit frame buffers at that many times the native
+-// resolution as well, and each present publishes the display at that size (packed RGBA8, width x height) for the
+-// window. 1 or no Vulkan: nothing is published. PS2X_VK_SCALE sets the start value (default 1); the controls menu
+-// (F2) changes it while the game runs.
++// Internal resolution of the Vulkan GS backend: 2..max_scale draws 32-bit frame buffers at that many times the
++// native resolution as well, and each present publishes the display at that size (packed RGBA8, width x height) for
++// the window. 1 or no Vulkan: nothing is published. PS2X_VK_SCALE sets the start value (default 1); the graphics
++// menu (F4) changes it while the game runs.
+ uint32_t gsHiresScale();
+-void gsHiresSetScale(uint32_t scale);
++void gsHiresSetScale(uint32_t scale); // clamped to 1..gsHiresMaxScale()
++// The highest scale: the backend sizes its buffers for it at start (they grow with its square). max_scale from the
++// graphics file, else PS2X_VK_MAX_SCALE, else 4; the backend lowers it when its buffers do not fit.
++constexpr uint32_t kGsHiresMaxScaleLimit = 8u;
++uint32_t gsHiresMaxScale();
++void gsHiresSetMaxScale(uint32_t max); // clamped to 1..kGsHiresMaxScaleLimit; lowers the scale to it
+ // Every GPU present publishes: the high-resolution display, or nothing (width 0) when it has none (native only).
+ void gsHiresPublish(std::vector<uint8_t> &&pixels, uint32_t width, uint32_t height);
+ // The same from memory the caller keeps: copied into a buffer that goes back and forth with the window's, so a
+diff --git a/ps2xRuntime/include/runtime/ps2_menus.h b/ps2xRuntime/include/runtime/ps2_menus.h
+index aaf85be..4c42072 100755
+--- a/ps2xRuntime/include/runtime/ps2_menus.h
++++ b/ps2xRuntime/include/runtime/ps2_menus.h
+@@ -2,6 +2,8 @@
+ #define PS2_MENUS_H
+ 
+ #include <cstdint>
++#include <string>
++#include <string_view>
+ 
+ // In-window menus, drawn over the game by the render loop: F2 rebinds the controls (saved to the controls file),
+ // F4 sets the graphics (saved to the graphics file), F5 toggles the game's own bonus cheats (MOH: Rising Sun only;
+@@ -12,7 +14,28 @@ void ps2MenusUpdateAndDraw(uint8_t *rdram);
+ // The frame rate the player picked in the graphics menu (60 or 30), for a game hook that limits its own frame rate
+ // (MOH: Rising Sun's frame limiter). 60 until the graphics file is read.
+ int ps2GraphicsFrameRate();
++// Anti-aliasing of the frame as the window draws it: kAntialias* bits, 0 (off) until the graphics file is read.
++constexpr int kAntialiasSsaa = 1; // area (box) filter when the frame is larger than where it is drawn
++constexpr int kAntialiasFxaa = 2; // FXAA over the frame as drawn
++int ps2GraphicsAntialias();
+ // The graphics file: PS2X_GRAPHICS or graphics.ini in the working directory.
+ const char *ps2GraphicsPath();
+ 
++// What the graphics file holds. windowW 0: the start size (MHRS_WINDOW or the built-in one); scale 0: the start
++// value (PS2X_VK_SCALE); maxScale 0: the start value (PS2X_VK_MAX_SCALE, else 4).
++struct GraphicsSettings
++{
++    int windowW = 0, windowH = 0;
++    bool fullscreen = false;
++    uint32_t scale = 0;
++    uint32_t maxScale = 0; // 1..kGsHiresMaxScaleLimit, read once at start
++    int frameRate = 60;
++    int antialias = 0;
++};
++// Unknown keys and bad values are skipped: a hand-edited file never stops the game.
++GraphicsSettings ps2ParseGraphics(std::string_view text);
++// A whole graphics file that ps2ParseGraphics reads back to the same settings.
++std::string ps2FormatGraphics(const GraphicsSettings &s);
++GraphicsSettings ps2LoadGraphics(); // the graphics file; defaults without one
++
+ #endif
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+index ecbf570..da874c0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_vulkan_backend.h"
+ #include "runtime/gs/gs_hires.h"
++#include "runtime/ps2_menus.h"
+ 
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+@@ -605,20 +606,45 @@ bool gsHiresTake(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height
+ 
+ namespace
+ {
+-    std::atomic<uint32_t> g_hiresScale{0}; // 0: not read from PS2X_VK_SCALE yet
++    std::atomic<uint32_t> g_hiresScale{0};    // 0: not read from PS2X_VK_SCALE yet
++    std::atomic<uint32_t> g_hiresMaxScale{0}; // 0: not read from the graphics file / PS2X_VK_MAX_SCALE yet
+     std::atomic<bool> g_hiresActive{false};
+ }
+ 
+ bool gsHiresActive() { return g_hiresActive.load(std::memory_order_relaxed); }
+ void gsHiresSetActive(bool active) { g_hiresActive.store(active, std::memory_order_relaxed); }
+ 
++uint32_t gsHiresMaxScale()
++{
++    uint32_t max = g_hiresMaxScale.load(std::memory_order_relaxed);
++    if (max == 0u)
++    {
++        max = ps2LoadGraphics().maxScale; // the graphics file wins, as for the other settings
++        if (max == 0u)
++        {
++            const char *env = std::getenv("PS2X_VK_MAX_SCALE");
++            max = static_cast<uint32_t>(std::clamp(env ? std::atoi(env) : 4, 1, static_cast<int>(kGsHiresMaxScaleLimit)));
++        }
++        g_hiresMaxScale.store(max, std::memory_order_relaxed);
++    }
++    return max;
++}
++
++void gsHiresSetMaxScale(uint32_t max)
++{
++    max = std::clamp(max, 1u, kGsHiresMaxScaleLimit);
++    g_hiresMaxScale.store(max, std::memory_order_relaxed);
++    if (gsHiresScale() > max)
++        g_hiresScale.store(max, std::memory_order_relaxed);
++}
++
+ uint32_t gsHiresScale()
+ {
+     uint32_t scale = g_hiresScale.load(std::memory_order_relaxed);
+     if (scale == 0u)
+     {
+         const char *env = std::getenv("PS2X_VK_SCALE");
+-        scale = static_cast<uint32_t>(std::clamp(env ? std::atoi(env) : 1, 1, 4));
++        scale = static_cast<uint32_t>(std::clamp(env ? std::atoi(env) : 1, 1, static_cast<int>(gsHiresMaxScale())));
+         g_hiresScale.store(scale, std::memory_order_relaxed);
+     }
+     return scale;
+@@ -626,7 +652,7 @@ uint32_t gsHiresScale()
+ 
+ void gsHiresSetScale(uint32_t scale)
+ {
+-    g_hiresScale.store(std::clamp<uint32_t>(scale, 1u, 4u), std::memory_order_relaxed);
++    g_hiresScale.store(std::clamp(scale, 1u, gsHiresMaxScale()), std::memory_order_relaxed);
+ }
+ 
+ // GS VRAM has two copies. The GPU rasterizes into a device-local buffer; the CPU backend
+@@ -667,13 +693,13 @@ struct GSVulkanBackend::VkState
+     PageSet cpuDirty; // host copy is newer
+     PageSet gpuDirty; // device copy is newer
+ 
+-    // Internal resolution (PS2X_VK_SCALE = 2..4, gs_hires.h): shadowBuffer holds scale x scale samples per VRAM
+-    // word. shadowValid: pages whose samples match their native words as drawn at high resolution (draws to 32-bit
+-    // frame/z buffers write both); anything else that writes a page (CPU, 16-bit draws) makes it stale, and the
+-    // next high-resolution draw into it first refills it from the native words.
+-    static constexpr uint32_t kMaxScale = 4u; // the buffers are sized for it, so the scale can change at any time
+-    uint32_t maxScale = 1;                     // kMaxScale, or 1 without the high-resolution buffers/pipelines
+-    uint32_t scale = 1;                        // the one in use (changes between batches, see syncScale)
++    // Internal resolution (PS2X_VK_SCALE = 2..max_scale, gs_hires.h): shadowBuffer holds scale x scale samples per
++    // VRAM word. shadowValid: pages whose samples match their native words as drawn at high resolution (draws to
++    // 32-bit frame/z buffers write both); anything else that writes a page (CPU, 16-bit draws) makes it stale, and
++    // the next high-resolution draw into it first refills it from the native words.
++    uint32_t maxScale = 1; // gsHiresMaxScale() at start: the buffers are sized for it, so the scale can change at any
++                           // time; lower when they did not fit, 1 without the high-resolution buffers/pipelines
++    uint32_t scale = 1;    // the one in use (changes between batches, see syncScale)
+     void syncScale()
+     {
+         const uint32_t wanted = std::min(gsHiresScale(), maxScale);
+@@ -700,11 +726,24 @@ struct GSVulkanBackend::VkState
+ 
+     VkBuffer outBuffer = VK_NULL_HANDLE; // present output, host-visible
+     void *outMapped = nullptr;
+-    // outBuffer holds kSlots slots of a native frame (640x512 words) and a high-resolution one (kMaxScale^2 as many).
++    // outBuffer holds kSlots slots of a native frame (640x512 words) and a high-resolution one (maxScale^2 as many).
+     // Slot 0: synchronous presents. Slots 1..3: pipelined presents, each read back at the following present.
+     static constexpr uint32_t kSlots = 4u;
+     static constexpr uint32_t kSlotNativeWords = 640u * 512u;
+-    static constexpr uint32_t kSlotWords = kSlotNativeWords * (1u + 4u * 4u);
++    static constexpr uint32_t slotWordsFor(uint32_t maxScale) { return kSlotNativeWords * (1u + maxScale * maxScale); }
++    static_assert(uint64_t{kSlots} * kSlotNativeWords * (1u + kGsHiresMaxScaleLimit * kGsHiresMaxScaleLimit) * 4u <= UINT32_MAX,
++                  "slot offsets in words and bytes stay 32-bit");
++    uint32_t slotWords = slotWordsFor(1u);
++    // Frees the buffers created since allocations had count entries.
++    void freeAllocationsFrom(size_t count)
++    {
++        for (; allocations.size() > count; allocations.pop_back())
++        {
++            vkDestroyBuffer(device, allocations.back().first, nullptr);
++            if (allocations.back().second != VK_NULL_HANDLE)
++                vkFreeMemory(device, allocations.back().second, nullptr);
++        }
++    }
+     struct PresentSlot
+     {
+         bool pending = false;
+@@ -868,7 +907,7 @@ bool GSVulkanBackend::VkState::createShareBuffer()
+     external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+     VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+     bufferInfo.pNext = &external;
+-    bufferInfo.size = static_cast<VkDeviceSize>(kSlots) * kSlotWords * 4u;
++    bufferInfo.size = static_cast<VkDeviceSize>(kSlots) * slotWords * 4u;
+     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+     if (vkCreateBuffer(device, &bufferInfo, nullptr, &shareBuffer) != VK_SUCCESS)
+@@ -1038,7 +1077,6 @@ bool GSVulkanBackend::initVulkan()
+         !vk.createBuffer(vk.vramBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          false, vk.vramBuffer, nullptr) ||
+         !vk.createBuffer(VkState::kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, vk.uploadBuffer, &uploadMapped) ||
+-        !vk.createBuffer(VkState::kSlots * VkState::kSlotWords * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, vk.outBuffer, &vk.outMapped) ||
+         !vk.createStream(vk.states, sizeof(PipeState), VkState::kMaxStates) ||
+         !vk.createStream(vk.geoms, sizeof(Geom), VkState::kMaxGeoms) ||
+         !vk.createStream(vk.tiles, 4u, VkState::kTileWords) ||
+@@ -1049,11 +1087,35 @@ bool GSVulkanBackend::initVulkan()
+     }
+     vk.vramMapped = static_cast<uint8_t *>(vramMapped);
+     vk.uploadMapped = static_cast<uint8_t *>(uploadMapped);
+-    vk.maxScale = VkState::kMaxScale;
+-    if (!vk.createBuffer(vk.vramBufferSize * vk.maxScale * vk.maxScale, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false, vk.shadowBuffer, nullptr))
++    // The high-resolution copy and the present output grow with max_scale squared (x8: 256 MB and 4 x 85 MB). When
++    // they exceed the device's storage buffer range or memory: x4 (what the backend always had), then native only.
++    VkPhysicalDeviceProperties deviceProps{};
++    vkGetPhysicalDeviceProperties(vk.phys, &deviceProps);
++    const VkDeviceSize range = deviceProps.limits.maxStorageBufferRange;
++    for (vk.maxScale = gsHiresMaxScale();; vk.maxScale = vk.maxScale > 4u ? 4u : 1u)
++    {
++        vk.slotWords = VkState::slotWordsFor(vk.maxScale);
++        const VkDeviceSize shadowBytes = vk.vramBufferSize * vk.maxScale * vk.maxScale;
++        const VkDeviceSize outBytes = VkDeviceSize{VkState::kSlots} * vk.slotWords * 4u;
++        const size_t mark = vk.allocations.size();
++        const bool inRange = shadowBytes <= range && outBytes <= range;
++        if (vk.maxScale == 1u ||
++            (inRange && vk.createBuffer(shadowBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false, vk.shadowBuffer, nullptr) &&
++             vk.createBuffer(outBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, vk.outBuffer, &vk.outMapped)))
++            break;
++        vk.freeAllocationsFrom(mark);
++        vk.shadowBuffer = vk.outBuffer = VK_NULL_HANDLE;
++        vk.outMapped = nullptr;
++        std::cerr << "[gs-vulkan] internal resolution up to x" << vk.maxScale
++                  << (inRange ? ": not enough memory" : ": buffers larger than the device's storage buffer range of ")
++                  << (inRange ? std::string() : std::to_string(range >> 20u) + " MB")
++                  << (vk.maxScale > 4u ? ", trying up to x4" : ", drawing at native resolution") << std::endl;
++    }
++    if (vk.maxScale == 1u &&
++        !vk.createBuffer(VkDeviceSize{VkState::kSlots} * vk.slotWords * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, vk.outBuffer, &vk.outMapped))
+     {
+-        std::cerr << "[gs-vulkan] no memory for internal resolution, drawing at native resolution" << std::endl;
+-        vk.maxScale = 1u;
++        std::cerr << "[gs-vulkan] buffer allocation failed, CPU fallback" << std::endl;
++        return false;
+     }
+     if (wantShare && vk.maxScale > 1u && !vk.createShareBuffer())
+     {
+@@ -1159,9 +1221,10 @@ bool GSVulkanBackend::initVulkan()
+         std::cerr << "[gs-vulkan] internal resolution pipelines unavailable, drawing at native resolution" << std::endl;
+         vk.maxScale = 1u;
+     }
++    gsHiresSetMaxScale(vk.maxScale); // the menu offers what the buffers allow
+     vk.syncScale();
+     if (vk.scale > 1u)
+-        std::cerr << "[gs-vulkan] internal resolution x" << vk.scale << std::endl;
++        std::cerr << "[gs-vulkan] internal resolution x" << vk.scale << " (up to x" << vk.maxScale << ")" << std::endl;
+ 
+     VkCommandPoolCreateInfo commandPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+     commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+@@ -1991,9 +2054,9 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+         const uint32_t slot = vk.lastSlot % 3u + 1u;
+         if (vk.slots[slot].pending) // not read back yet (cannot happen with 3 slots read one present later)
+             vkWaitForFences(vk.device, 1, &vk.slotFences[slot], VK_TRUE, UINT64_MAX);
+-        const uint32_t base = slot * VkState::kSlotWords;
++        const uint32_t base = slot * vk.slotWords;
+         const uint8_t *slotBytes = static_cast<const uint8_t *>(vk.outMapped) + static_cast<size_t>(base) * 4u;
+-        gsHiresRelease(slotBytes, slotBytes + VkState::kSlotWords * 4u);
++        gsHiresRelease(slotBytes, slotBytes + vk.slotWords * 4u);
+         const VkCommandBuffer cb = vk.command();
+         vk.barrier(cb); // after all drawing submitted before, not only what this command buffer holds
+         PresentPushConstants pc{};
+@@ -2045,7 +2108,7 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+         vkWaitForFences(vk.device, 1, &vk.slotFences[ready], VK_TRUE, UINT64_MAX);
+         const VkState::PresentSlot done = vk.slots[ready];
+         vk.slots[ready].pending = false;
+-        const uint8_t *src = static_cast<const uint8_t *>(vk.outMapped) + static_cast<size_t>(ready) * VkState::kSlotWords * 4u;
++        const uint8_t *src = static_cast<const uint8_t *>(vk.outMapped) + static_cast<size_t>(ready) * vk.slotWords * 4u;
+         PresentationFrame frame{};
+         frame.width = done.width;
+         frame.height = done.height;
+@@ -2055,7 +2118,7 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+         {
+             if (done.hiresWidth != 0u && done.shared)
+                 gsHiresPublishGpu(src + VkState::kSlotNativeWords * 4u,
+-                                  (static_cast<uint64_t>(ready) * VkState::kSlotWords + VkState::kSlotNativeWords) * 4u,
++                                  (static_cast<uint64_t>(ready) * vk.slotWords + VkState::kSlotNativeWords) * 4u,
+                                   done.hiresWidth, done.hiresHeight);
+             else if (done.hiresWidth != 0u)
+             {
+@@ -2117,9 +2180,11 @@ PresentationFrame GSVulkanBackend::presentGpu(const GSPresentationRequest &reque
+ #else // !PS2X_HAS_VULKAN — no Vulkan in this build: everything stays on the CPU backend.
+ 
+ uint32_t gsHiresScale() { return 1u; }
++uint32_t gsHiresMaxScale() { return 1u; }
+ bool gsHiresActive() { return false; }
+ void gsHiresSetActive(bool) {}
+ void gsHiresSetScale(uint32_t) {}
++void gsHiresSetMaxScale(uint32_t) {}
+ void gsHiresPublish(std::vector<uint8_t> &&, uint32_t, uint32_t) {}
+ void gsHiresPublishCopy(const uint8_t *, uint32_t, uint32_t) {}
+ void gsHiresPublishShared(const uint8_t *, uint32_t, uint32_t) {}
+diff --git a/ps2xRuntime/src/lib/ps2_menus.cpp b/ps2xRuntime/src/lib/ps2_menus.cpp
+index ce423f2..6e08e72 100755
+--- a/ps2xRuntime/src/lib/ps2_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_menus.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ #include <fstream>
+ #include <iterator>
++#include <sstream>
+ #include <string>
+ #include <vector>
+ 
+@@ -307,6 +308,8 @@ namespace
+ 
+     // ---- graphics menu ----
+     std::atomic<int> g_frameRate{60};
++    std::atomic<int> g_antialias{0};
++    constexpr const char *kAntialiasNames[] = {"off", "ssaa", "fxaa", "ssaa+fxaa"}; // by kAntialias* bits
+ 
+     struct WindowSize
+     {
+@@ -316,21 +319,13 @@ namespace
+                                            {1600, 900},  {1600, 1200}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
+     constexpr int kWindowSizeCount = static_cast<int>(std::size(kWindowSizes));
+ 
+-    // What the graphics file holds. windowW 0: the start size (MHRS_WINDOW or the built-in one); scale 0: the
+-    // start value (PS2X_VK_SCALE).
+-    struct GraphicsSettings
+-    {
+-        int windowW = 0, windowH = 0;
+-        bool fullscreen = false;
+-        uint32_t scale = 0;
+-        int frameRate = 60;
+-    };
+-
+     enum GraphicsRow
+     {
+         GfxWindow,
+         GfxFullscreen,
+         GfxScale,
++        GfxMaxScale,
++        GfxAntialias,
+         GfxFrameRate,
+         GfxDefaults,
+         GfxCount
+@@ -343,49 +338,14 @@ namespace
+         GraphicsSettings settings;
+     };
+ 
+-    // Unknown keys and bad values are skipped: a hand-edited file never stops the game.
+-    GraphicsSettings loadGraphics()
+-    {
+-        GraphicsSettings s;
+-        std::ifstream file(ps2GraphicsPath());
+-        for (std::string line; std::getline(file, line);)
+-        {
+-            line = line.substr(0, line.find('#'));
+-            const size_t eq = line.find('=');
+-            if (eq == std::string::npos)
+-                continue;
+-            std::string key = line.substr(0, eq);
+-            key.erase(std::remove_if(key.begin(), key.end(), [](unsigned char c) { return std::isspace(c); }), key.end());
+-            const char *value = line.c_str() + eq + 1;
+-            int a = 0, b = 0;
+-            if (key == "window" && std::sscanf(value, " %dx%d", &a, &b) == 2 && a >= 320 && b >= 240)
+-            {
+-                s.windowW = a;
+-                s.windowH = b;
+-            }
+-            else if (key == "fullscreen" && std::sscanf(value, " %d", &a) == 1)
+-                s.fullscreen = a != 0;
+-            else if (key == "scale" && std::sscanf(value, " %d", &a) == 1 && a >= 1 && a <= 4)
+-                s.scale = static_cast<uint32_t>(a);
+-            else if (key == "fps" && std::sscanf(value, " %d", &a) == 1)
+-                s.frameRate = a <= 30 ? 30 : 60;
+-        }
+-        return s;
+-    }
+-
+     void saveGraphics(const GraphicsSettings &s, std::string &status)
+     {
+         std::ofstream file(ps2GraphicsPath(), std::ios::trunc);
+-        file << "# Written by the graphics menu (F4).\n";
+-        if (s.windowW > 0)
+-            file << "window = " << s.windowW << "x" << s.windowH << "    # window size when not fullscreen\n";
+-        file << "fullscreen = " << (s.fullscreen ? 1 : 0) << "    # borderless, at the monitor's resolution\n";
+-        if (s.scale > 0)
+-            file << "scale = " << s.scale << "    # internal resolution, 1 (native PS2) to 4\n";
+-        file << "fps = " << s.frameRate << "    # game frame rate: 60 or 30 (menus always run at 30)\n";
++        file << ps2FormatGraphics(s);
+         status = file ? std::string("Saved to ") + ps2GraphicsPath() : std::string("Could not write ") + ps2GraphicsPath();
+     }
+ 
++    // max_scale is not applied: the Vulkan backend reads it once at start (gsHiresMaxScale).
+     void applyGraphics(const GraphicsSettings &s)
+     {
+         if (s.fullscreen != IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
+@@ -395,6 +355,7 @@ namespace
+         if (s.scale > 0)
+             gsHiresSetScale(s.scale);
+         g_frameRate.store(s.frameRate, std::memory_order_relaxed);
++        g_antialias.store(s.antialias, std::memory_order_relaxed);
+     }
+ 
+     // The preset at or just above the current window size.
+@@ -442,7 +403,22 @@ namespace
+         case GfxScale:
+             if (step != 0)
+             {
+-                s.scale = static_cast<uint32_t>(std::clamp(static_cast<int>(gsHiresScale()) + step, 1, 4));
++                s.scale = static_cast<uint32_t>(std::clamp(static_cast<int>(gsHiresScale()) + step, 1, static_cast<int>(gsHiresMaxScale())));
++                changed = true;
++            }
++            break;
++        case GfxMaxScale:
++            if (step != 0)
++            {
++                const int current = static_cast<int>(s.maxScale > 0 ? s.maxScale : gsHiresMaxScale());
++                s.maxScale = static_cast<uint32_t>(std::clamp(current + step, 1, static_cast<int>(kGsHiresMaxScaleLimit)));
++                changed = true;
++            }
++            break;
++        case GfxAntialias:
++            if (step != 0 || enter)
++            {
++                s.antialias = (s.antialias + (step < 0 ? 3 : 1)) % 4;
+                 changed = true;
+             }
+             break;
+@@ -460,6 +436,7 @@ namespace
+                 s.windowW = 1280;
+                 s.windowH = 960;
+                 s.scale = 2;
++                s.maxScale = 4;
+                 changed = true;
+             }
+             break;
+@@ -492,9 +469,24 @@ namespace
+             case GfxFullscreen: label = "Fullscreen"; value = s.fullscreen ? "on" : "off"; break;
+             case GfxScale:
+                 label = "Internal resolution";
+-                value = TextFormat("%ux (%ux%u)%s", gsHiresScale(), 640u * gsHiresScale(), 448u * gsHiresScale(),
++                value = TextFormat("%ux  %ux%u%s", gsHiresScale(), 640u * gsHiresScale(), 448u * gsHiresScale(),
+                                    gsHiresScale() > 1u ? "" : "  native PS2");
+                 break;
++            case GfxMaxScale:
++            {
++                label = "Highest internal resolution";
++                const uint32_t saved = s.maxScale > 0 ? s.maxScale : gsHiresMaxScale();
++                value = TextFormat("%ux  (takes effect after restart", saved);
++                value += saved != gsHiresMaxScale() ? std::string(TextFormat("; now %ux)", gsHiresMaxScale())) : std::string(")");
++                break;
++            }
++            case GfxAntialias:
++            {
++                constexpr const char *kLabels[] = {"off", "SSAA (area filter)", "FXAA", "SSAA + FXAA"};
++                label = "Anti-aliasing";
++                value = kLabels[s.antialias & 3];
++                break;
++            }
+             case GfxFrameRate:
+                 label = "Frame rate";
+                 value = TextFormat("%d fps%s", s.frameRate, s.frameRate == 60 ? "" : "  (as on the PS2)");
+@@ -628,6 +620,7 @@ namespace
+ }
+ 
+ int ps2GraphicsFrameRate() { return g_frameRate.load(std::memory_order_relaxed); }
++int ps2GraphicsAntialias() { return g_antialias.load(std::memory_order_relaxed); }
+ 
+ const char *ps2GraphicsPath()
+ {
+@@ -635,13 +628,72 @@ const char *ps2GraphicsPath()
+     return path;
+ }
+ 
++GraphicsSettings ps2ParseGraphics(std::string_view text)
++{
++    GraphicsSettings s;
++    std::istringstream in{std::string(text)};
++    for (std::string line; std::getline(in, line);)
++    {
++        line = line.substr(0, line.find('#'));
++        const size_t eq = line.find('=');
++        if (eq == std::string::npos)
++            continue;
++        std::string key = line.substr(0, eq);
++        key.erase(std::remove_if(key.begin(), key.end(), [](unsigned char c) { return std::isspace(c); }), key.end());
++        const char *value = line.c_str() + eq + 1;
++        int a = 0, b = 0;
++        char word[16] = {};
++        if (key == "window" && std::sscanf(value, " %dx%d", &a, &b) == 2 && a >= 320 && b >= 240)
++        {
++            s.windowW = a;
++            s.windowH = b;
++        }
++        else if (key == "fullscreen" && std::sscanf(value, " %d", &a) == 1)
++            s.fullscreen = a != 0;
++        else if (key == "scale" && std::sscanf(value, " %d", &a) == 1 && a >= 1 && a <= static_cast<int>(kGsHiresMaxScaleLimit))
++            s.scale = static_cast<uint32_t>(a); // above max_scale: gsHiresSetScale lowers it
++        else if (key == "max_scale" && std::sscanf(value, " %d", &a) == 1 && a >= 1 && a <= static_cast<int>(kGsHiresMaxScaleLimit))
++            s.maxScale = static_cast<uint32_t>(a);
++        else if (key == "fps" && std::sscanf(value, " %d", &a) == 1)
++            s.frameRate = a <= 30 ? 30 : 60;
++        else if (key == "antialias" && std::sscanf(value, " %15s", word) == 1)
++            for (int i = 0; i < 4; ++i)
++                if (std::strcmp(word, kAntialiasNames[i]) == 0)
++                    s.antialias = i;
++    }
++    return s;
++}
++
++std::string ps2FormatGraphics(const GraphicsSettings &s)
++{
++    std::ostringstream out;
++    out << "# Written by the graphics menu (F4).\n";
++    if (s.windowW > 0)
++        out << "window = " << s.windowW << "x" << s.windowH << "    # window size when not fullscreen\n";
++    out << "fullscreen = " << (s.fullscreen ? 1 : 0) << "    # borderless, at the monitor's resolution\n";
++    if (s.scale > 0)
++        out << "scale = " << s.scale << "    # internal resolution, 1 (native PS2) to max_scale\n";
++    if (s.maxScale > 0)
++        out << "max_scale = " << s.maxScale << "    # highest internal resolution, 1 to " << kGsHiresMaxScaleLimit
++            << "; read at start, GPU memory grows with its square\n";
++    out << "antialias = " << kAntialiasNames[s.antialias & 3] << "    # off, ssaa, fxaa or ssaa+fxaa\n";
++    out << "fps = " << s.frameRate << "    # game frame rate: 60 or 30 (menus always run at 30)\n";
++    return out.str();
++}
++
++GraphicsSettings ps2LoadGraphics()
++{
++    std::ifstream file(ps2GraphicsPath());
++    return ps2ParseGraphics(std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()));
++}
++
+ void ps2MenusUpdateAndDraw(uint8_t *rdram)
+ {
+     static bool graphicsApplied = false;
+     if (!graphicsApplied) // the graphics file wins over PS2X_VK_SCALE / MHRS_WINDOW when it sets a value
+     {
+         graphicsApplied = true;
+-        g_graphicsMenu.settings = loadGraphics();
++        g_graphicsMenu.settings = ps2LoadGraphics();
+         applyGraphics(g_graphicsMenu.settings);
+     }
+     const bool risingSun = isRisingSun(rdram);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9f931fe..ced2849 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -17,6 +17,7 @@
+ #include "runtime/gs/gs_hires.h"
+ #include "runtime/ps2_menus.h"
+ #include "ps2_host_backend.h"
++#include "rlgl.h" // rlGetShaderIdDefault: what LoadShaderFromMemory returns when a shader does not compile
+ #include "ps2_iop_host.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ 
+@@ -28,6 +29,7 @@
+ #include <cstring>
+ #include <limits>
+ #include <chrono>
++#include <cmath>
+ #include <atomic>
+ #include <immintrin.h>
+ #include <thread>
+@@ -536,6 +538,136 @@ namespace
+ }
+ #endif
+ 
++// Anti-aliasing of the frame as the window draws it (graphics menu), after the GS: native VRAM never sees it, and
++// the overlays drawn after it (FPS monitor, menus, debug UI) stay sharp. GLSL 330: raylib's desktop OpenGL 3.3.
++namespace
++{
++    // SSAA: a frame larger than where it is drawn (internal resolution above the window size) is reduced with an
++    // area filter, each window pixel the coverage-weighted mean of every frame texel under it. Bilinear minification
++    // reads 2x2 texels and skips the rest beyond a 2x reduction. Not larger: the texture's own filter, as without it.
++    constexpr const char *kSsaaShader = R"(#version 330
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec4 colDiffuse;
++out vec4 finalColor;
++void main()
++{
++    vec2 size = vec2(textureSize(texture0, 0));
++    vec2 ratio = vec2(abs(dFdx(fragTexCoord.x)), abs(dFdy(fragTexCoord.y))) * size; // texels per window pixel
++    if (ratio.x <= 1.0 && ratio.y <= 1.0)
++    {
++        finalColor = texture(texture0, fragTexCoord) * colDiffuse * fragColor;
++        return;
++    }
++    ratio = max(ratio, vec2(1.0));
++    vec2 lo = fragTexCoord * size - 0.5 * ratio;
++    vec2 hi = lo + ratio;
++    ivec2 first = ivec2(floor(lo));
++    ivec2 last = ivec2(ceil(hi)) - 1;
++    ivec2 edge = ivec2(size) - 1;
++    vec4 sum = vec4(0.0);
++    float total = 0.0;
++    // 17 texels: a 16x reduction (an 8x frame in a 320 pixel wide window) at any offset.
++    for (int y = first.y; y <= last.y && y < first.y + 17; ++y)
++    {
++        float wy = min(hi.y, float(y + 1)) - max(lo.y, float(y));
++        for (int x = first.x; x <= last.x && x < first.x + 17; ++x)
++        {
++            float w = wy * (min(hi.x, float(x + 1)) - max(lo.x, float(x)));
++            sum += texelFetch(texture0, clamp(ivec2(x, y), ivec2(0), edge), 0) * w;
++            total += w;
++        }
++    }
++    finalColor = sum / total * colDiffuse * fragColor;
++}
++)";
++
++    // FXAA (the compact variant of Lottes' FXAA): over the frame as drawn, 1:1 with window pixels.
++    constexpr const char *kFxaaShader = R"(#version 330
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec4 colDiffuse;
++out vec4 finalColor;
++void main()
++{
++    vec2 px = 1.0 / vec2(textureSize(texture0, 0));
++    vec2 uv = fragTexCoord;
++    const vec3 toLuma = vec3(0.299, 0.587, 0.114);
++    float lumaNW = dot(texture(texture0, uv + vec2(-1.0, -1.0) * px).rgb, toLuma);
++    float lumaNE = dot(texture(texture0, uv + vec2(1.0, -1.0) * px).rgb, toLuma);
++    float lumaSW = dot(texture(texture0, uv + vec2(-1.0, 1.0) * px).rgb, toLuma);
++    float lumaSE = dot(texture(texture0, uv + vec2(1.0, 1.0) * px).rgb, toLuma);
++    vec4 centre = texture(texture0, uv);
++    float lumaM = dot(centre.rgb, toLuma);
++    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
++    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
++    vec2 dir = vec2(-((lumaNW + lumaNE) - (lumaSW + lumaSE)), (lumaNW + lumaSW) - (lumaNE + lumaSE));
++    float reduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 / 8.0), 1.0 / 128.0);
++    float scale = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
++    dir = clamp(dir * scale, vec2(-8.0), vec2(8.0)) * px;
++    vec3 a = 0.5 * (texture(texture0, uv + dir * (1.0 / 3.0 - 0.5)).rgb + texture(texture0, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
++    vec3 b = a * 0.5 + 0.25 * (texture(texture0, uv - dir * 0.5).rgb + texture(texture0, uv + dir * 0.5).rgb);
++    float lumaB = dot(b, toLuma);
++    finalColor = vec4((lumaB < lumaMin || lumaB > lumaMax) ? a : b, centre.a) * colDiffuse * fragColor;
++}
++)";
++
++    // A shader of the window's, loaded at first use; null when it does not compile (logged once): drawn without it.
++    const Shader *windowShader(Shader &shader, int &state, const char *code, const char *name)
++    {
++        if (state == 0)
++        {
++            shader = LoadShaderFromMemory(nullptr, code);
++            state = shader.id != rlGetShaderIdDefault() ? 1 : -1;
++            if (state < 0)
++                std::cerr << "[window] " << name << " shader did not compile, anti-aliasing without it" << std::endl;
++        }
++        return state > 0 ? &shader : nullptr;
++    }
++
++    // Draws the frame texture (src of it) into dst with the graphics menu's anti-aliasing.
++    void drawFrame(const Texture2D &tex, Rectangle src, Rectangle dst)
++    {
++        static Shader ssaa{}, fxaa{};
++        static int ssaaState = 0, fxaaState = 0;
++        static RenderTexture2D target{};
++        const int antialias = ps2GraphicsAntialias();
++        const Shader *box = (antialias & kAntialiasSsaa) ? windowShader(ssaa, ssaaState, kSsaaShader, "SSAA") : nullptr;
++        const Shader *post = (antialias & kAntialiasFxaa) ? windowShader(fxaa, fxaaState, kFxaaShader, "FXAA") : nullptr;
++        // FXAA reads the frame as drawn: drawn into a texture of dst's size first (whole pixels, so it maps 1:1).
++        const int w = static_cast<int>(std::lround(dst.width)), h = static_cast<int>(std::lround(dst.height));
++        if (post && w > 0 && h > 0 && (target.texture.width != w || target.texture.height != h))
++        {
++            if (target.id != 0)
++                UnloadRenderTexture(target);
++            target = LoadRenderTexture(w, h);
++            SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR); // FXAA samples between pixels
++        }
++        if (post && (w <= 0 || h <= 0 || !IsRenderTextureValid(target)))
++            post = nullptr;
++        if (post)
++        {
++            BeginTextureMode(target);
++            ClearBackground(BLACK);
++        }
++        if (box)
++            BeginShaderMode(*box);
++        DrawTexturePro(tex, src, post ? Rectangle{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h)} : dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (box)
++            EndShaderMode();
++        if (!post)
++            return;
++        EndTextureMode();
++        BeginShaderMode(*post);
++        // Render textures are stored bottom-up: a negative source height flips them back.
++        DrawTexturePro(target.texture, Rectangle{0.0f, 0.0f, static_cast<float>(w), -static_cast<float>(h)},
++                       Rectangle{std::round(dst.x), std::round(dst.y), static_cast<float>(w), static_cast<float>(h)}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        EndShaderMode();
++    }
++}
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -3002,7 +3134,7 @@ void PS2Runtime::run()
+             (screenHeight - dstHeight) * 0.5f,
+             dstWidth,
+             dstHeight};
+-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        drawFrame(frameTex, srcRect, dstRect);
+         if (IsKeyPressed(KEY_F3))
+             hudEnabled = !hudEnabled;
+         if (hudEnabled)
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 650b0cd..20fcb8f 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -6,6 +6,8 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/gs_vulkan_backend.h"
++#include "runtime/gs/gs_hires.h"
++#include "runtime/ps2_menus.h"
+ #include "runtime/ee_scheduler.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+@@ -4921,5 +4923,67 @@ void register_ps2_gs_tests()
+             t.IsTrue(drawn > 4000u, "the scene should cover most of the frame");
+             t.Equals(wrong, 0u, "Vulkan batch raster should match the CPU backend pixel for pixel, up to rounding");
+         });
++
++        tc.Run("graphics file keeps max_scale and antialias, and reads old files as before", [](TestCase &t)
++        {
++            GraphicsSettings s;
++            s.windowW = 1920;
++            s.windowH = 1080;
++            s.fullscreen = true;
++            s.scale = 6;
++            s.maxScale = 8;
++            s.frameRate = 30;
++            s.antialias = kAntialiasSsaa | kAntialiasFxaa;
++            const GraphicsSettings back = ps2ParseGraphics(ps2FormatGraphics(s));
++            t.Equals(back.windowW, 1920, "window width");
++            t.Equals(back.windowH, 1080, "window height");
++            t.IsTrue(back.fullscreen, "fullscreen");
++            t.Equals(back.scale, 6u, "scale");
++            t.Equals(back.maxScale, 8u, "max_scale");
++            t.Equals(back.frameRate, 30, "fps");
++            t.Equals(back.antialias, kAntialiasSsaa | kAntialiasFxaa, "antialias");
++            for (int aa = 0; aa < 4; ++aa)
++            {
++                GraphicsSettings one;
++                one.antialias = aa;
++                t.Equals(ps2ParseGraphics(ps2FormatGraphics(one)).antialias, aa, "antialias " + std::to_string(aa));
++            }
++
++            // A file from before: no max_scale, no antialias.
++            const GraphicsSettings old = ps2ParseGraphics("window = 1280x960\nfullscreen = 0\nscale = 2    # internal resolution\nfps = 60\n");
++            t.Equals(old.scale, 2u, "old file scale");
++            t.Equals(old.maxScale, 0u, "no max_scale: the start value applies");
++            t.Equals(old.antialias, 0, "no antialias: off");
++            t.IsTrue(ps2FormatGraphics(GraphicsSettings{}).find("max_scale") == std::string::npos, "max_scale is only written when set");
++
++            const GraphicsSettings bad = ps2ParseGraphics("max_scale = 9\nscale = 0\nantialias = msaa\n");
++            t.Equals(bad.maxScale, 0u, "max_scale above 8 is skipped");
++            t.Equals(bad.scale, 0u, "scale 0 is skipped");
++            t.Equals(bad.antialias, 0, "unknown antialias is skipped");
++            t.Equals(ps2ParseGraphics("max_scale = 1\n").maxScale, 1u, "max_scale 1");
++            t.Equals(ps2ParseGraphics("antialias = fxaa # comment\n").antialias, kAntialiasFxaa, "antialias with a comment");
++        });
++
++        tc.Run("internal resolution stays within max_scale", [](TestCase &t)
++        {
++            const uint32_t oldMax = gsHiresMaxScale(), oldScale = gsHiresScale();
++            gsHiresSetMaxScale(5u);
++            if (gsHiresMaxScale() == 1u)
++                return; // a build without Vulkan: always native
++            t.Equals(gsHiresMaxScale(), 5u, "max_scale 5");
++            gsHiresSetScale(8u);
++            t.Equals(gsHiresScale(), 5u, "a scale above max_scale is lowered to it");
++            gsHiresSetScale(0u);
++            t.Equals(gsHiresScale(), 1u, "scale 0 is 1");
++            gsHiresSetScale(5u);
++            gsHiresSetMaxScale(3u);
++            t.Equals(gsHiresScale(), 3u, "lowering max_scale lowers the scale");
++            gsHiresSetMaxScale(9u);
++            t.Equals(gsHiresMaxScale(), kGsHiresMaxScaleLimit, "max_scale is at most 8");
++            gsHiresSetMaxScale(0u);
++            t.Equals(gsHiresMaxScale(), 1u, "max_scale is at least 1");
++            gsHiresSetMaxScale(oldMax);
++            gsHiresSetScale(oldScale);
++        });
+     });
+ }

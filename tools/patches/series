@@ -122,3 +122,4 @@ ps2recomp-ee-call-costs.patch
 ps2recomp-guest-access-fast-path.patch
 ps2recomp-libc-rand-31bit.patch
 ps2recomp-second-controller.patch
+ps2recomp-gfx-scale-antialias.patch

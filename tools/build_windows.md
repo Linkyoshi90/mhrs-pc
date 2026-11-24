@@ -47,20 +47,34 @@ Env vars: `PS2X_SKIP_MOVIES=60` (end every movie after 60 pictures; Esc/Backspac
 `PS2X_VK_STATS=<n>` (batch/readback counters every n presents), `MHRS_HUD=1` (start with the FPS monitor on),
 `MHRS_WINDOW=1920x1080`, `MHRS_FILTER=point`.
 
-Internal resolution (`ps2recomp-gs-internal-resolution`): `PS2X_VK_SCALE=2..4` (with `PS2X_VK_RASTER=1`) draws every
+Internal resolution (`ps2recomp-gs-internal-resolution`): `PS2X_VK_SCALE=2..max_scale` (with `PS2X_VK_RASTER=1`) draws every
 32-bit frame and depth buffer at that many times the native resolution as well, and shows the display at that
 size (3 = 1920x1344). It is a copy of GS memory with scale x scale samples per pixel next to the native one, which
 stays exactly as before, so everything the game reads back is unchanged; 32-bit textures drawn earlier (the frame
 a full-screen pass copies or filters) are sampled from the copy. 16-bit buffers stay native. `play_mingw.bat` sets
-2 unless `PS2X_VK_SCALE` is already set; the controls menu (F2, row "Internal resolution", Left/Right) changes it
-while the game runs (not saved). With `PS2X_VK_RASTER=1` the display is always copied out on the GPU (formerly
+2 unless `PS2X_VK_SCALE` is already set; the graphics menu (F4, row "Internal resolution", Left/Right) changes it
+while the game runs. The highest scale, `max_scale` (1..8, default 4; `PS2X_VK_MAX_SCALE` or the graphics file),
+is read once at start because the GPU buffers are sized for it, and they grow with its square: 64 MB copy + 85 MB
+present buffer at 4, 256 MB + 325 MB at 8 (on Windows the present buffer twice, once shared with the window). A GPU
+whose storage buffers cannot be that large (llvmpipe, some Intel drivers: 128 MB) or that has no memory left falls
+back to 4, then to native, with a `[gs-vulkan]` log line.
+
+Anti-aliasing (`ps2recomp-gfx-scale-antialias`, graphics menu row "Anti-aliasing", `antialias` in the graphics
+file): `ssaa` reduces a frame larger than the window area it is drawn into with an area filter (every frame pixel
+under a window pixel counts; plain bilinear skips most of them beyond 2x), so an internal resolution above the
+window size works as supersampling; it changes nothing when the frame is not larger. `fxaa` runs FXAA over the frame
+as drawn (any internal resolution, 1x too); `ssaa+fxaa` both. Both are window shaders after the GS (the CPU GS
+backend gets them too); the FPS monitor and menus are drawn after them and stay sharp. `off` is the old output, and
+`MHRS_FILTER=point` still means point sampling with it. With `PS2X_VK_RASTER=1` the display is always copied out on the GPU (formerly
 `PS2X_VK_PRESENT=1`), which is also faster than the CPU copy. Costs GPU time only: mission 1's first room runs as fast at 3 as at 1;
 the mission-1 intro (heavy overdraw) drops from about 76 to 62 flips/s at 3 (72 at 2). The present runs
 behind the GS queue (`ps2recomp-gs-present-pipeline`), so the window never waits for drawing to finish. It shows
 every game frame at 2 and about 30 new frames a second at 3.
 
 In the game window: **F2** opens the controls menu (rebind keys, mouse and gamepad, mouse look settings; saved to
-`controls.ini`), **F5** the cheat menu (the game's 12 bonus cheats; saved to `cheats.ini`).
+`controls.ini`), **F4** the graphics menu (window size, fullscreen, internal resolution, highest internal resolution
+`max_scale` (takes effect after a restart), anti-aliasing, frame rate; saved to `graphics.ini`, which wins over the
+env vars when it sets a value), **F5** the cheat menu (the game's 12 bonus cheats; saved to `cheats.ini`).
 
 FPS monitor (`ps2recomp-fps-monitor`): **F3** shows or hides it; `play_mingw.bat` starts with it on. The large
 number is game frames a second (the game writes DISPFB1 once a frame; green at 55+, yellow at 28+, red below).
