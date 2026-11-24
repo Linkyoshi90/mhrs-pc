@@ -494,6 +494,22 @@ card with a scripted pad (TEMP `MHRS_PAD_SCRIPT` in the runner tree, see the pro
   ahead (10, 15), one worker job for UNPACK copy + VU1 run. Remaining EE cost: the VIF1 chain copy (~10%,
   `memmove`), which `processVIF1Data` needs because it has no state for commands that cross DMA tags.
 
+## Above 60 fps (2026-11-24, `ps2recomp-fps-limit` + `src/game/frame_limit.cpp`)
+
+The frame tick `func_00271218` sets the frame's time step `D_0035ED20 = D_00359DDC * vblanks` (the count comes from
+the limiter `func_0015A080`, at least 1). `D_00359DDC` is 1.0, and 1.2 after the PAL setup at 0x15A418 (50 Hz), so
+the game already scales its step per vblank for another vblank rate. Frames cannot outrun the vblank: the flip in
+`func_002CD3E0` either waits for a vblank (`func_002CD5A0` polls CSR VSINT) or leaves it to the vblank handler
+`func_002D1340`, and the next frame waits for a pending flip.
+
+So a limit above 60 runs the host vblank at that rate (`EeScheduler::setVBlankHz`, period `vblankPeriodUs`) and
+writes `D_00359DDC = 1.0 * period / 60 Hz period` before each frame tick (the tick loads it before the limiter
+runs). Only with the loader done (state 5) outside the front end; loading screens keep 2 vblanks at 60 Hz. While
+a movie picture came within 200 ms the vblank stays at 60 Hz, since the movie player counts vblanks
+(`D_004D2970+0x1C0`) and the runtime's MPEG timing uses the vsync tick. Not adjusted: game code that counts frames
+or vblanks instead of using the time step (menus; `func_001D92D8` polls once per vblank), and CD streams, whose
+production follows the vsync tick (they fill their buffer faster, like a faster drive). Not yet checked in play.
+
 ## To 60 fps in the menus
 
 The main menu is not a light 2D screen: it draws a 3D scene (the ship's bridge) behind the text and costs

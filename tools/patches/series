@@ -123,3 +123,4 @@ ps2recomp-guest-access-fast-path.patch
 ps2recomp-libc-rand-31bit.patch
 ps2recomp-second-controller.patch
 ps2recomp-gfx-scale-antialias.patch
+ps2recomp-fps-limit.patch

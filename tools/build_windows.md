@@ -73,8 +73,15 @@ every game frame at 2 and about 30 new frames a second at 3.
 
 In the game window: **F2** opens the controls menu (rebind keys, mouse and gamepad, mouse look settings; saved to
 `controls.ini`), **F4** the graphics menu (window size, fullscreen, internal resolution, highest internal resolution
-`max_scale` (takes effect after a restart), anti-aliasing, frame rate; saved to `graphics.ini`, which wins over the
-env vars when it sets a value), **F5** the cheat menu (the game's 12 bonus cheats; saved to `cheats.ini`).
+`max_scale` (takes effect after a restart), anti-aliasing, frame rate limit; saved to `graphics.ini`, which wins over
+the env vars when it sets a value), **F5** the cheat menu (the game's 12 bonus cheats; saved to `cheats.ini`).
+
+Frame rate limit (`ps2recomp-fps-limit`, graphics menu row "Frame rate limit", `fps_limit` in the graphics file):
+30, 60 (default), 72, 90, 120 or 144 fps in missions; the front-end menus and loading screens stay at 30. A file
+with the older `fps` key is still read. The game only flips on a vblank, so above 60 the emulated vblank runs at
+the limit (in missions, after loading) and the game's time step per vblank shrinks to match: gameplay speed stays
+the same, only more frames are drawn, if the PC is fast enough. Movies always get 60 Hz vblanks. What counts frames
+instead of time (the pause menu's cursor repeat, for one) runs faster above 60, as it already did at 60.
 
 FPS monitor (`ps2recomp-fps-monitor`): **F3** shows or hides it; `play_mingw.bat` starts with it on. The large
 number is game frames a second (the game writes DISPFB1 once a frame; green at 55+, yellow at 28+, red below).

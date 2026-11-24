@@ -1,0 +1,193 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 1d79cf9..357c322 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -282,6 +282,16 @@ public:
+     // Host milliseconds since the EE last wrote a GS display register (PMODE..BGCOLOR, a flip); large before the
+     // first one.
+     static int64_t hostMsSinceDisplayWrite();
++    // Host vblank rate, 60 Hz by default, for a game that steps its logic by the vblanks that passed: it must scale
++    // its step per vblank by vblankPeriodUs(rate) / vblankPeriodUs(60). Applies from the next vblank, and never while
++    // a movie plays (its pictures count vblanks). Returns the rate the next vblank will use.
++    int setVBlankHz(int hz) noexcept;
++    // The vblank period for a rate, clamped to 30..240 Hz: 16667 us at 60, as before rates could change.
++    static constexpr uint32_t vblankPeriodUs(int hz) noexcept
++    {
++        hz = hz < 30 ? 30 : (hz > 240 ? 240 : hz);
++        return (1000000u + static_cast<uint32_t>(hz) / 2u) / static_cast<uint32_t>(hz);
++    }
+     ~EeScheduler();
+ 
+     EeScheduler(const EeScheduler &) = delete;
+@@ -476,4 +486,5 @@ private:
+     uint64_t m_nextVBlankCycle = 0;
+     std::chrono::steady_clock::time_point m_nextVBlankHost{};
+     bool m_hostPacedVBlank = true;
++    std::atomic<int> m_vblankHz{60};
+ };
+diff --git a/ps2xRuntime/include/runtime/ps2_menus.h b/ps2xRuntime/include/runtime/ps2_menus.h
+index 4c42072..deddc82 100755
+--- a/ps2xRuntime/include/runtime/ps2_menus.h
++++ b/ps2xRuntime/include/runtime/ps2_menus.h
+@@ -11,9 +11,12 @@
+ // cheat flags. The first call also applies the graphics file (window size, fullscreen, internal resolution).
+ void ps2MenusUpdateAndDraw(uint8_t *rdram);
+ 
+-// The frame rate the player picked in the graphics menu (60 or 30), for a game hook that limits its own frame rate
+-// (MOH: Rising Sun's frame limiter). 60 until the graphics file is read.
++// The frame rate limit the player picked in the graphics menu (one of kFrameRates), for a game hook that limits its
++// own frame rate (MOH: Rising Sun's frame limiter). 60 until the graphics file is read.
++constexpr int kFrameRates[] = {30, 60, 72, 90, 120, 144};
+ int ps2GraphicsFrameRate();
++// The limit `step` places above (below, if negative) the highest one at or under `fps`, within kFrameRates.
++int ps2StepFrameRate(int fps, int step);
+ // Anti-aliasing of the frame as the window draws it: kAntialias* bits, 0 (off) until the graphics file is read.
+ constexpr int kAntialiasSsaa = 1; // area (box) filter when the frame is larger than where it is drawn
+ constexpr int kAntialiasFxaa = 2; // FXAA over the frame as drawn
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 0c89982..92705ef 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1964,15 +1964,26 @@ int64_t EeScheduler::hostMsSinceDisplayWrite()
+ // Set by sceMpegGetPicture, which a playing movie calls for every picture.
+ std::atomic<int64_t> g_lastMoviePictureNs{0};
+ 
++static bool moviePlaying()
++{
++    constexpr int64_t kMovieQuietNs = 200 * 1000000ll;
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    return now - g_lastMoviePictureNs.load(std::memory_order_relaxed) < kMovieQuietNs;
++}
++
+ static bool skipIdleNow(PS2Runtime &runtime)
+ {
+     const EeScheduler::SkipIdleFn whileFn = g_skipIdleWhile.load(std::memory_order_relaxed);
+     if (whileFn == nullptr || !whileFn(runtime.memory().getRDRAM()))
+         return false;
+     // Never during a movie: its pictures follow the guest clock, and a load can run under one.
+-    constexpr int64_t kMovieQuietNs = 200 * 1000000ll;
+-    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+-    return now - g_lastMoviePictureNs.load(std::memory_order_relaxed) >= kMovieQuietNs;
++    return !moviePlaying();
++}
++
++int EeScheduler::setVBlankHz(int hz) noexcept
++{
++    m_vblankHz.store(hz, std::memory_order_relaxed);
++    return moviePlaying() ? 60 : hz;
+ }
+ 
+ void EeScheduler::processDueDeadlines()
+@@ -2063,9 +2074,10 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + hostWait(kVBlankDuration),
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
++                const uint32_t periodUs = vblankPeriodUs(moviePlaying() ? 60 : m_vblankHz.load(std::memory_order_relaxed));
+                 // After a long host stall, drop the backlog instead of firing a burst of vblanks.
+-                m_nextVBlankCycle = scheduled.deadlineCycle + kVBlankPeriodCycles;
+-                m_nextVBlankHost = std::max(scheduled.hostDeadline + hostWait(kVBlankPeriod),
++                m_nextVBlankCycle = scheduled.deadlineCycle + microsecondsToEeCycles(periodUs);
++                m_nextVBlankHost = std::max(scheduled.hostDeadline + hostWait(std::chrono::microseconds(periodUs)),
+                                             std::chrono::steady_clock::now() - kVBlankMaxLag);
+                 scheduleEvent(m_nextVBlankCycle, m_nextVBlankHost,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+diff --git a/ps2xRuntime/src/lib/ps2_menus.cpp b/ps2xRuntime/src/lib/ps2_menus.cpp
+index 6e08e72..c13f270 100755
+--- a/ps2xRuntime/src/lib/ps2_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_menus.cpp
+@@ -423,9 +423,9 @@ namespace
+             }
+             break;
+         case GfxFrameRate:
+-            if (step != 0 || enter)
++            if (step != 0)
+             {
+-                s.frameRate = s.frameRate == 60 ? 30 : 60;
++                s.frameRate = ps2StepFrameRate(s.frameRate, step);
+                 changed = true;
+             }
+             break;
+@@ -488,8 +488,8 @@ namespace
+                 break;
+             }
+             case GfxFrameRate:
+-                label = "Frame rate";
+-                value = TextFormat("%d fps%s", s.frameRate, s.frameRate == 60 ? "" : "  (as on the PS2)");
++                label = "Frame rate limit";
++                value = TextFormat("%d fps%s", s.frameRate, s.frameRate == 30 ? "  (as on the PS2)" : "");
+                 break;
+             case GfxDefaults: label = "Reset to defaults (Enter)"; break;
+             }
+@@ -620,6 +620,14 @@ namespace
+ }
+ 
+ int ps2GraphicsFrameRate() { return g_frameRate.load(std::memory_order_relaxed); }
++
++int ps2StepFrameRate(int fps, int step)
++{
++    int i = 0;
++    while (i + 1 < static_cast<int>(std::size(kFrameRates)) && kFrameRates[i + 1] <= fps)
++        ++i;
++    return kFrameRates[std::clamp(i + step, 0, static_cast<int>(std::size(kFrameRates)) - 1)];
++}
+ int ps2GraphicsAntialias() { return g_antialias.load(std::memory_order_relaxed); }
+ 
+ const char *ps2GraphicsPath()
+@@ -654,8 +662,8 @@ GraphicsSettings ps2ParseGraphics(std::string_view text)
+             s.scale = static_cast<uint32_t>(a); // above max_scale: gsHiresSetScale lowers it
+         else if (key == "max_scale" && std::sscanf(value, " %d", &a) == 1 && a >= 1 && a <= static_cast<int>(kGsHiresMaxScaleLimit))
+             s.maxScale = static_cast<uint32_t>(a);
+-        else if (key == "fps" && std::sscanf(value, " %d", &a) == 1)
+-            s.frameRate = a <= 30 ? 30 : 60;
++        else if ((key == "fps_limit" || key == "fps") && std::sscanf(value, " %d", &a) == 1) // fps: older files
++            s.frameRate = ps2StepFrameRate(a, 0);
+         else if (key == "antialias" && std::sscanf(value, " %15s", word) == 1)
+             for (int i = 0; i < 4; ++i)
+                 if (std::strcmp(word, kAntialiasNames[i]) == 0)
+@@ -677,7 +685,8 @@ std::string ps2FormatGraphics(const GraphicsSettings &s)
+         out << "max_scale = " << s.maxScale << "    # highest internal resolution, 1 to " << kGsHiresMaxScaleLimit
+             << "; read at start, GPU memory grows with its square\n";
+     out << "antialias = " << kAntialiasNames[s.antialias & 3] << "    # off, ssaa, fxaa or ssaa+fxaa\n";
+-    out << "fps = " << s.frameRate << "    # game frame rate: 60 or 30 (menus always run at 30)\n";
++    out << "fps_limit = " << s.frameRate
++        << "    # 30, 60, 72, 90, 120 or 144; menus and loading screens always run at 30\n";
+     return out.str();
+ }
+ 
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 20fcb8f..3e4c3e0 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -4964,6 +4964,32 @@ void register_ps2_gs_tests()
+             t.Equals(ps2ParseGraphics("antialias = fxaa # comment\n").antialias, kAntialiasFxaa, "antialias with a comment");
+         });
+ 
++        tc.Run("frame rate limit steps through its values and keeps game speed", [](TestCase &t)
++        {
++            for (int fps : kFrameRates)
++            {
++                GraphicsSettings s;
++                s.frameRate = fps;
++                t.Equals(ps2ParseGraphics(ps2FormatGraphics(s)).frameRate, fps, "fps_limit " + std::to_string(fps));
++                // The game steps vblanks * (period / 60 Hz period): per real second that must stay 60 vblanks' worth.
++                const double speed = fps * static_cast<double>(EeScheduler::vblankPeriodUs(fps)) /
++                                     (60.0 * EeScheduler::vblankPeriodUs(60));
++                t.IsTrue(speed > 0.9999 && speed < 1.0001, "game speed at " + std::to_string(fps) + " Hz vblank");
++            }
++            t.Equals(GraphicsSettings{}.frameRate, 60, "default 60");
++            t.IsTrue(ps2FormatGraphics(GraphicsSettings{}).find("fps_limit = 60") != std::string::npos, "written as fps_limit");
++            t.Equals(ps2ParseGraphics("fps = 30\n").frameRate, 30, "old key fps");
++            t.Equals(ps2ParseGraphics("fps_limit = 100\n").frameRate, 90, "between values: the one below");
++            t.Equals(ps2ParseGraphics("fps_limit = 10\n").frameRate, 30, "below 30");
++            t.Equals(ps2ParseGraphics("fps_limit = 500\n").frameRate, 144, "above 144");
++            t.Equals(ps2StepFrameRate(60, 1), 72, "60 up");
++            t.Equals(ps2StepFrameRate(72, -1), 60, "72 down");
++            t.Equals(ps2StepFrameRate(144, 1), 144, "stops at 144");
++            t.Equals(ps2StepFrameRate(30, -1), 30, "stops at 30");
++            t.Equals(EeScheduler::vblankPeriodUs(60), 16667u, "60 Hz period as before");
++            t.Equals(EeScheduler::vblankPeriodUs(1000), EeScheduler::vblankPeriodUs(240), "rate clamped");
++        });
++
+         tc.Run("internal resolution stays within max_scale", [](TestCase &t)
+         {
+             const uint32_t oldMax = gsHiresMaxScale(), oldScale = gsHiresScale();
