@@ -1,0 +1,45 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index df9c317..e6901e4 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1045,8 +1045,19 @@ bool PS2Runtime::syncCoreSubsystems()
+         }
+         const bool dBitEnabled = (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+         const bool tBitEnabled = (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+-        m_memory.postGifVu([this, resume, startPC, top, itop, dBitEnabled, tBitEnabled]
++        // this + one packed word = 16 bytes, which std::function keeps inline: the six separate captures (24 bytes)
++        // cost a heap allocation on the EE and a free on the worker for every one of ~100k runs per second.
++        const uint64_t packed = (static_cast<uint64_t>(startPC) & 0xFFFFFu) | ((static_cast<uint64_t>(top) & 0xFFFFFu) << 20u) |
++                                ((static_cast<uint64_t>(itop) & 0xFFFFFu) << 40u) | (static_cast<uint64_t>(resume) << 60u) |
++                                (static_cast<uint64_t>(dBitEnabled) << 61u) | (static_cast<uint64_t>(tBitEnabled) << 62u);
++        m_memory.postGifVu([this, packed]
+                            {
++                               const uint32_t startPC = static_cast<uint32_t>(packed & 0xFFFFFu);
++                               const uint32_t top = static_cast<uint32_t>((packed >> 20u) & 0xFFFFFu);
++                               const uint32_t itop = static_cast<uint32_t>((packed >> 40u) & 0xFFFFFu);
++                               const bool resume = (packed >> 60u) & 1u;
++                               const bool dBitEnabled = (packed >> 61u) & 1u;
++                               const bool tBitEnabled = (packed >> 62u) & 1u;
+                                m_vu1.state().dBitEnabled = dBitEnabled;
+                                m_vu1.state().tBitEnabled = tBitEnabled;
+                                vurecBegin(resume ? 'R' : 'X', resume ? 0u : startPC, top, itop, m_vu1, m_memory); // TEMP-DEBUG(mhrs) vurec
+@@ -1805,7 +1816,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    if (targetPc == 0x003012F0u) // TEMP-DEBUG(mhrs): game allocator (name, size, align, ?, flags)
++    static const bool allocLog = std::getenv("MHRS_ALLOC_LOG") != nullptr || std::getenv("MHRS_DUMP_ALLOC") != nullptr; // TEMP-DEBUG(mhrs)
++    if (allocLog && targetPc == 0x003012F0u) // TEMP-DEBUG(mhrs): game allocator (name, size, align, ?, flags)
+     {
+         static uint64_t allocN = 0;
+         static uint64_t allocTotal = 0;
+@@ -1827,7 +1839,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+             }
+         }
+     }
+-    if (m_eeScheduler->currentThreadId() == 1) // TEMP-DEBUG(mhrs): main-thread indirect call histogram
++    static const bool callHist = std::getenv("MHRS_CALL_HIST") != nullptr; // TEMP-DEBUG(mhrs)
++    if (callHist && m_eeScheduler->currentThreadId() == 1) // TEMP-DEBUG(mhrs): main-thread indirect call histogram
+     {
+         std::lock_guard<std::mutex> l(g_mhrsCallHistMutex);
+         ++g_mhrsCallHist[(static_cast<uint64_t>(sourcePc) << 32) | targetPc];

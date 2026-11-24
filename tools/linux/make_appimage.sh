@@ -37,6 +37,8 @@ export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 cd "${MHRS_DATA:-${OWD:-$PWD}}"
 export PS2X_GS_BACKEND="${PS2X_GS_BACKEND:-vulkan}"
 export PS2X_VK_RASTER="${PS2X_VK_RASTER:-1}"
+# Internal resolution (1 = native PS2, 2 = twice in each direction; tools/windows/play_mingw.bat uses 2 too).
+export PS2X_VK_SCALE="${PS2X_VK_SCALE:-2}"
 # Record VU1 programs that have no compiled version yet (see tools/frame_rate.md) when the folder exists.
 [ -d build/vu1/dumps ] && export PS2_VU1_DUMP_DIR="${PS2_VU1_DUMP_DIR:-build/vu1/dumps}"
 exec "$HERE/usr/bin/ps2EntryRunner" "${1:-extracted/MOH3RDVD.ELF}" "${2:-ISO/Medal of Honor - Rising Sun.iso}"

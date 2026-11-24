@@ -1,0 +1,40 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index c8eda06..e5f5612 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -248,6 +248,9 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+     (void)op;
+     // TEMP-DEBUG(mhrs): MHRS_WATCH=<addr>:<len>[,<addr>:<len>...] logs guest stores into those ranges
+     extern uint32_t g_mhrsWatchAddr[4], g_mhrsWatchLen[4];
++    extern bool g_mhrsWatchAny; // one load per guest store when no watch is set (the loop ran on every store)
++    if (!g_mhrsWatchAny)
++        return;
+     const uint32_t phys = guestAddr & 0x1FFFFFFFu;
+     for (int i = 0; i < 4; ++i)
+     {
+diff --git a/ps2xRuntime/include/runtime/ps2_address.h b/ps2xRuntime/include/runtime/ps2_address.h
+index f7689e0..95775e7 100644
+--- a/ps2xRuntime/include/runtime/ps2_address.h
++++ b/ps2xRuntime/include/runtime/ps2_address.h
+@@ -52,6 +52,9 @@ static inline constexpr bool Ps2IsPhysicalSpecialAddress(uint32_t physAddr)
+ 
+ static inline constexpr bool Ps2IsSpecialAddress(uint32_t addr)
+ {
++    // Main RAM (KUSEG, below 32 MB) holds no special range and is most guest accesses: decide it with one compare.
++    if (addr < 0x02000000u)
++        return false;
+     if (Ps2IsKseg23Address(addr))
+         return true;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index df9c317..977ddbe 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3062,6 +3062,7 @@ std::string mhrsDispatchHistoryString() { return formatDispatchHistory(); } // T
+ // TEMP-DEBUG(mhrs): store watch (see ps2TraceGuestWrite)
+ uint32_t g_mhrsWatchAddr[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+ uint32_t g_mhrsWatchLen[4] = {0u, 0u, 0u, 0u};
++bool g_mhrsWatchAny = std::getenv("MHRS_WATCH") != nullptr;
+ static const bool g_mhrsWatchParsed = []()
+ {
+     const char *w = std::getenv("MHRS_WATCH");

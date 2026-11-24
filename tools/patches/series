@@ -115,3 +115,9 @@ ps2recomp-vu1-dump-async.patch
 ps2recomp-gif-packet-batches.patch
 ps2recomp-gs-window-frames-on-gpu.patch
 ps2recomp-vu1-xgkick-wrap-mask.patch
+ps2recomp-mouse-aim.patch
+ps2recomp-graphics-menu.patch
+ps2recomp-iop-heap-larger.patch
+ps2recomp-ee-call-costs.patch
+ps2recomp-guest-access-fast-path.patch
+ps2recomp-libc-rand-31bit.patch

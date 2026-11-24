@@ -13,6 +13,8 @@
 // SNDI_memcpy (+0x4600): hand-written memmove(a0 = dst, a1 = src, a2 = n); n <= 0 copies nothing.
 // mixiop (+0x36d0): acc[i] += src[i] * (a1 >> 8) for a0 int32 samples (a2 = src, a3 = acc); the hot loop of
 //   SNDDRV's software voices, so scenes with many sounds (explosions) ran the IOP interpreter flat out.
+// SFILTERI_rs16linear (+0x3120) and decxa16c (+0x9ba0): the software voices' linear resampler and ADPCM
+//   decoder, the next hottest IOP code once mixiop was native.
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -114,6 +116,86 @@ namespace mhrs::snddrv
         return 20u + (count & 3u) * 9u + (count & ~3u) * 7u;
     }
 
+    int32_t readS32(std::span<uint8_t> ram, uint32_t address) { return static_cast<int32_t>(read32(ram, address)); }
+
+    void write32(std::span<uint8_t> ram, uint32_t address, uint32_t value)
+    {
+        std::memcpy(ram.data() + phys(address), &value, sizeof(value));
+    }
+
+    // Low 32 bits of a signed mult, as mflo gives them.
+    int32_t mulLo(int32_t a, int32_t b) { return static_cast<int32_t>(static_cast<uint32_t>(a) * static_cast<uint32_t>(b)); }
+
+    uint32_t rs16Linear(uint32_t, uint32_t *gpr, std::span<uint8_t> ram)
+    {
+        const uint32_t state = gpr[4];
+        const int32_t count = static_cast<int32_t>(gpr[5]);
+        const uint32_t src = gpr[6];
+        uint32_t dst = gpr[7];
+        if (count <= 0)
+            return 7u;
+        if (static_cast<uint32_t>(count) > kRamSize / 4u) // never seen; the original would write past IOP RAM
+            return 7u;
+        // Four outputs per pass, at pos + {0, step1, step2, step3}; pos += step4 (16.16 fixed point).
+        const uint32_t passes = (static_cast<uint32_t>(count) + 3u) / 4u;
+        for (uint32_t p = 0; p < passes; ++p, dst += 16u)
+        {
+            const uint32_t pos = read32(ram, state + 48u);
+            const uint32_t at[4] = {pos, pos + read32(ram, state + 32u), pos + read32(ram, state + 36u), pos + read32(ram, state + 40u)};
+            for (uint32_t k = 0; k < 4; ++k)
+            {
+                const uint32_t sample = src + (at[k] >> 16u) * 4u;
+                const int32_t s0 = readS32(ram, sample);
+                const int32_t diff = static_cast<int32_t>(read32(ram, sample + 4u) - static_cast<uint32_t>(s0));
+                write32(ram, dst + 4u * k, static_cast<uint32_t>((mulLo(diff, static_cast<int32_t>(at[k] & 0xFFFFu)) >> 16) + s0));
+            }
+            write32(ram, state + 48u, pos + read32(ram, state + 44u));
+        }
+        return 8u + passes * 72u;
+    }
+
+    // XA-style ADPCM: groups of 15 bytes (header: filter index << 4 | shift, then 14 bytes of two nibbles)
+    // -> 28 int32 samples. State: +0 bytes left (-28 per group, runs while > 0), +4/+8 history, +12 src, +16 dst.
+    uint32_t decXa16c(uint32_t entry, uint32_t *gpr, std::span<uint8_t> ram)
+    {
+        const uint32_t s = gpr[4];
+        const uint32_t coefA = hiLo(ram, entry + 0x40u, entry + 0x48u);
+        const uint32_t coefB = hiLo(ram, entry + 0x4Cu, entry + 0x54u);
+        uint32_t insns = 7u;
+        for (uint32_t groups = 0; readS32(ram, s) > 0; ++groups)
+        {
+            if (groups > kRamSize / 15u) // never seen: a group count no RAM could hold
+                break;
+            write32(ram, s, read32(ram, s) - 28u);
+            uint32_t in = read32(ram, s + 12u);
+            uint32_t out = read32(ram, s + 16u);
+            const uint32_t header = ram[phys(in++)];
+            const uint32_t shift = (header & 0xFu) + 8u;
+            const int32_t c0 = read16(ram, coefA + (header >> 4u) * 4u);
+            const int32_t c1 = read16(ram, coefB + (header >> 4u) * 4u);
+            int32_t newest = readS32(ram, s + 4u);
+            int32_t older = readS32(ram, s + 8u);
+            for (uint32_t i = 0; i < 14; ++i, ++in, out += 8u)
+            {
+                const uint32_t byte = ram[phys(in)];
+                const int32_t hi = static_cast<int32_t>((byte >> 4u) << 28u) >> shift;
+                const int32_t first = static_cast<int32_t>(static_cast<uint32_t>(hi) + static_cast<uint32_t>(mulLo(newest, c0)) + static_cast<uint32_t>(mulLo(older, c1))) >> 8;
+                write32(ram, out, static_cast<uint32_t>(first));
+                const int32_t lo = static_cast<int32_t>(byte << 28u) >> shift;
+                const int32_t second = static_cast<int32_t>(static_cast<uint32_t>(lo) + static_cast<uint32_t>(mulLo(first, c0)) + static_cast<uint32_t>(mulLo(newest, c1))) >> 8;
+                write32(ram, out + 4u, static_cast<uint32_t>(second));
+                older = first;
+                newest = second;
+            }
+            write32(ram, s + 4u, static_cast<uint32_t>(newest));
+            write32(ram, s + 8u, static_cast<uint32_t>(older));
+            write32(ram, s + 12u, in);
+            write32(ram, s + 16u, out);
+            insns += 698u;
+        }
+        return insns;
+    }
+
     // Masks: all bits checked except relocated fields at the given word indices.
     std::vector<uint32_t> masks(uint32_t words, std::initializer_list<uint32_t> hiLoWords, std::initializer_list<uint32_t> jumpWords)
     {
@@ -143,6 +225,8 @@ namespace mhrs::snddrv
         add(runtime, 0x5824u, masks(122u, {6, 7, 16, 17, 38, 40}, {51, 55, 66, 70, 81, 85, 96, 100}), 0x0AA430FEu, mixEe48Iop48);
         add(runtime, 0x4600u, masks(201u, {}, {153}), 0x5674C270u, memmoveNative);
         add(runtime, 0x36D0u, masks(49u, {}, {}), 0x6A1CFBD3u, mixIop);
+        add(runtime, 0x3120u, masks(80u, {}, {}), 0x9E068FEFu, rs16Linear);
+        add(runtime, 0x9BA0u, masks(77u, {16, 18, 19, 21}, {73}), 0xBA2AEBE3u, decXa16c);
     }
 }
 

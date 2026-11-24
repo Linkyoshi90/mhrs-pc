@@ -7,6 +7,7 @@
 // it moved twice as fast.
 #include "game_overrides.h"
 #include "ps2_runtime.h"
+#include "runtime/ps2_menus.h"
 
 #include <cstdint>
 #include <cstring>
@@ -29,7 +30,7 @@ namespace mhrs::framelimit
         uint32_t state = 0u, frontEnd = 0u;
         std::memcpy(&state, rdram + kLoaderState, sizeof(state));
         std::memcpy(&frontEnd, rdram + kFrontEnd, sizeof(frontEnd));
-        if (frontEnd != 0u)
+        if (frontEnd != 0u || ps2GraphicsFrameRate() <= 30) // 30 fps picked in the graphics menu (F4)
             state = 0u;
         std::memcpy(rdram + kLimitState, &state, sizeof(state));
         g_frameTick(rdram, ctx, runtime);

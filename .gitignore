@@ -17,3 +17,5 @@ build/
 imgui.ini
 ps2_log.txt
 __pycache__/
+dist/MOHRS-x86_64.AppImage
+dist/MOHRS.AppDir/usr/bin/ps2EntryRunner

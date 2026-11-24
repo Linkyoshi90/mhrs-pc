@@ -1,0 +1,361 @@
+--- a/ps2xRuntime/include/runtime/ps2_menus.h
++++ b/ps2xRuntime/include/runtime/ps2_menus.h
+@@ -4,8 +4,15 @@
+ #include <cstdint>
+ 
+ // In-window menus, drawn over the game by the render loop: F2 rebinds the controls (saved to the controls file),
+-// F5 toggles the game's own bonus cheats (MOH: Rising Sun only; saved to cheats.ini). While one is open the game
+-// keeps running but sees an idle pad. rdram: guest memory, for the cheat flags.
++// F4 sets the graphics (saved to the graphics file), F5 toggles the game's own bonus cheats (MOH: Rising Sun only;
++// saved to cheats.ini). While one is open the game keeps running but sees an idle pad. rdram: guest memory, for the
++// cheat flags. The first call also applies the graphics file (window size, fullscreen, internal resolution).
+ void ps2MenusUpdateAndDraw(uint8_t *rdram);
+ 
++// The frame rate the player picked in the graphics menu (60 or 30), for a game hook that limits its own frame rate
++// (MOH: Rising Sun's frame limiter). 60 until the graphics file is read.
++int ps2GraphicsFrameRate();
++// The graphics file: PS2X_GRAPHICS or graphics.ini in the working directory.
++const char *ps2GraphicsPath();
++
+ #endif
+--- a/ps2xRuntime/src/lib/ps2_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_menus.cpp
+@@ -4,6 +4,9 @@
+ #include "ps2_host_backend.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cctype>
++#include <cstdlib>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -18,6 +21,7 @@
+     {
+         None,
+         Controls,
++        Graphics,
+         Cheats
+     };
+ 
+@@ -70,7 +74,6 @@
+         RowSensitivity,
+         RowDeadzone,
+         RowInvertY,
+-        RowResolution,
+         RowDefaults,
+         RowCount
+     };
+@@ -107,7 +110,7 @@
+     {
+         for (int key = GetKeyPressed(); key != 0; key = GetKeyPressed())
+         {
+-            if (key == KEY_F2 || key == KEY_F3 || key == KEY_F5)
++            if (key == KEY_F2 || key == KEY_F3 || key == KEY_F4 || key == KEY_F5)
+                 continue; // the menu and HUD keys
+             input = {PadInput::Key, key, 0};
+             if (!ps2PadInputName(input).empty())
+@@ -213,11 +216,6 @@
+             if (changed)
+                 controls.invertY = !controls.invertY;
+             break;
+-        case RowResolution: // not a control: applies at once, nothing saved (PS2X_VK_SCALE sets the start value)
+-            if (step != 0)
+-                gsHiresSetScale(static_cast<uint32_t>(std::clamp(static_cast<int>(gsHiresScale()) + step, 1, 4)));
+-            changed = false;
+-            break;
+         case RowDefaults:
+             changed = enter;
+             if (changed)
+@@ -255,10 +253,6 @@
+                 case RowSensitivity: label = "Stick look sensitivity"; value = TextFormat("%.1f", controls->sensitivity); break;
+                 case RowDeadzone: label = "Gamepad dead zone"; value = TextFormat("%.2f", controls->deadzone); break;
+                 case RowInvertY: label = "Invert look up/down"; value = controls->invertY ? "on" : "off"; break;
+-                case RowResolution:
+-                    label = "Internal resolution";
+-                    value = TextFormat("%ux (%ux%u)", gsHiresScale(), 640u * gsHiresScale(), 448u * gsHiresScale());
+-                    break;
+                 case RowDefaults: label = "Reset all to defaults (Enter)"; break;
+                 }
+             DrawText(label.c_str(), p.x + 20, y, kFont, RAYWHITE);
+@@ -268,6 +262,209 @@
+             DrawText(menu.status.c_str(), p.x + p.w - 16 - MeasureText(menu.status.c_str(), 16), p.y + 16, 16, LIME);
+     }
+ 
++    // ---- graphics menu ----
++    std::atomic<int> g_frameRate{60};
++
++    struct WindowSize
++    {
++        int w, h;
++    };
++    constexpr WindowSize kWindowSizes[] = {{640, 480},   {960, 720},   {1280, 720},  {1280, 960},
++                                           {1600, 900},  {1600, 1200}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
++    constexpr int kWindowSizeCount = static_cast<int>(std::size(kWindowSizes));
++
++    // What the graphics file holds. windowW 0: the start size (MHRS_WINDOW or the built-in one); scale 0: the
++    // start value (PS2X_VK_SCALE).
++    struct GraphicsSettings
++    {
++        int windowW = 0, windowH = 0;
++        bool fullscreen = false;
++        uint32_t scale = 0;
++        int frameRate = 60;
++    };
++
++    enum GraphicsRow
++    {
++        GfxWindow,
++        GfxFullscreen,
++        GfxScale,
++        GfxFrameRate,
++        GfxDefaults,
++        GfxCount
++    };
++
++    struct GraphicsMenu
++    {
++        int selected = 0;
++        std::string status;
++        GraphicsSettings settings;
++    };
++
++    // Unknown keys and bad values are skipped: a hand-edited file never stops the game.
++    GraphicsSettings loadGraphics()
++    {
++        GraphicsSettings s;
++        std::ifstream file(ps2GraphicsPath());
++        for (std::string line; std::getline(file, line);)
++        {
++            line = line.substr(0, line.find('#'));
++            const size_t eq = line.find('=');
++            if (eq == std::string::npos)
++                continue;
++            std::string key = line.substr(0, eq);
++            key.erase(std::remove_if(key.begin(), key.end(), [](unsigned char c) { return std::isspace(c); }), key.end());
++            const char *value = line.c_str() + eq + 1;
++            int a = 0, b = 0;
++            if (key == "window" && std::sscanf(value, " %dx%d", &a, &b) == 2 && a >= 320 && b >= 240)
++            {
++                s.windowW = a;
++                s.windowH = b;
++            }
++            else if (key == "fullscreen" && std::sscanf(value, " %d", &a) == 1)
++                s.fullscreen = a != 0;
++            else if (key == "scale" && std::sscanf(value, " %d", &a) == 1 && a >= 1 && a <= 4)
++                s.scale = static_cast<uint32_t>(a);
++            else if (key == "fps" && std::sscanf(value, " %d", &a) == 1)
++                s.frameRate = a <= 30 ? 30 : 60;
++        }
++        return s;
++    }
++
++    void saveGraphics(const GraphicsSettings &s, std::string &status)
++    {
++        std::ofstream file(ps2GraphicsPath(), std::ios::trunc);
++        file << "# Written by the graphics menu (F4).\n";
++        if (s.windowW > 0)
++            file << "window = " << s.windowW << "x" << s.windowH << "    # window size when not fullscreen\n";
++        file << "fullscreen = " << (s.fullscreen ? 1 : 0) << "    # borderless, at the monitor's resolution\n";
++        if (s.scale > 0)
++            file << "scale = " << s.scale << "    # internal resolution, 1 (native PS2) to 4\n";
++        file << "fps = " << s.frameRate << "    # game frame rate: 60 or 30 (menus always run at 30)\n";
++        status = file ? std::string("Saved to ") + ps2GraphicsPath() : std::string("Could not write ") + ps2GraphicsPath();
++    }
++
++    void applyGraphics(const GraphicsSettings &s)
++    {
++        if (s.fullscreen != IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
++            ToggleBorderlessWindowed();
++        if (!s.fullscreen && s.windowW > 0 && (GetScreenWidth() != s.windowW || GetScreenHeight() != s.windowH))
++            SetWindowSize(s.windowW, s.windowH);
++        if (s.scale > 0)
++            gsHiresSetScale(s.scale);
++        g_frameRate.store(s.frameRate, std::memory_order_relaxed);
++    }
++
++    // The preset at or just above the current window size.
++    int windowPreset(int w, int h)
++    {
++        for (int i = 0; i < kWindowSizeCount; ++i)
++            if (kWindowSizes[i].w * kWindowSizes[i].h >= w * h)
++                return i;
++        return kWindowSizeCount - 1;
++    }
++
++    bool updateGraphics(GraphicsMenu &menu)
++    {
++        if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_F4))
++            return false;
++        if (pressed(KEY_DOWN))
++            menu.selected = (menu.selected + 1) % GfxCount;
++        if (pressed(KEY_UP))
++            menu.selected = (menu.selected + GfxCount - 1) % GfxCount;
++        const int step = pressed(KEY_RIGHT) ? 1 : (pressed(KEY_LEFT) ? -1 : 0);
++        const bool enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
++        GraphicsSettings &s = menu.settings;
++        bool changed = false;
++        switch (menu.selected)
++        {
++        case GfxWindow:
++            if (step != 0 && !s.fullscreen)
++            {
++                const int current = windowPreset(GetScreenWidth(), GetScreenHeight());
++                const bool exact = kWindowSizes[current].w == GetScreenWidth() && kWindowSizes[current].h == GetScreenHeight();
++                // From a size between presets, Left goes to the one below, Right to the one above.
++                const int next = std::clamp(step < 0 || exact ? current + step : current, 0, kWindowSizeCount - 1);
++                s.windowW = kWindowSizes[next].w;
++                s.windowH = kWindowSizes[next].h;
++                changed = true;
++            }
++            break;
++        case GfxFullscreen:
++            if (step != 0 || enter)
++            {
++                s.fullscreen = !s.fullscreen;
++                changed = true;
++            }
++            break;
++        case GfxScale:
++            if (step != 0)
++            {
++                s.scale = static_cast<uint32_t>(std::clamp(static_cast<int>(gsHiresScale()) + step, 1, 4));
++                changed = true;
++            }
++            break;
++        case GfxFrameRate:
++            if (step != 0 || enter)
++            {
++                s.frameRate = s.frameRate == 60 ? 30 : 60;
++                changed = true;
++            }
++            break;
++        case GfxDefaults:
++            if (enter)
++            {
++                s = GraphicsSettings{};
++                s.windowW = 1280;
++                s.windowH = 960;
++                s.scale = 2;
++                changed = true;
++            }
++            break;
++        }
++        if (changed)
++        {
++            applyGraphics(s);
++            saveGraphics(s, menu.status);
++        }
++        return true;
++    }
++
++    void drawGraphics(const GraphicsMenu &menu)
++    {
++        const GraphicsSettings &s = menu.settings;
++        const Panel p = drawPanel("Graphics", GfxCount, "Up/Down: select   Left/Right: change   Esc/F4: close");
++        for (int row = 0; row < GfxCount; ++row)
++        {
++            const int y = p.y + 48 + row * kRowHeight;
++            if (row == menu.selected)
++                DrawRectangle(p.x + 8, y - 2, p.w - 16, kRowHeight, Color{90, 70, 30, 200});
++            std::string label, value;
++            switch (row)
++            {
++            case GfxWindow:
++                label = "Window size";
++                value = s.fullscreen ? TextFormat("%dx%d (fullscreen)", GetScreenWidth(), GetScreenHeight())
++                                     : TextFormat("%dx%d", GetScreenWidth(), GetScreenHeight());
++                break;
++            case GfxFullscreen: label = "Fullscreen"; value = s.fullscreen ? "on" : "off"; break;
++            case GfxScale:
++                label = "Internal resolution";
++                value = TextFormat("%ux (%ux%u)%s", gsHiresScale(), 640u * gsHiresScale(), 448u * gsHiresScale(),
++                                   gsHiresScale() > 1u ? "" : "  native PS2");
++                break;
++            case GfxFrameRate:
++                label = "Frame rate";
++                value = TextFormat("%d fps%s", s.frameRate, s.frameRate == 60 ? "" : "  (as on the PS2)");
++                break;
++            case GfxDefaults: label = "Reset to defaults (Enter)"; break;
++            }
++            DrawText(label.c_str(), p.x + 20, y, kFont, RAYWHITE);
++            DrawText(value.c_str(), p.x + 300, y, kFont, row == menu.selected ? YELLOW : Color{180, 220, 255, 255});
++        }
++        if (!menu.status.empty())
++            DrawText(menu.status.c_str(), p.x + p.w - 16 - MeasureText(menu.status.c_str(), 16), p.y + 16, 16, LIME);
++    }
++
+     // ---- cheat menu ----
+     // The game's bonus cheats (BONUS_CHEAT_01..12 in its text tables), in the order of its GetCheatByIndex
+     // (0x29FD88): one 32-bit flag each. The game reads them where they apply, so a flag set here works like the
+@@ -383,11 +580,27 @@
+     Menu g_menu = Menu::None;
+     bool g_waitRelease = false; // after closing: the game stays blocked until the closing key is let go
+     ControlsMenu g_controlsMenu;
++    GraphicsMenu g_graphicsMenu;
+     CheatMenu g_cheatMenu;
+ }
+ 
++int ps2GraphicsFrameRate() { return g_frameRate.load(std::memory_order_relaxed); }
++
++const char *ps2GraphicsPath()
++{
++    static const char *path = std::getenv("PS2X_GRAPHICS") ? std::getenv("PS2X_GRAPHICS") : "graphics.ini";
++    return path;
++}
++
+ void ps2MenusUpdateAndDraw(uint8_t *rdram)
+ {
++    static bool graphicsApplied = false;
++    if (!graphicsApplied) // the graphics file wins over PS2X_VK_SCALE / MHRS_WINDOW when it sets a value
++    {
++        graphicsApplied = true;
++        g_graphicsMenu.settings = loadGraphics();
++        applyGraphics(g_graphicsMenu.settings);
++    }
+     const bool risingSun = isRisingSun(rdram);
+     if (risingSun && !g_cheatMenu.loaded)
+         loadCheats(g_cheatMenu);
+@@ -398,26 +611,31 @@
+     {
+         if (IsKeyPressed(KEY_F2))
+             g_menu = Menu::Controls;
++        else if (IsKeyPressed(KEY_F4))
++            g_menu = Menu::Graphics;
+         else if (IsKeyPressed(KEY_F5))
+             g_menu = Menu::Cheats;
+         if (g_menu != Menu::None)
+         {
+             g_controlsMenu.capturing = false;
+             g_controlsMenu.status.clear();
++            g_graphicsMenu.status.clear();
+             ps2PadSetBlocked(true);
+             g_waitRelease = false;
+         }
+     }
+     else
+     {
+-        const bool open = g_menu == Menu::Controls ? updateControls(g_controlsMenu) : updateCheats(g_cheatMenu, risingSun);
++        const bool open = g_menu == Menu::Controls   ? updateControls(g_controlsMenu)
++                          : g_menu == Menu::Graphics ? updateGraphics(g_graphicsMenu)
++                                                     : updateCheats(g_cheatMenu, risingSun);
+         if (!open)
+         {
+             g_menu = Menu::None;
+             g_waitRelease = true;
+         }
+     }
+-    if (g_waitRelease && !IsKeyDown(KEY_ESCAPE) && !IsKeyDown(KEY_ENTER) && !IsKeyDown(KEY_F2) && !IsKeyDown(KEY_F5))
++    if (g_waitRelease && !IsKeyDown(KEY_ESCAPE) && !IsKeyDown(KEY_ENTER) && !IsKeyDown(KEY_F2) && !IsKeyDown(KEY_F4) && !IsKeyDown(KEY_F5))
+     {
+         g_waitRelease = false;
+         ps2PadSetBlocked(false);
+@@ -425,6 +643,8 @@
+ 
+     if (g_menu == Menu::Controls)
+         drawControls(g_controlsMenu);
++    else if (g_menu == Menu::Graphics)
++        drawGraphics(g_graphicsMenu);
+     else if (g_menu == Menu::Cheats)
+         drawCheats(g_cheatMenu, risingSun);
+ }

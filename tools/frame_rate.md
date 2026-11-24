@@ -475,6 +475,25 @@ measured in a heavier scene, where frames take longer than a vblank throughout.
 Not built: posting the unpack copy and the VU1 run as one worker job. The worker's job machinery is ~1% of it
 (`OrderedWorker::loop` 0.4%, its spin lock 0.4%, no allocations), so that is all it could save.
 
+## A heavier benchmark: the mission 2 boat ride (2026-11-24)
+
+The ride at the start of Midnight Raid on Guadalcanal (data level 1_3) is scripted, so every run sees the same
+frames, and it runs ~100 flips/s, below the cap. Unattended runs reach it from a scratch copy of the player's memory
+card with a scripted pad (TEMP `MHRS_PAD_SCRIPT` in the runner tree, see the project notes).
+
+- Kept, `ps2recomp-ee-call-costs` (+2.5-3%): a TEMP-DEBUG call histogram (mutex + hash map on every guest call) and
+  per-allocation logging in `dispatchGuestBranch` were part of the series; they now need `MHRS_CALL_HIST` /
+  `MHRS_ALLOC_LOG`. VU1 run jobs capture 16 bytes, so `std::function` keeps them inline: before, each of ~120k
+  runs per second allocated on the EE and freed on the worker.
+- Kept, `ps2recomp-guest-access-fast-path` (fps-neutral, less EE work): main-RAM accesses skip the special-address
+  ranges with one compare; the `MHRS_WATCH` loop on every guest store is skipped unless a watch is set.
+- What bounds it: 20% extra load on the VU1 worker costs 5.8% fps, the same on the EE 2.5%. Frames shorter than a
+  vblank already wait for the limiter (the main thread sleeps in `func_0030C038` for 5-20% of the time), so the
+  average comes from long, worker-heavy frames.
+- No gain, not kept: a flat array for the EE IO registers, batching the EE timer updates, more display writes
+  ahead (10, 15), one worker job for UNPACK copy + VU1 run. Remaining EE cost: the VIF1 chain copy (~10%,
+  `memmove`), which `processVIF1Data` needs because it has no state for commands that cross DMA tags.
+
 ## To 60 fps in the menus
 
 The main menu is not a light 2D screen: it draws a 3D scene (the ship's bridge) behind the text and costs

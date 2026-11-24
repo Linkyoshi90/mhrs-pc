@@ -1,0 +1,36 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index d467c4b..4172811 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ #include "Common.h"
+ #include "LibC.h"
+ #include "ps2_log.h"
+@@ -1080,14 +1081,24 @@ namespace ps2_stubs
+         setReturnU32(ctx, 0u);
+     }
+ 
++    // The PS2 newlib rand: RAND_MAX is 0x7FFFFFFF, and games scale by it (MOH: Rising Sun multiplies by 2^-31 for
++    // a random float). A 15-bit host-style result made every such value its range's minimum: random jitter became
++    // a steady drift (mounted-gun shake turned the view a little further every frame).
++    static std::atomic<uint32_t> g_randState{1u};
++
+     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        setReturnS32(ctx, std::rand() & 0x7FFF);
++        uint32_t state = g_randState.load(std::memory_order_relaxed);
++        uint32_t next;
++        do
++            next = state * 0x41C64E6Du + 0x3039u;
++        while (!g_randState.compare_exchange_weak(state, next, std::memory_order_relaxed));
++        setReturnS32(ctx, static_cast<int32_t>(next & 0x7FFFFFFFu));
+     }
+ 
+     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        std::srand(getRegU32(ctx, 4));
++        g_randState.store(getRegU32(ctx, 4), std::memory_order_relaxed);
+         setReturnS32(ctx, 0);
+     }
+ 

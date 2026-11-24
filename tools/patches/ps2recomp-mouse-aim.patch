@@ -1,0 +1,90 @@
+--- a/ps2xRuntime/include/runtime/ps2_pad_keys.h
++++ b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+@@ -123,6 +123,13 @@
+ void ps2PadSetBlocked(bool blocked);
+ bool ps2PadBlocked();
+ 
++// Mouse aim for games with a hook that turns the camera itself: the mouse movement (pixels, already scaled by
++// mouse_look and flipped by invert_y) since the previous call. False when mouse_look is off or a menu is open.
++// While a hook keeps calling it (within kMouseAimHold seconds), the pad no longer turns the mouse into right-stick
++// deflection, so the camera does not turn twice; when the hook stops (turrets, cutscenes) the stick mapping returns.
++bool ps2PadTakeMouseAim(float &dx, float &dy);
++constexpr double kMouseAimHold = 0.25;
++
+ // True once per press of the skip_movie input (polled while a movie plays), or once the movie has shown
+ // PS2X_SKIP_MOVIES=<n> pictures.
+ // held: the caller's memory of the input (-1 before its first poll, so a key held from before does not count).
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -382,6 +382,34 @@
+     return pressed || always;
+ }
+ 
++namespace
++{
++    std::atomic<double> g_mouseAimTaken{-1.0}; // GetTime() of the last ps2PadTakeMouseAim call
++}
++
++bool ps2PadTakeMouseAim(float &dx, float &dy)
++{
++    dx = dy = 0.0f;
++    static float lastX = 0.0f, lastY = 0.0f;
++    const std::shared_ptr<const PadControls> controls = ps2PadControls();
++    if (!IsWindowReady() || ps2PadBlocked() || controls->mouseLook <= 0.0f)
++    {
++        g_mouseAimTaken.store(-1.0, std::memory_order_relaxed);
++        return false;
++    }
++    const double now = GetTime();
++    const Vector2 position = GetMousePosition(); // unbounded: the cursor is captured (DisableCursor)
++    const double previous = g_mouseAimTaken.exchange(now, std::memory_order_relaxed);
++    if (previous >= 0.0 && now - previous <= kMouseAimHold) // else start from here: no jump after a pause
++    {
++        dx = (position.x - lastX) * controls->mouseLook;
++        dy = (position.y - lastY) * controls->mouseLook * (controls->invertY ? -1.0f : 1.0f);
++    }
++    lastX = position.x;
++    lastY = position.y;
++    return true;
++}
++
+ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+ {
+     if (!data || size < 32)
+@@ -420,7 +448,9 @@
+         const Vector2 position = GetMousePosition(); // unbounded: the cursor is captured (DisableCursor)
+         float dx = 0.0f, dy = 0.0f;
+         mouse.poll(GetTime(), position.x, position.y, dx, dy);
+-        if (lookX == 0.0f && lookY == 0.0f)
++        const double taken = g_mouseAimTaken.load(std::memory_order_relaxed);
++        const bool aimHook = taken >= 0.0 && GetTime() - taken <= kMouseAimHold;
++        if (lookX == 0.0f && lookY == 0.0f && !aimHook)
+         {
+             data[4] = ps2PadMouseAxis(dx, controls.mouseLook);
+             data[5] = ps2PadMouseAxis(dy * invert, controls.mouseLook);
+--- a/ps2xRuntime/src/lib/ps2_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_menus.cpp
+@@ -83,7 +83,11 @@
+         std::string status;
+     };
+ 
+-    bool isKeyboardOrMouse(const PadInput &input) { return input.kind == PadInput::Key || input.kind == PadInput::Mouse; }
++    // Inputs of one group replace each other when a new one is bound: keys, mouse buttons, gamepad.
++    int inputGroup(const PadInput &input)
++    {
++        return input.kind == PadInput::Key ? 0 : (input.kind == PadInput::Mouse ? 1 : 2);
++    }
+ 
+     void applyControls(PadControls controls, std::string &status)
+     {
+@@ -163,8 +167,8 @@
+             {
+                 // The new input replaces the target's inputs of its kind (keyboard/mouse or gamepad), keeps the other.
+                 std::vector<PadInput> &bind = controls.bind[menu.selected];
+-                const bool keyboard = isKeyboardOrMouse(input);
+-                std::erase_if(bind, [keyboard](const PadInput &old) { return isKeyboardOrMouse(old) == keyboard; });
++                const int group = inputGroup(input);
++                std::erase_if(bind, [group](const PadInput &old) { return inputGroup(old) == group; });
+                 bind.push_back(input);
+                 menu.capturing = false;
+                 applyControls(std::move(controls), menu.status);
