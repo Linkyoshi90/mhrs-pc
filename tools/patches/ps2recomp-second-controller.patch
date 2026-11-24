@@ -1,0 +1,683 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_pad_keys.h b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+index 37da82f..359a2d7 100755
+--- a/ps2xRuntime/include/runtime/ps2_pad_keys.h
++++ b/ps2xRuntime/include/runtime/ps2_pad_keys.h
+@@ -47,7 +47,9 @@ inline uint8_t ps2PadMouseAxis(float delta, float scale)
+ //           pad:<button> (a b x y lb rb lt rt back start ls rs dpad_up dpad_down dpad_left dpad_right),
+ //           pad:<axis><+|-> (lx ly rx ry; + is right/down)
+ // settings: mouse_look = <stick units per pixel per 1/60 s, 0 = off>, deadzone = <0..0.9>,
+-//           sensitivity = <look stick scale>, invert_y = 0|1, gamepad = <index>
++//           sensitivity = <look stick scale>, invert_y = 0|1, gamepad = <index, -1 = none>
++// Player 2 (pad port 2): the same pad targets and settings with a "p2_" prefix (p2_cross = pad:a, p2_gamepad = 1).
++// skip_movie, fast_forward and mouse_look are player 1's only.
+ struct PadInput
+ {
+     enum Kind : uint8_t
+@@ -93,18 +95,35 @@ enum PadTarget : uint8_t
+     PadTargetCount
+ };
+ 
+-struct PadControls
++// One player's pad.
++struct PadPlayer
+ {
+     std::array<std::vector<PadInput>, PadTargetCount> bind;
+-    float mouseLook = 0.0f;
+     float deadzone = 0.0f;
+     float sensitivity = 1.0f;
+     bool invertY = false;
+-    int gamepad = 0;
++    int gamepad = 0; // -1: no gamepad
++};
++
++// Player 1 (port 1, also skip_movie / fast_forward / mouse look) and player 2 (port 2, the "p2_" lines).
++struct PadControls : PadPlayer
++{
++    float mouseLook = 0.0f;
++    PadPlayer p2;
++    PadPlayer &player(int index) { return index == 1 ? p2 : *this; }
++    const PadPlayer &player(int index) const { return index == 1 ? p2 : *this; }
+ };
+ 
+-// The built-in bindings: keyboard, mouse buttons and the first gamepad together; PS2X_MOUSE_LOOK for mouseLook.
++// The built-in bindings: player 1 has keyboard, mouse buttons and the first gamepad together, PS2X_MOUSE_LOOK for
++// mouseLook; player 2 has the same gamepad bindings on the second gamepad and no keys.
+ PadControls ps2PadDefaultControls();
++// A gamepad index that is plugged in (false for -1).
++bool ps2PadGamepadAvailable(int gamepad);
++// Whether a pad port (0 or 1) has a controller: port 1 always, port 2 while player 2's gamepad is plugged in or
++// player 2 has a keyboard/mouse binding. Read live, so plugging the gamepad in or out takes effect at once.
++bool ps2PadConnected(int port);
++// Tests: replaces the host input query (0/1 for keys and buttons, -1..1 for a stick axis); nullptr restores it.
++void ps2PadSetInputSource(float (*source)(const PadInput &input, int gamepad));
+ // Applies a controls file's text; returns one message per line it could not use.
+ std::vector<std::string> ps2PadParseControls(std::string_view text, PadControls &controls);
+ // The live controls: the defaults with the controls file applied (loaded on first use), until the controls menu
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index a07a460..0e467d6 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "Pad.h"
++#include "runtime/ps2_pad_keys.h"
+ #include "runtime/ee_scheduler.h" // TEMP-DEBUG(mhrs)
+ 
+ namespace ps2_stubs
+@@ -284,6 +285,10 @@ namespace ps2_stubs
+                 }
+                 portState = *sharedPortState;
+             }
++            if (!ps2PadConnected(port))
++            {
++                return false; // no controller in this port (port 2 without a player 2 device)
++            }
+ 
+             PadInputState state;
+             bool useOverride = false;
+@@ -477,10 +482,10 @@ namespace ps2_stubs
+         (void)rdram;
+         (void)runtime;
+         std::lock_guard<std::mutex> lock(g_padStateMutex);
+-        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
+-                                                           static_cast<int>(getRegU32(ctx, 5)));
++        const int port = static_cast<int>(getRegU32(ctx, 4));
++        PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
+         int32_t state = kPadStateDisconnected;
+-        if (portState && portState->open)
++        if (portState && portState->open && ps2PadConnected(port))
+         {
+             if (portState->transientState != 0u)
+             {
+diff --git a/ps2xRuntime/src/lib/ps2_menus.cpp b/ps2xRuntime/src/lib/ps2_menus.cpp
+index 97fdb51..ce423f2 100755
+--- a/ps2xRuntime/src/lib/ps2_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_menus.cpp
+@@ -70,16 +70,27 @@ namespace
+         "Skip movie", "Fast forward (hold)"};
+     enum SettingRow
+     {
+-        RowMouseLook = PadTargetCount,
++        RowPlayer,
++        RowFirstTarget, // one row per PadTarget
++        RowMouseLook = RowFirstTarget + PadTargetCount,
+         RowSensitivity,
+         RowDeadzone,
+         RowInvertY,
++        RowGamepad,
+         RowDefaults,
+         RowCount
+     };
+ 
++    // Rows that belong to player 1 whichever player is shown.
++    bool playerOneOnly(int row)
++    {
++        const int target = row - RowFirstTarget;
++        return row == RowMouseLook || target == PadSkipMovie || target == PadFastForward;
++    }
++
+     struct ControlsMenu
+     {
++        int player = 0; // the player whose bindings and settings are shown
+         int selected = 0;
+         bool capturing = false;
+         float axisRest[4] = {}; // stick positions when the capture started: only a new deflection binds
+@@ -122,7 +133,7 @@ namespace
+                 input = {PadInput::Mouse, button, 0};
+                 return true;
+             }
+-        if (!IsGamepadAvailable(gamepad))
++        if (!ps2PadGamepadAvailable(gamepad))
+             return false;
+         for (int button = GAMEPAD_BUTTON_LEFT_FACE_UP; button <= GAMEPAD_BUTTON_RIGHT_THUMB; ++button)
+             if (IsGamepadButtonPressed(gamepad, button))
+@@ -159,6 +170,8 @@ namespace
+     bool updateControls(ControlsMenu &menu)
+     {
+         PadControls controls = *ps2PadControls();
++        PadPlayer &player = controls.player(menu.player);
++        const int target = menu.selected - RowFirstTarget;
+         if (menu.capturing)
+         {
+             if (IsKeyPressed(KEY_ESCAPE))
+@@ -166,10 +179,10 @@ namespace
+                 menu.capturing = false;
+                 menu.status = "Cancelled";
+             }
+-            else if (PadInput input; captureInput(menu, controls.gamepad, input))
++            else if (PadInput input; captureInput(menu, player.gamepad, input))
+             {
+                 // The new input replaces the target's inputs of its kind (keyboard/mouse or gamepad), keeps the other.
+-                std::vector<PadInput> &bind = controls.bind[menu.selected];
++                std::vector<PadInput> &bind = player.bind[target];
+                 const int group = inputGroup(input);
+                 std::erase_if(bind, [group](const PadInput &old) { return inputGroup(old) == group; });
+                 bind.push_back(input);
+@@ -186,7 +199,15 @@ namespace
+             menu.selected = (menu.selected + RowCount - 1) % RowCount;
+         const int step = pressed(KEY_RIGHT) ? 1 : (pressed(KEY_LEFT) ? -1 : 0);
+         const bool enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
+-        if (menu.selected < PadTargetCount)
++        if (menu.selected == RowPlayer)
++        {
++            if (step != 0 || enter)
++                menu.player = 1 - menu.player;
++            return true;
++        }
++        if (menu.player == 1 && playerOneOnly(menu.selected))
++            return true;
++        if (target >= 0 && target < PadTargetCount)
+         {
+             if (enter)
+             {
+@@ -194,13 +215,13 @@ namespace
+                 {
+                 } // drop the queued Enter
+                 for (int axis = 0; axis < 4; ++axis)
+-                    menu.axisRest[axis] = IsGamepadAvailable(controls.gamepad) ? GetGamepadAxisMovement(controls.gamepad, axis) : 0.0f;
++                    menu.axisRest[axis] = ps2PadGamepadAvailable(player.gamepad) ? GetGamepadAxisMovement(player.gamepad, axis) : 0.0f;
+                 menu.capturing = true;
+                 menu.status.clear();
+             }
+             else if (IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE))
+             {
+-                controls.bind[menu.selected].clear();
++                player.bind[target].clear();
+                 applyControls(std::move(controls), menu.status);
+             }
+             return true;
+@@ -209,17 +230,24 @@ namespace
+         switch (menu.selected)
+         {
+         case RowMouseLook: controls.mouseLook = std::clamp(std::round(controls.mouseLook) + static_cast<float>(step), 0.0f, 40.0f); break;
+-        case RowSensitivity: controls.sensitivity = std::clamp(std::round(controls.sensitivity * 10.0f + static_cast<float>(step)) / 10.0f, 0.1f, 3.0f); break;
+-        case RowDeadzone: controls.deadzone = std::clamp(std::round(controls.deadzone * 20.0f + static_cast<float>(step)) / 20.0f, 0.0f, 0.9f); break;
++        case RowSensitivity: player.sensitivity = std::clamp(std::round(player.sensitivity * 10.0f + static_cast<float>(step)) / 10.0f, 0.1f, 3.0f); break;
++        case RowDeadzone: player.deadzone = std::clamp(std::round(player.deadzone * 20.0f + static_cast<float>(step)) / 20.0f, 0.0f, 0.9f); break;
+         case RowInvertY:
+             changed = step != 0 || enter;
+             if (changed)
+-                controls.invertY = !controls.invertY;
++                player.invertY = !player.invertY;
+             break;
++        case RowGamepad: player.gamepad = std::clamp(player.gamepad + step, -1, 3); break; // raylib has 4 gamepads
+         case RowDefaults:
+             changed = enter;
+             if (changed)
+-                controls = ps2PadDefaultControls();
++            {
++                // Resets the player shown; player 1 also gets the default mouse look.
++                const PadControls defaults = ps2PadDefaultControls();
++                player = defaults.player(menu.player);
++                if (menu.player == 0)
++                    controls.mouseLook = defaults.mouseLook;
++            }
+             break;
+         }
+         if (changed)
+@@ -241,20 +269,35 @@ namespace
+             if (row == menu.selected)
+                 DrawRectangle(p.x + 8, y - 2, p.w - 16, kRowHeight, Color{90, 70, 30, 200});
+             std::string label, value;
+-            if (row < PadTargetCount)
++            const PadPlayer &player = controls->player(menu.player);
++            if (const int target = row - RowFirstTarget; target >= 0 && target < PadTargetCount)
+             {
+-                label = kTargetLabels[row];
+-                value = (menu.capturing && row == menu.selected) ? "< press an input >" : bindingText(controls->bind[row]);
++                label = kTargetLabels[target];
++                value = (menu.capturing && row == menu.selected) ? "< press an input >" : bindingText(player.bind[target]);
+             }
+             else
+                 switch (row)
+                 {
++                case RowPlayer:
++                    label = "Player (Left/Right)";
++                    value = menu.player == 0 ? "1  (pad port 1)"
++                                             : (ps2PadConnected(1) ? "2  (pad port 2: connected)" : "2  (pad port 2: empty, no gamepad or key bound)");
++                    break;
+                 case RowMouseLook: label = "Mouse look speed"; value = controls->mouseLook > 0.0f ? TextFormat("%.0f", controls->mouseLook) : "off"; break;
+-                case RowSensitivity: label = "Stick look sensitivity"; value = TextFormat("%.1f", controls->sensitivity); break;
+-                case RowDeadzone: label = "Gamepad dead zone"; value = TextFormat("%.2f", controls->deadzone); break;
+-                case RowInvertY: label = "Invert look up/down"; value = controls->invertY ? "on" : "off"; break;
+-                case RowDefaults: label = "Reset all to defaults (Enter)"; break;
++                case RowSensitivity: label = "Stick look sensitivity"; value = TextFormat("%.1f", player.sensitivity); break;
++                case RowDeadzone: label = "Gamepad dead zone"; value = TextFormat("%.2f", player.deadzone); break;
++                case RowInvertY: label = "Invert look up/down"; value = player.invertY ? "on" : "off"; break;
++                case RowGamepad:
++                    label = "Gamepad";
++                    value = player.gamepad < 0 ? "none"
++                            : ps2PadGamepadAvailable(player.gamepad)
++                                ? TextFormat("%d: %s", player.gamepad, GetGamepadName(player.gamepad))
++                                : TextFormat("%d: not connected", player.gamepad);
++                    break;
++                case RowDefaults: label = menu.player == 0 ? "Reset player 1 to defaults (Enter)" : "Reset player 2 to defaults (Enter)"; break;
+                 }
++            if (menu.player == 1 && playerOneOnly(row))
++                value = "(player 1 only)";
+             DrawText(label.c_str(), p.x + 20, y, kFont, RAYWHITE);
+             DrawText(value.c_str(), p.x + 300, y, kFont, row == menu.selected ? YELLOW : Color{180, 220, 255, 255});
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 24211a3..4b96662 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -140,6 +140,11 @@ PadControls ps2PadDefaultControls()
+         "look_up = UP, pad:ry-\n" "look_down = DOWN, pad:ry+\n" "look_left = LEFT, pad:rx-\n" "look_right = RIGHT, pad:rx+\n"
+         "skip_movie = ESCAPE, BACKSPACE\n" "fast_forward = F\n",
+         controls);
++    for (size_t target = 0; target < PadSkipMovie; ++target)
++        for (const PadInput &input : controls.bind[target])
++            if (input.kind == PadInput::PadButton || input.kind == PadInput::PadAxis)
++                controls.p2.bind[target].push_back(input);
++    controls.p2.gamepad = 1;
+     return controls;
+ }
+ 
+@@ -166,22 +171,25 @@ std::vector<std::string> ps2PadParseControls(std::string_view text, PadControls
+         }
+         const std::string_view value = line.substr(eq + 1);
+         const std::string number = trimUpper(value);
+-        if (key == "MOUSE_LOOK")
++        const bool p2 = key.rfind("P2_", 0) == 0;
++        const std::string name = p2 ? key.substr(3) : key;
++        PadPlayer &player = controls.player(p2 ? 1 : 0);
++        if (name == "MOUSE_LOOK" && !p2)
+             controls.mouseLook = std::strtof(number.c_str(), nullptr);
+-        else if (key == "DEADZONE")
+-            controls.deadzone = std::clamp(std::strtof(number.c_str(), nullptr), 0.0f, 0.9f);
+-        else if (key == "SENSITIVITY")
+-            controls.sensitivity = std::strtof(number.c_str(), nullptr);
+-        else if (key == "INVERT_Y")
+-            controls.invertY = std::atoi(number.c_str()) != 0;
+-        else if (key == "GAMEPAD")
+-            controls.gamepad = std::atoi(number.c_str());
++        else if (name == "DEADZONE")
++            player.deadzone = std::clamp(std::strtof(number.c_str(), nullptr), 0.0f, 0.9f);
++        else if (name == "SENSITIVITY")
++            player.sensitivity = std::strtof(number.c_str(), nullptr);
++        else if (name == "INVERT_Y")
++            player.invertY = std::atoi(number.c_str()) != 0;
++        else if (name == "GAMEPAD")
++            player.gamepad = std::max(-1, std::atoi(number.c_str()));
+         else
+         {
+             size_t target = 0;
+-            while (target < PadTargetCount && key != trimUpper(kTargetNames[target]))
++            while (target < PadTargetCount && name != trimUpper(kTargetNames[target]))
+                 ++target;
+-            if (target == PadTargetCount)
++            if (target == PadTargetCount || (p2 && target >= PadSkipMovie)) // skip_movie / fast_forward: player 1's
+             {
+                 fail("unknown name " + key);
+                 continue;
+@@ -208,7 +216,7 @@ std::vector<std::string> ps2PadParseControls(std::string_view text, PadControls
+                 rest.remove_prefix(comma + 1);
+             }
+             if (ok)
+-                controls.bind[target] = std::move(inputs);
++                player.bind[target] = std::move(inputs);
+         }
+     }
+     return errors;
+@@ -306,54 +314,90 @@ std::string ps2PadFormatControls(const PadControls &controls)
+     std::ostringstream os;
+     os << "# Written by the controls menu (F2). Format: see controls.example.ini.\n";
+     os << "mouse_look = " << controls.mouseLook << "\n";
+-    os << "deadzone = " << controls.deadzone << "\n";
+-    os << "sensitivity = " << controls.sensitivity << "\n";
+-    os << "invert_y = " << (controls.invertY ? 1 : 0) << "\n";
+-    os << "gamepad = " << controls.gamepad << "\n";
+-    for (size_t target = 0; target < PadTargetCount; ++target)
++    const auto player = [&os](const PadPlayer &p, const char *prefix, size_t targets)
+     {
+-        os << kTargetNames[target] << " =";
+-        bool first = true;
+-        for (const PadInput &input : controls.bind[target])
++        os << prefix << "deadzone = " << p.deadzone << "\n";
++        os << prefix << "sensitivity = " << p.sensitivity << "\n";
++        os << prefix << "invert_y = " << (p.invertY ? 1 : 0) << "\n";
++        os << prefix << "gamepad = " << p.gamepad << "\n";
++        for (size_t target = 0; target < targets; ++target)
+         {
+-            const std::string name = ps2PadInputName(input);
+-            if (name.empty())
+-                continue;
+-            os << (first ? " " : ", ") << name;
+-            first = false;
++            os << prefix << kTargetNames[target] << " =";
++            bool first = true;
++            for (const PadInput &input : p.bind[target])
++            {
++                const std::string name = ps2PadInputName(input);
++                if (name.empty())
++                    continue;
++                os << (first ? " " : ", ") << name;
++                first = false;
++            }
++            os << "\n";
+         }
+-        os << "\n";
+-    }
++    };
++    player(controls, "", PadTargetCount);
++    os << "\n# Player 2 (pad port 2)\n";
++    player(controls.p2, "p2_", PadSkipMovie);
+     return os.str();
+ }
+ 
+ namespace
+ {
++    float hostInput(const PadInput &input, int gamepad)
++    {
++        switch (input.kind)
++        {
++        case PadInput::Key: return IsKeyDown(input.code) ? 1.0f : 0.0f;
++        case PadInput::Mouse: return IsMouseButtonDown(input.code) ? 1.0f : 0.0f;
++        case PadInput::PadButton: return IsGamepadButtonDown(gamepad, input.code) ? 1.0f : 0.0f;
++        case PadInput::PadAxis: return GetGamepadAxisMovement(gamepad, input.code);
++        }
++        return 0.0f;
++    }
++    std::atomic<float (*)(const PadInput &, int)> g_inputSource{hostInput};
++
+     // How far a target is pressed, 0..1: the strongest of its inputs.
+-    float targetStrength(const PadControls &controls, PadTarget target, float sensitivity)
++    float targetStrength(const PadPlayer &player, PadTarget target, float sensitivity)
+     {
+-        const bool gamepad = IsGamepadAvailable(controls.gamepad);
++        const bool gamepad = ps2PadGamepadAvailable(player.gamepad);
++        const auto source = g_inputSource.load(std::memory_order_relaxed);
+         float best = 0.0f;
+-        for (const PadInput &input : controls.bind[target])
++        for (const PadInput &input : player.bind[target])
+         {
+-            float v = 0.0f;
+-            switch (input.kind)
+-            {
+-            case PadInput::Key: v = IsKeyDown(input.code) ? 1.0f : 0.0f; break;
+-            case PadInput::Mouse: v = IsMouseButtonDown(input.code) ? 1.0f : 0.0f; break;
+-            case PadInput::PadButton: v = gamepad && IsGamepadButtonDown(controls.gamepad, input.code) ? 1.0f : 0.0f; break;
+-            case PadInput::PadAxis:
+-                if (gamepad)
+-                    v = ps2PadAxisStrength(GetGamepadAxisMovement(controls.gamepad, input.code) * static_cast<float>(input.sign),
+-                                           controls.deadzone, sensitivity);
+-                break;
+-            }
+-            best = std::max(best, v);
++            const bool padInput = input.kind == PadInput::PadButton || input.kind == PadInput::PadAxis;
++            if (padInput && !gamepad)
++                continue;
++            const float v = source(input, player.gamepad);
++            best = std::max(best, input.kind == PadInput::PadAxis
++                                      ? ps2PadAxisStrength(v * static_cast<float>(input.sign), player.deadzone, sensitivity)
++                                      : v);
+         }
+         return best;
+     }
+ }
+ 
++void ps2PadSetInputSource(float (*source)(const PadInput &input, int gamepad))
++{
++    g_inputSource.store(source ? source : hostInput, std::memory_order_relaxed);
++}
++
++bool ps2PadGamepadAvailable(int gamepad) { return gamepad >= 0 && IsGamepadAvailable(gamepad); }
++
++bool ps2PadConnected(int port)
++{
++    if (port != 1)
++        return port == 0;
++    const std::shared_ptr<const PadControls> controls = ps2PadControls();
++    const PadPlayer &p2 = controls->p2;
++    if (ps2PadGamepadAvailable(p2.gamepad))
++        return true;
++    for (const std::vector<PadInput> &inputs : p2.bind)
++        for (const PadInput &input : inputs)
++            if (input.kind == PadInput::Key || input.kind == PadInput::Mouse)
++                return true;
++    return false;
++}
++
+ namespace
+ {
+     std::atomic<bool> g_fastForward{false};
+@@ -410,9 +454,9 @@ bool ps2PadTakeMouseAim(float &dx, float &dy)
+     return true;
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
+ {
+-    if (!data || size < 32)
++    if (!data || size < 32 || !ps2PadConnected(port))
+         return false;
+ 
+     std::memset(data, 0, 32);
+@@ -425,7 +469,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         return true;
+     const std::shared_ptr<const PadControls> snapshot = ps2PadControls();
+     const PadControls &controls = *snapshot;
+-    const auto strength = [&](PadTarget target, float sensitivity) { return targetStrength(controls, target, sensitivity); };
++    const PadPlayer &player = controls.player(port);
++    const auto strength = [&](PadTarget target, float sensitivity) { return targetStrength(player, target, sensitivity); };
+ 
+     uint16_t btns = 0xFFFFu;
+     for (size_t button = 0; button < 16u; ++button)
+@@ -436,12 +481,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+ 
+     data[6] = ps2PadStickByte(strength(PadMoveRight, 1.0f) - strength(PadMoveLeft, 1.0f));
+     data[7] = ps2PadStickByte(strength(PadMoveDown, 1.0f) - strength(PadMoveUp, 1.0f));
+-    const float invert = controls.invertY ? -1.0f : 1.0f;
+-    const float lookX = strength(PadLookRight, controls.sensitivity) - strength(PadLookLeft, controls.sensitivity);
+-    const float lookY = (strength(PadLookDown, controls.sensitivity) - strength(PadLookUp, controls.sensitivity)) * invert;
++    const float invert = player.invertY ? -1.0f : 1.0f;
++    const float lookX = strength(PadLookRight, player.sensitivity) - strength(PadLookLeft, player.sensitivity);
++    const float lookY = (strength(PadLookDown, player.sensitivity) - strength(PadLookUp, player.sensitivity)) * invert;
+     data[4] = ps2PadStickByte(lookX);
+     data[5] = ps2PadStickByte(lookY);
+-    if (controls.mouseLook > 0.0f)
++    if (port == 0 && controls.mouseLook > 0.0f) // the mouse is player 1's
+     {
+         // Polled every time so the speed window stays current; keys and the stick win while held.
+         static PadMouseSpeed mouse;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3d0e7b9..9f931fe 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -705,10 +705,8 @@ PS2Runtime::PS2Runtime()
+     // so games shipping their own PADMAN.IRX (like this one) get real controller state.
+     m_iopSubsystem->setPadInputProvider([this](int port, ps2x::iop::IopPadState &state)
+     {
+-        if (port != 0)
+-            return false; // one virtual pad, on port 1
+         uint8_t data[32];
+-        if (!m_padBackend.readState(0, 0, data, sizeof(data)))
++        if (!m_padBackend.readState(port, 0, data, sizeof(data))) // false: no controller in this port
+             return false;
+         state.buttons = static_cast<uint16_t>(data[2] | (data[3] << 8));
+         state.rx = data[4];
+diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
+index 759f5fc..abff080 100644
+--- a/ps2xTest/src/pad_input_tests.cpp
++++ b/ps2xTest/src/pad_input_tests.cpp
+@@ -3,7 +3,9 @@
+ #include "ps2_syscalls.h"
+ #include "Stubs/Pad.h"
+ #include "runtime/ps2_pad_keys.h"
++#include "runtime/ps2_pad.h"
+ 
++#include <algorithm>
+ #include <vector>
+ #include <cstdint>
+ #include <string>
+@@ -63,6 +65,26 @@ namespace
+         const uint8_t *data = rdram.data() + kPadDataAddr;
+         return static_cast<uint16_t>(data[2] | (data[3] << 8));
+     }
++
++    // Host input for the pad state tests: only the key in g_heldKey is down.
++    int g_heldKey = 0;
++    float heldKeyInput(const PadInput &input, int /*gamepad*/)
++    {
++        return input.kind == PadInput::Key && input.code == g_heldKey ? 1.0f : 0.0f;
++    }
++
++    uint32_t padGetState(R5900Context &ctx, std::vector<uint8_t> &rdram, uint32_t port)
++    {
++        setRegU32(ctx, 4, port);
++        setRegU32(ctx, 5, 0u);
++        ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
++        return static_cast<uint32_t>(getRegU32(&ctx, 2));
++    }
++
++    bool sameSettings(const PadPlayer &a, const PadPlayer &b)
++    {
++        return a.deadzone == b.deadzone && a.sensitivity == b.sensitivity && a.invertY == b.invertY && a.gamepad == b.gamepad;
++    }
+ }
+ 
+ void register_pad_input_tests()
+@@ -631,5 +653,142 @@ void register_pad_input_tests()
+             mouse.poll(1.001, 34.0f, -15.0f, dx, dy);
+             t.Equals(dx, 4.0f, "polls closer than a frame are not scaled up");
+         });
++
++        tc.Run("player 2 defaults are player 1's gamepad bindings on the second gamepad", [](TestCase &t)
++               {
++            const PadControls d = ps2PadDefaultControls();
++            t.Equals(d.gamepad, 0, "player 1 uses the first gamepad");
++            t.Equals(d.p2.gamepad, 1, "player 2 uses the second gamepad");
++            for (size_t target = 0; target < PadTargetCount; ++target)
++            {
++                std::vector<PadInput> padHalf;
++                if (target < PadSkipMovie)
++                    for (const PadInput &input : d.bind[target])
++                        if (input.kind == PadInput::PadButton || input.kind == PadInput::PadAxis)
++                            padHalf.push_back(input);
++                t.IsTrue(d.p2.bind[target] == padHalf, std::string("player 2 default of ") + ps2PadTargetName(target));
++            }
++            t.IsTrue(!d.p2.bind[PadCross].empty(), "player 2 has a cross binding");
++
++            PadControls c = ps2PadDefaultControls();
++            const auto errors = ps2PadParseControls("cross = P\ngamepad = -1\ndeadzone = 0.3\n", c);
++            t.Equals(errors.size(), static_cast<size_t>(0), "a player 1 file has no errors");
++            t.Equals(c.gamepad, -1, "gamepad = -1 means no gamepad");
++            for (size_t target = 0; target < PadTargetCount; ++target)
++                t.IsTrue(c.p2.bind[target] == d.p2.bind[target], std::string("a file without p2_ lines keeps player 2's ") + ps2PadTargetName(target));
++            t.IsTrue(sameSettings(c.p2, d.p2), "a file without p2_ lines keeps player 2's settings");
++        });
++
++        tc.Run("p2_ lines set player 2 and leave player 1 alone", [](TestCase &t)
++               {
++            const PadControls d = ps2PadDefaultControls();
++            PadControls c = ps2PadDefaultControls();
++            const auto errors = ps2PadParseControls(
++                "p2_cross = P, pad:b\np2_gamepad = -1\np2_deadzone = 0.3\np2_sensitivity = 2\np2_invert_y = 1\n"
++                "p2_skip_movie = Q\np2_mouse_look = 3\n", c);
++            t.Equals(errors.size(), static_cast<size_t>(2), "p2_skip_movie and p2_mouse_look are not player 2 names");
++            t.Equals(c.p2.bind[PadCross].size(), static_cast<size_t>(2), "p2_cross takes its two inputs");
++            t.IsTrue(c.p2.bind[PadCross][0] == PadInput{PadInput::Key, 'P', 0}, "p2_cross binds the key P");
++            t.Equals(c.p2.gamepad, -1, "p2_gamepad is read");
++            t.Equals(c.p2.deadzone, 0.3f, "p2_deadzone is read");
++            t.Equals(c.p2.sensitivity, 2.0f, "p2_sensitivity is read");
++            t.IsTrue(c.p2.invertY, "p2_invert_y is read");
++            t.IsTrue(c.p2.bind[PadSkipMovie].empty(), "player 2 has no movie skip");
++            for (size_t target = 0; target < PadTargetCount; ++target)
++                t.IsTrue(c.bind[target] == d.bind[target], std::string("player 1 keeps ") + ps2PadTargetName(target));
++            t.IsTrue(sameSettings(c, d), "player 1 keeps its settings");
++            t.Equals(c.mouseLook, d.mouseLook, "mouse_look is untouched");
++        });
++
++        tc.Run("a controls file with player 2 changes reads back the same", [](TestCase &t)
++               {
++            PadControls c = ps2PadDefaultControls();
++            const auto setup = ps2PadParseControls(
++                "gamepad = 2\nr1 = mouse:left\np2_cross = P, pad:b\np2_move_up = W\np2_r1 =\np2_gamepad = -1\n"
++                "p2_deadzone = 0.35\np2_sensitivity = 1.5\np2_invert_y = 1\n", c);
++            t.Equals(setup.size(), static_cast<size_t>(0), "the setup text is valid");
++            const std::string text = ps2PadFormatControls(c);
++            t.IsTrue(text.find("p2_skip_movie") == std::string::npos && text.find("p2_mouse_look") == std::string::npos,
++                     "player 1 only names are not written for player 2");
++            PadControls back = ps2PadDefaultControls();
++            back.p2.bind[PadCross].clear();
++            back.p2.gamepad = 3;
++            const auto errors = ps2PadParseControls(text, back);
++            t.Equals(errors.size(), static_cast<size_t>(0), "the written file has no errors");
++            for (size_t target = 0; target < PadTargetCount; ++target)
++            {
++                t.IsTrue(back.bind[target] == c.bind[target], std::string("player 1 ") + ps2PadTargetName(target) + " survives");
++                t.IsTrue(back.p2.bind[target] == c.p2.bind[target], std::string("player 2 ") + ps2PadTargetName(target) + " survives");
++            }
++            t.IsTrue(sameSettings(back, c), "player 1 settings survive");
++            t.IsTrue(sameSettings(back.p2, c.p2), "player 2 settings survive");
++            t.Equals(back.p2.gamepad, -1, "p2_gamepad = -1 survives");
++        });
++
++        tc.Run("pad port 2 is connected only with a player 2 device, and the players stay apart", [](TestCase &t)
++               {
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
++            R5900Context ctx;
++            PSPadBackend backend;
++            uint8_t data[32];
++            ps2PadSetInputSource(heldKeyInput);
++            g_heldKey = 0;
++
++            // Defaults: no window, so no gamepad is plugged in; player 2 has no keys.
++            ps2PadSetControls(ps2PadDefaultControls());
++            t.IsTrue(backend.readState(0, 0, data, sizeof(data)), "port 1 always has a controller");
++            const uint8_t idle[8] = {0x01, 0x73, 0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80};
++            t.IsTrue(std::equal(idle, idle + 8, data), "port 1 idle state is unchanged");
++            g_heldKey = 'X';
++            backend.readState(0, 0, data, sizeof(data));
++            t.Equals(static_cast<uint16_t>(data[2] | (data[3] << 8)), static_cast<uint16_t>(0xFFFFu & ~kPadBtnCross), "X still presses cross on port 1");
++            g_heldKey = 'W';
++            backend.readState(0, 0, data, sizeof(data));
++            t.Equals(data[7], static_cast<uint8_t>(0x00), "W still pushes port 1's left stick up");
++            g_heldKey = 0;
++
++            t.IsTrue(!ps2PadConnected(1), "port 2 is empty without a player 2 device");
++            t.IsTrue(!backend.readState(1, 0, data, sizeof(data)), "an empty port 2 has no pad state");
++            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
++            openPadPort(ctx, rdram, 0);
++            openPadPort(ctx, rdram, 1);
++            t.Equals(padGetState(ctx, rdram, 0), static_cast<uint32_t>(6), "port 1 is STABLE");
++            t.Equals(padGetState(ctx, rdram, 1), static_cast<uint32_t>(0), "an empty port 2 is DISCONNECTED");
++            setRegU32(ctx, 4, 1u);
++            setRegU32(ctx, 5, 0u);
++            setRegU32(ctx, 6, kPadDataAddr);
++            ps2_stubs::scePadRead(rdram.data(), &ctx, nullptr);
++            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0), "scePadRead fails on an empty port 2");
++
++            PadControls c = ps2PadDefaultControls();
++            c.p2.gamepad = -1;
++            ps2PadSetControls(c);
++            t.IsTrue(!ps2PadConnected(1), "p2_gamepad = -1 without keys leaves port 2 empty");
++
++            c.p2.bind[PadCross] = {PadInput{PadInput::Key, 'P', 0}};
++            ps2PadSetControls(c);
++            t.IsTrue(ps2PadConnected(1), "a player 2 key binding connects port 2");
++            t.Equals(padGetState(ctx, rdram, 1), static_cast<uint32_t>(6), "port 2 with a key binding is STABLE");
++            t.IsTrue(backend.readState(1, 0, data, sizeof(data)), "port 2 has pad state");
++            t.Equals(static_cast<uint16_t>(data[2] | (data[3] << 8)), static_cast<uint16_t>(0xFFFF), "port 2 idle has no buttons");
++
++            g_heldKey = 'P';
++            backend.readState(0, 0, data, sizeof(data));
++            t.Equals(static_cast<uint16_t>(data[2] | (data[3] << 8)), static_cast<uint16_t>(0xFFFF), "player 2's key does not press port 1");
++            backend.readState(1, 0, data, sizeof(data));
++            t.Equals(static_cast<uint16_t>(data[2] | (data[3] << 8)), static_cast<uint16_t>(0xFFFFu & ~kPadBtnCross), "player 2's key presses cross on port 2");
++
++            g_heldKey = 'X';
++            backend.readState(0, 0, data, sizeof(data));
++            t.Equals(static_cast<uint16_t>(data[2] | (data[3] << 8)), static_cast<uint16_t>(0xFFFFu & ~kPadBtnCross), "player 1's key presses cross on port 1");
++            backend.readState(1, 0, data, sizeof(data));
++            t.Equals(static_cast<uint16_t>(data[2] | (data[3] << 8)), static_cast<uint16_t>(0xFFFF), "player 1's key does not press port 2");
++
++            g_heldKey = 0;
++            ps2PadSetInputSource(nullptr);
++            ps2PadSetControls(ps2PadDefaultControls());
++            closePadPort(ctx, rdram, 0);
++            closePadPort(ctx, rdram, 1);
++        });
+     });
+ }

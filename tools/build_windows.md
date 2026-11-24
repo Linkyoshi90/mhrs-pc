@@ -69,6 +69,8 @@ speed) and how often the window redraws.
 
 Controls: copy `tools/controls.example.ini` to `controls.ini` in the folder you start from (or set `PS2X_CONTROLS`)
 to rebind keys, mouse buttons and gamepad buttons/axes, and to set mouse look, dead zone, sensitivity and invert-Y.
+A second player (pad port 2, for split screen) uses the same names with a `p2_` prefix and the second gamepad by
+default (`p2_gamepad`; `-1` = no gamepad); in the F2 menu the first row, "Player", switches the rows to player 2.
 
 `tools/windows/pack_mingw.sh <tree> <dest>` copies the exe plus every DLL it imports from the build tree
 (ffmpeg and its codec libs); everything else is a Windows system DLL or the driver's `vulkan-1.dll`.

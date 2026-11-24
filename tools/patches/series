@@ -121,3 +121,4 @@ ps2recomp-iop-heap-larger.patch
 ps2recomp-ee-call-costs.patch
 ps2recomp-guest-access-fast-path.patch
 ps2recomp-libc-rand-31bit.patch
+ps2recomp-second-controller.patch
