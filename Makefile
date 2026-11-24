@@ -51,7 +51,7 @@ PS2RECOMP  ?= $(HOME)/src/PS2Recomp
 RECOMP_CFG := recomp/$(BASE).toml
 RECOMP_BIN := $(PS2RECOMP)/out/linux
 
-.PHONY: recomp runner vu1
+.PHONY: recomp runner runner-src vu1
 
 # VU1 microcode the game uploads, compiled to C++ the runtime runs instead of interpreting: blocks (any pc)
 # and lean programs (whole programs from their entries, see PS2Recomp's ps2xRuntime/tools/vu1_lean_gen.cpp).
@@ -80,16 +80,19 @@ recomp: build/functions.csv
 # rsync -c only touches files whose content changed, so rebuilds stay incremental.
 # ponytail: --delete wipes runner/ extras (upstream only ships a placeholder there); revisit if upstream adds real runner sources.
 # No LTO: Release IPO on ~170 MB of generated C++ is too slow.
-runner: recomp vu1
+runner: runner-src
+	cmake -S $(PS2RECOMP) -B $(RECOMP_BIN) -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+	  "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -DNDEBUG" "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -DNDEBUG"
+	cmake --build $(RECOMP_BIN) --target ps2EntryRunner -j$$(nproc)
+
+# Sources only (tools/launcher/build.sh builds them itself, for Linux or with mingw for Windows).
+runner-src: recomp vu1
 	rsync -rc --delete --filter='P mhrs_*' --include='*.cpp' --exclude='*' build/recomp/ $(PS2RECOMP)/ps2xRuntime/src/runner/
 	rsync -c build/recomp/*.h $(PS2RECOMP)/ps2xRuntime/include/
 	# Our hand-written host code (game overrides, native IOP functions) builds into the same runner.
 	for f in src/iop/*.cpp src/game/*.cpp; do rsync -c $$f $(PS2RECOMP)/ps2xRuntime/src/runner/mhrs_$$(basename $$f); done
 	# VU1 microcode compiled into blocks (see vu1 above).
-	for f in $(VU1_OUT)/*.cpp; do [ -e "$$f" ] && rsync -c $$f $(PS2RECOMP)/ps2xRuntime/src/runner/mhrs_$$(basename $$f); done
-	cmake -S $(PS2RECOMP) -B $(RECOMP_BIN) -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-	  "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -DNDEBUG" "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -DNDEBUG"
-	cmake --build $(RECOMP_BIN) --target ps2EntryRunner -j$$(nproc)
+	for f in $(VU1_OUT)/*.cpp; do [ ! -e "$$f" ] || rsync -c $$f $(PS2RECOMP)/ps2xRuntime/src/runner/mhrs_$$(basename $$f); done
 
 # The runtime maps cdrom0: to the ELF's folder, so boot a copy placed at the disc root.
 # The game also reads raw sectors (it parses ISO9660 itself), so it needs the disc image too.
