@@ -95,6 +95,9 @@ build() {
         echo "built dist/windows/ps2EntryRunner.exe"
     else
         step "Building ps2EntryRunner (takes a long time the first time)"
+        # The generated VU1 files need many GB each to compile: one at a time, or a 16 GB machine kills the compiler.
+        vu1=$(ninja -C "$TREE/out/linux" -t targets all | grep -oE '^[^:]*vu1_(lean|blocks)_[^:]*\.o' || true)
+        [ -z "$vu1" ] || ninja -C "$TREE/out/linux" -j1 $vu1
         cmake --build "$TREE/out/linux" --target ps2EntryRunner -j"$JOBS"
         if ! command -v appimagetool >/dev/null && [ -z "${APPIMAGETOOL:-}" ]; then
             export APPIMAGETOOL=$WORK/appimagetool-x86_64.AppImage
